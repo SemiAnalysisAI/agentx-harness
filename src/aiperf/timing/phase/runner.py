@@ -221,14 +221,21 @@ class PhaseRunner(TaskManagerMixin):
         self._baseline_end_ns: int | None = None
 
     def _root_idle_gap_cap_seconds(self) -> float | None:
-        """Per-trace runtime idle cap for AgentX profiling.
+        """Per-trace runtime idle cap for AgentX replay.
 
         The cap measures actual whole-tree idle time after the final in-flight
         request completes. Dataset timestamps remain untouched; only pending
         runtime timers for that root and its descendants may be advanced.
+
+        Armed for WARMUP as well as PROFILING. An accelerated cache-pressure
+        warmup (--warmup-requests-per-lane / --agentic-cache-warmup-duration)
+        activates the same replay gate and replays the same recorded gaps, so
+        leaving it uncapped both stretches warmup far past its budget on traces
+        with multi-minute idle periods and hands profiling a cache that was
+        filled under a different arrival process than the one being measured.
         """
         if (
-            self._config.phase != CreditPhase.PROFILING
+            self._config.phase not in (CreditPhase.PROFILING, CreditPhase.WARMUP)
             or self._config.timing_mode != TimingMode.AGENTIC_REPLAY
             or self._run is None
         ):

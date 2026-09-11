@@ -516,7 +516,9 @@ request starts immediately, while every other trajectory keeps the same
 relative spacing. With
 `--trace-idle-gap-cap-seconds S`, a per-trajectory watchdog covers initial
 future work and restarts when the last in-flight request across the root and
-all descendant streams completes.
+all descendant streams completes. The watchdog is armed in both warmup and
+profiling, so an accelerated cache-pressure warmup fills the cache under the
+same arrival process that profiling then measures.
 If that tree remains idle for `S` seconds, AIPerf uniformly advances only its
 pending timers; dataset timestamps, relative timer spacing, request order, and
 spawn/join gates remain unchanged. If every request completes while future

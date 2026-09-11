@@ -286,7 +286,9 @@ change it. Replay dispatches each turn only after the previous one completes,
 so start-to-start deltas would double-count the server's own response time and make every session
 drift later turn by turn. Individual trace gaps are not capped by default; pass
 `--trace-idle-gap-cap-seconds S` to advance a trajectory's pending timers when its root and
-all descendants have had no request in flight for `S` seconds. This runtime guard does not
+all descendants have had no request in flight for `S` seconds. The guard is armed in warmup as
+well as profiling, so a cache-pressure warmup replays the same capped gaps it will be measured
+under. This runtime guard does not
 rewrite dataset timestamps or bypass spawn/join dependencies. If the entire replay has no active or ready request, AIPerf uniformly
 shifts every pending request timer so the next request arrives within 10 seconds.
 
