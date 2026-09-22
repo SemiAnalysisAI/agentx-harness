@@ -22,17 +22,17 @@ from aiperf.plugin.schema.schemas import TransportMetadata
 
 FirstTokenCallback = Callable[[int, SSEMessage], Awaitable[bool]]
 """
-Type alias for a callback that is called with the ttft_ns and the first SSE message:
+Callback invoked for each SSE message until it returns True.
 
 Args:
-    ttft_ns: duration from request start
-    message: the first SSE message
+    ttft_ns: elapsed duration from request start to this message
+    message: the current SSE message
 
 Returns:
-    True if this is meaningful content (stop looking for first token), False otherwise
+    True to stop observing; False to continue receiving subsequent messages.
 
-This callback is used to determine if the first token has been received and can be released.
-It is used to release prefill concurrency.
+The worker uses this to release prefill concurrency once on meaningful content.
+Scenario coverage keeps observing afterward to retain the latest content timestamp.
 """
 
 
