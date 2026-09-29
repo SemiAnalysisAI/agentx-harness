@@ -50,7 +50,63 @@ quick sanity check that the run followed the locked rules.
 
 ---
 
-## Quick Start
+## Standalone preset
+
+With this harness checkout installed (`uv pip install -e . 'datasets>=4.7.0'`),
+run against an existing OpenAI-compatible server:
+
+```bash
+aiperf profile --scenario inferencex-agentx --url "$SERVER_URL"
+```
+
+This opt-in preset follows the
+[InferenceX standalone recipe](https://github.com/SemiAnalysisAI/InferenceX/blob/44475c2f16d27066617282f64d1176cf90ac4dbc/inferencex-e2e/docs/agentx-standalone.md).
+It does not change `inferencex-agentx-mvp`, declare an AgentX v1.1 release, or
+make results from different recipes automatically comparable.
+
+| Setting | Preset default |
+|---|---|
+| Endpoint | Streaming chat, `/v1/chat/completions`, server token counts |
+| Corpus | `semianalysis_cc_traces_weka_062126`, up to 393 eligible traces |
+| Load and duration | Concurrency 8, 3,600 profiling seconds |
+| Sampling | Seed 42, trajectory start range 0.25–0.75 |
+| Warmup | 10 requests per lane, 1,800-second warmup grace |
+| Timing | 300-second per-trace idle cap; existing 10-second global idle lock |
+| Failures | Failed-request threshold 0.10; existing context-overflow and metric-coverage gates |
+| Reporting | 30-second stats, 1-second slices, realtime metrics enabled, GPU telemetry disabled |
+| Runtime | Dataset/profile configuration timeouts 1,800 seconds; TCP user timeout 900,000 ms |
+| Output | Fresh `artifacts/agentx-<UTC timestamp>-<random suffix>/` for each profile invocation |
+
+The hour excludes dataset preparation, warmup, and drain. This is one load
+point, not a concurrency sweep; add `--concurrency N` and rerun for each point.
+The usual flags override preset defaults, while invariant conflicts still
+fail (or mark the submission invalid under `--unsafe-override`).
+
+`profile` discovers the model with one bounded GET to `/v1/models`, forwarding
+`--api-key` and custom headers. Discovery requires one URL and exactly one
+nonempty model ID; empty/multiple listings, HTTP failures, and redirects
+require an explicit `--model`. Root URLs, `/v1`, chat-completions URLs, and
+proxy path prefixes are supported. Discovery does not infer a model's context
+limit or tokenizer from server metadata.
+
+The tokenizer still defaults to the selected model name. Pass
+`--tokenizer <HF-repo-or-local-path>` for a serving alias. Remote tokenizer code
+stays disabled unless you explicitly pass `--tokenizer-trust-remote-code`.
+Servers must support the corpus's context lengths, streaming, and
+`ignore_eos=true`; use the matching context limit or corpus explicitly.
+No model-specific chat-template or router-affinity settings are guessed.
+
+`aiperf profile -f config.yaml` also accepts `benchmark.scenario: inferencex-agentx`.
+CLI load and endpoint values override YAML, and YAML values override preset defaults.
+An authored dataset list is kept as-is; edit its corpus and trace controls in
+YAML rather than expecting dataset-selection flags to replace that list.
+Existing environment values override
+the runtime defaults; defaults apply only during the profile invocation and
+are inherited by its child services. The old
+`AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES` export is not needed: this checkout
+has no consumer for it.
+
+## Legacy MVP quick start
 
 You'll need:
 

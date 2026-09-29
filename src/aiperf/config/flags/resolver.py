@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 def resolve_config(
     cli_config: CLIConfig,
     config_file: Path | None = None,
+    *,
+    config_dict: dict[str, Any] | None = None,
 ) -> AIPerfConfig:
     """Return an `AIPerfConfig` from a YAML config file and/or CLI flags.
 
@@ -63,10 +65,13 @@ def resolve_config(
             explicitly-set CLI flags on ``cli_config`` are deep-merged on
             top before validation. Without ``config_file``, the
             CLIConfig -> AIPerfConfig converter handles the full CLI-only path.
+        config_dict: Already-loaded YAML input, when profile's model discovery
+            has read the file. Takes precedence over config_file.
 
     Returns:
         Fully resolved `AIPerfConfig` ready for downstream use.
     """
+    from aiperf.config.flags.agentx import apply_cli_defaults, apply_yaml_defaults
     from aiperf.config.flags.converter import (
         _promote_cli_dataset_magic_lists,
         _promote_magic_lists_to_sweep_block,
@@ -77,14 +82,19 @@ def resolve_config(
     if config_file is None:
         config_file = cli_config.config_file
 
-    if config_file is None:
-        return convert_cli_to_aiperf(cli_config)
+    if config_file is None and config_dict is None:
+        return convert_cli_to_aiperf(apply_cli_defaults(cli_config))
 
     from aiperf.config import AIPerfConfig
     from aiperf.config.loader import load_config_dict
 
-    yaml_dict = load_config_dict(config_file)
+    yaml_dict = (
+        copy.deepcopy(config_dict)
+        if config_dict is not None
+        else load_config_dict(config_file)
+    )
     _normalize_loaded_benchmark_shorthands(yaml_dict)
+    yaml_dict = apply_yaml_defaults(yaml_dict, cli_config)
     # Build the recipe's view of BenchmarkConfig from YAML + the
     # endpoint/input CLI overrides ONLY: the recipe inspects fields like
     # ``endpoint.streaming`` (via ``require_streaming``) before emitting

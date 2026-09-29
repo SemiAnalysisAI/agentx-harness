@@ -2218,7 +2218,8 @@ class CLIConfig(BaseConfig):
         Field(
             default=None,
             description="Lock all benchmark invariants for a named scenario "
-            "(e.g. 'inferencex-agentx-mvp'). Conflicts with the locked "
+            "('inferencex-agentx-mvp', or 'inferencex-agentx' for standalone "
+            "recipe defaults and profile-only model discovery). Conflicts with the locked "
             "invariants raise ScenarioLockError at startup unless "
             "--unsafe-override is also passed. Distinct from the sweep "
             "``scenarios`` strategy (hand-picked named runs).",

@@ -51,7 +51,10 @@ def profile(
     from aiperf.config.loader.errors import ConfigurationError
 
     with exit_on_error(title="Error Running AIPerf System", show_traceback=False):
-        from aiperf.config.flags.resolver import resolve_config
+        from aiperf.cli_commands._agentx import (
+            agentx_environment,
+            resolve_profile_config,
+        )
         from aiperf.config.loader import build_benchmark_plan
 
         # ``resolve_config`` handles both paths: CLI-only (no config_file)
@@ -59,8 +62,7 @@ def profile(
         # ``--search-recipe`` / ``--ttft-sla-ms`` / ``--ui`` overlay on top).
         # The merge order matters: a CLI-supplied recipe must reach the
         # converter even when the YAML omits one.
-        config_file = cli_config.config_file
-        config = resolve_config(cli_config, config_file)
+        config = resolve_profile_config(cli_config)
         plan = build_benchmark_plan(config)
 
     with exit_on_error(
@@ -69,4 +71,5 @@ def profile(
     ):
         from aiperf.cli_runner import run_benchmark
 
-        run_benchmark(plan)
+        with agentx_environment(config.benchmark.scenario):
+            run_benchmark(plan)

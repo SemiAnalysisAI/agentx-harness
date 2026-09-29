@@ -38,3 +38,13 @@ INFERENCEX_AGENTX_MVP = ScenarioSpec(
     require_cache_bust=CacheBustTarget.FIRST_TURN_PREFIX,
     minimum_profile_metric_coverage_ratio=0.95,
 )
+
+# Keep the legacy name's defaults frozen for existing benchmark recipes.
+INFERENCEX_AGENTX = INFERENCEX_AGENTX_MVP.model_copy(
+    update={
+        "name": "inferencex-agentx",
+        "default_benchmark_duration_seconds": 3600,
+        "default_trajectory_start_min_ratio": 0.25,
+        "default_trajectory_start_max_ratio": 0.75,
+    }
+)

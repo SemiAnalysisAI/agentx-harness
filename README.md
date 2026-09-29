@@ -11,6 +11,20 @@ SPDX-License-Identifier: Apache-2.0
 
 https://inferencex.semianalysis.com/datasets
 
+### Run against an existing server
+
+Install this checkout with `uv pip install -e . 'datasets>=4.7.0'`, then run:
+
+```bash
+aiperf profile --scenario inferencex-agentx --url "$SERVER_URL"
+```
+
+The preset uses concurrency 8 and profiles for one hour, plus preparation,
+warmup, and drain. It discovers the model when `/v1/models` lists exactly one.
+Add `--model` for multiple models or servers without discovery, and `--tokenizer`
+if the served name is an alias. See the [standalone preset](docs/tutorials/agentx-mvp.md#standalone-preset)
+for defaults and overrides. The existing `inferencex-agentx-mvp` defaults are unchanged.
+
 
 
 ## Original README.md Below
