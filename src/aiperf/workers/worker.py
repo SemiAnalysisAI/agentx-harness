@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 
 from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.base_component_service import BaseComponentService
-from aiperf.common.constants import BYTES_PER_MIB, WARMUP_SYSTEM_MESSAGE_PREFIX
+from aiperf.common.constants import (
+    BYTES_PER_MIB,
+    NANOS_PER_SECOND,
+    WARMUP_SYSTEM_MESSAGE_PREFIX,
+)
 from aiperf.common.enums import (
     CacheBustTarget,
     CommAddress,
@@ -64,6 +68,7 @@ from aiperf.common.protocols import (
     StreamingPushClientProtocol,
 )
 from aiperf.common.scenario.context_overflow import is_context_overflow_response
+from aiperf.common.scenario.registry import get_scenario
 from aiperf.config.adaptive_scale_phase import (
     sla_filters_require_first_token_observation,
 )
@@ -72,6 +77,7 @@ from aiperf.credit.messages import (
     CreditReturn,
     FirstToken,
     RouterToWorkerMessage,
+    StreamingContent,
     WorkerReady,
     WorkerShutdown,
 )
@@ -613,6 +619,13 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         self._prefill_concurrency_enabled: bool = any(
             _phase_needs_first_token_callback(phase) for phase in self.run.cfg.phases
         )
+        self._streaming_coverage_enabled = bool(
+            self.run.cfg.scenario
+            and get_scenario(
+                self.run.cfg.scenario
+            ).minimum_profile_metric_coverage_ratio
+            is not None
+        )
 
         # One-shot warning gate so cache-bust diagnostics don't spam logs at
         # high concurrency — the misconfiguration is the same for every credit.
@@ -775,6 +788,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             request_latency_ns=credit_context.request_latency_ns,
             inter_token_latency_ns=credit_context.inter_token_latency_ns,
             output_sequence_length=credit_context.output_sequence_length,
+            last_streaming_content_ns=credit_context.last_streaming_content_ns,
             worker_id=self.service_id,
         )
         self.execute_async(self.credit_return_push_client.send(credit_return))
@@ -853,6 +867,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
                 request_latency_ns=credit_context.request_latency_ns,
                 inter_token_latency_ns=credit_context.inter_token_latency_ns,
                 output_sequence_length=credit_context.output_sequence_length,
+                last_streaming_content_ns=credit_context.last_streaming_content_ns,
                 worker_id=self.service_id,
             )
             await self.credit_return_push_client.send(credit_return)
@@ -955,35 +970,58 @@ class Worker(BaseComponentService, ProcessHealthMixin):
     def _make_first_token_callback(
         self, credit_context: CreditContext
     ) -> FirstTokenCallback | None:
-        """Build first-token callback when prefill concurrency limiting is active.
+        """Observe content for prefill release and scenario coverage when needed.
 
-        Detecting first token requires parsing each SSE chunk, so this overhead
-        is skipped when the orchestrator doesn't need TTFT events for slot management.
-
-        Returns:
-            Callback that sends FirstToken to the router on meaningful content,
-            or None when prefill concurrency is disabled.
+        Coverage keeps the callback active after the first token so cancellation
+        cannot discard the last content timestamp along with the request record.
         """
-        if not self._prefill_concurrency_enabled:
+        track_coverage = (
+            self._streaming_coverage_enabled
+            and credit_context.credit.phase == CreditPhase.PROFILING
+        )
+        if not self._prefill_concurrency_enabled and not track_coverage:
             return None
 
         credit = credit_context.credit
+        wall_clock_offset_ns = time.time_ns() - time.perf_counter_ns()
+        last_report_perf_ns: int | None = None
 
         async def on_first_token(ttft_ns: int, message: SSEMessage) -> bool:
+            nonlocal last_report_perf_ns
             parsed = self.inference_client.endpoint.parse_response(message)
             if parsed is None or parsed.data is None:
                 return False
 
-            await self.credit_return_push_client.send(
-                FirstToken(
-                    credit_id=credit.id,
-                    phase=credit.phase,
-                    phase_index=credit.phase_index,
-                    ttft_ns=ttft_ns,
+            if track_coverage:
+                credit_context.last_streaming_content_ns = (
+                    wall_clock_offset_ns + message.perf_ns
                 )
-            )
-            credit_context.first_token_sent = True
-            return True
+                if (
+                    last_report_perf_ns is None
+                    or message.perf_ns - last_report_perf_ns >= NANOS_PER_SECOND
+                ):
+                    await self.credit_return_push_client.send(
+                        StreamingContent(
+                            phase=credit.phase,
+                            phase_index=credit.phase_index,
+                            timestamp_ns=credit_context.last_streaming_content_ns,
+                        )
+                    )
+                    last_report_perf_ns = message.perf_ns
+            if (
+                self._prefill_concurrency_enabled
+                and not credit_context.first_token_sent
+            ):
+                await self.credit_return_push_client.send(
+                    FirstToken(
+                        credit_id=credit.id,
+                        phase=credit.phase,
+                        phase_index=credit.phase_index,
+                        ttft_ns=ttft_ns,
+                    )
+                )
+                credit_context.first_token_sent = True
+            return not track_coverage
 
         return on_first_token
 

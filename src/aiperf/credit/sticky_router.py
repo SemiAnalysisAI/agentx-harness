@@ -33,6 +33,7 @@ from aiperf.credit.messages import (
     CancelCredits,
     CreditReturn,
     FirstToken,
+    StreamingContent,
     WorkerReady,
     WorkerShutdown,
     WorkerToRouterMessage,
@@ -167,6 +168,12 @@ class CreditRouterProtocol(Protocol):
         """
         ...
 
+    def set_streaming_content_callback(
+        self, callback: Callable[[StreamingContent], Awaitable[None]]
+    ) -> None:
+        """Register the phase-coverage observer for in-flight content."""
+        ...
+
 
 # =============================================================================
 # Sticky Credit Router
@@ -281,6 +288,9 @@ class StickyCreditRouter(CommunicationMixin):
         self._on_first_token_callback: (
             Callable[[FirstToken], Awaitable[None]] | None
         ) = None
+        self._on_streaming_content_callback: (
+            Callable[[StreamingContent], Awaitable[None]] | None
+        ) = None
 
         # Sticky sessions: routing_key -> _StickyEntry
         # Routes all turns of a conversation (and DAG children pinned to it) to the
@@ -321,6 +331,12 @@ class StickyCreditRouter(CommunicationMixin):
     ) -> None:
         """Set callback for first token events (enables prefill concurrency release)."""
         self._on_first_token_callback = callback
+
+    def set_streaming_content_callback(
+        self, callback: Callable[[StreamingContent], Awaitable[None]]
+    ) -> None:
+        """Set the coverage observer without changing request or prefill counts."""
+        self._on_streaming_content_callback = callback
 
     async def wait_for_workers(self, timeout: float) -> None:
         """Close the startup race where a phase issues its first credit before
@@ -601,6 +617,9 @@ class StickyCreditRouter(CommunicationMixin):
                 if self._on_first_token_callback:
                     # Forward TTFT to orchestrator so it can release the prefill slot.
                     await self._on_first_token_callback(message)
+            case StreamingContent():
+                if self._on_streaming_content_callback:
+                    await self._on_streaming_content_callback(message)
             case WorkerReady():
                 self._register_worker(worker_id)
             case WorkerShutdown():
