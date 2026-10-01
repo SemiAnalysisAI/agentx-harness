@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 _logger = AIPerfLogger(__name__)
 
-_AGENTX_SCENARIO = "inferencex-agentx-mvp"
+_AGENTX_SCENARIOS = {"inferencex-agentx-mvp", "agentx"}
 
 # Phase types that only arise from an explicit scheduling request
 # (--request-rate / --user-centric-rate / --fixed-schedule or a YAML phase
@@ -463,7 +463,7 @@ def _apply_require_loader(
     # aliases are pinned by name; weka_hf is pinned to a known HF repo below.
     # Local weka_trace only proves format compatibility — any directory of
     # Weka-shaped JSON passes — so it cannot stamp submission_valid=true.
-    if spec.name == _AGENTX_SCENARIO and detected == _WEKA_TRACE_LOADER:
+    if spec.name in _AGENTX_SCENARIOS and detected == _WEKA_TRACE_LOADER:
         violations.append(
             ScenarioViolation(
                 flag="--custom-dataset-type / --input-file",
@@ -483,7 +483,7 @@ def _apply_require_loader(
             )
         )
 
-    if spec.name == _AGENTX_SCENARIO and detected == _WEKA_HF_LOADER:
+    if spec.name in _AGENTX_SCENARIOS and detected == _WEKA_HF_LOADER:
         dataset = run.cfg.get_default_dataset()
         hf_weka_dataset = getattr(dataset, "hf_weka_dataset", None)
         if hf_weka_dataset != _AGENTX_WEKA_HF_REPO:

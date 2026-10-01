@@ -522,6 +522,8 @@ def _apply_scenario_defaults(cli: CLIConfig) -> CLIConfig:
     }
     if "gpu_telemetry" in cli.model_fields_set:
         defaults.pop("no_gpu_telemetry", None)
+    if cli.agentic_cache_warmup_duration is not None:
+        defaults.pop("warmup_requests_per_lane", None)
     return cli.model_copy(update=defaults)
 
 
