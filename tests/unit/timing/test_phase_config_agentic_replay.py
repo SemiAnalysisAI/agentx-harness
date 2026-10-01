@@ -35,6 +35,7 @@ def test_warmup_config_uses_agentic_replay_when_top_level_is_agentic_replay() ->
     assert warmup is not None
     assert warmup.timing_mode == TimingMode.AGENTIC_REPLAY
     assert warmup.phase == CreditPhase.WARMUP
+    assert warmup.phase_kind == "warmup"
 
 
 def test_profiling_config_propagates_cap() -> None:
