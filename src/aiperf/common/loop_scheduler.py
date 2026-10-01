@@ -108,6 +108,7 @@ class LoopScheduler:
         self,
         handle_container: list[asyncio.TimerHandle | asyncio.Handle],
         coro: Coroutine,
+        tracked_handle_id: HandleId | None = None,
     ) -> None:
         """
         Timer callback: transition coroutine from pending to running.
@@ -118,7 +119,11 @@ class LoopScheduler:
         mutable list, then populate it after call_later() returns.
         """
         if handle_container[0] is not None:
-            handle_id = id(handle_container[0])
+            handle_id = (
+                tracked_handle_id
+                if tracked_handle_id is not None
+                else id(handle_container[0])
+            )
             self._handles.pop(handle_id, None)
             self._handle_groups.pop(handle_id, None)
         task = self._loop.create_task(coro)
@@ -131,15 +136,19 @@ class LoopScheduler:
         coro: Coroutine,
         *,
         group_id: str | None = None,
+        tracked_handle_id: HandleId | None = None,
     ) -> HandleId:
         """Track a handle and coroutine and return the handle ID.
 
-        We use the handle ID as the key to avoid recursion when handles contain circular refs (handle_container).
+        New timers use the handle ID as their logical key to avoid recursion
+        when handles contain circular refs (handle_container). Replay idle-cap
+        rescheduling preserves that logical key even though it replaces the
+        physical timer.
         Also, we pass the handle id back to the caller instead of the original handle to ensure they
         do not keep a reference to the handle, and do not attempt to cancel it without stopping the coroutine.
         Returning the handle ID forces the caller to use the cancel_handle_id() method to cancel the coroutine.
         """
-        handle_id = id(handle)
+        handle_id = tracked_handle_id if tracked_handle_id is not None else id(handle)
         self._handles[handle_id] = (handle, coro)
         if group_id is not None:
             self._handle_groups[handle_id] = group_id
@@ -369,12 +378,12 @@ class LoopScheduler:
             return 0.0
 
         items = [
-            (handle, coro, self._handle_groups.get(handle_id))
+            (handle_id, handle, coro, self._handle_groups.get(handle_id))
             for handle_id, (handle, coro) in self._handles.items()
         ]
         self._handles.clear()
         self._handle_groups.clear()
-        for handle, coro, group_id in items:
+        for handle_id, handle, coro, group_id in items:
             target = max(now, handle.when() - shift_sec)
             handle.cancel()
             handle_container = [None]
@@ -384,14 +393,19 @@ class LoopScheduler:
                 # occurs. Queue it as ready work explicitly; this also states
                 # the max_delay_sec=0 contract directly.
                 replacement = self._loop.call_soon(
-                    self._safe_callback, handle_container, coro
+                    self._safe_callback, handle_container, coro, handle_id
                 )
             else:
                 replacement = self._loop.call_at(
-                    target, self._safe_callback, handle_container, coro
+                    target, self._safe_callback, handle_container, coro, handle_id
                 )
             handle_container[0] = replacement
-            self._track_handle_and_return_id(replacement, coro, group_id=group_id)
+            self._track_handle_and_return_id(
+                replacement,
+                coro,
+                group_id=group_id,
+                tracked_handle_id=handle_id,
+            )
         return shift_sec
 
     def cap_pending_delay_for_group(self, group_id: str, max_delay_sec: float) -> float:
@@ -428,14 +442,19 @@ class LoopScheduler:
             handle_container = [None]
             if target <= now:
                 replacement = self._loop.call_soon(
-                    self._safe_callback, handle_container, coro
+                    self._safe_callback, handle_container, coro, handle_id
                 )
             else:
                 replacement = self._loop.call_at(
-                    target, self._safe_callback, handle_container, coro
+                    target, self._safe_callback, handle_container, coro, handle_id
                 )
             handle_container[0] = replacement
-            self._track_handle_and_return_id(replacement, coro, group_id=group_id)
+            self._track_handle_and_return_id(
+                replacement,
+                coro,
+                group_id=group_id,
+                tracked_handle_id=handle_id,
+            )
         return shift_sec
 
     @property

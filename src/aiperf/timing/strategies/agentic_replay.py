@@ -200,6 +200,11 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         self._accelerated_warmup_started = False
         self._handoff_credits: dict[str, Credit] = {}
         self._root_to_lane: dict[str, int] = {}
+        # Profiling child turns can be parked in LoopScheduler for recorded
+        # inter-turn delays. The orchestrator has already registered those
+        # children, so a duration-boundary scheduler sweep must notify it when
+        # a never-started turn is discarded or the parent join never drains.
+        self._scheduled_child_turns: dict[str, int] = {}
         # Accelerated warmup removes idle delays. Keep each tree's sampled t*
         # so handoff can restore every stream to one flattened dataset clock;
         # otherwise pending child turn-0 requests all look due at offset zero.
@@ -948,6 +953,48 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         ):
             await self.branch_orchestrator.on_child_stopped(turn.x_correlation_id)
 
+    async def _run_scheduled_child_turn(self, turn: TurnToSend) -> None:
+        """Run one delayed child turn after dropping its pending marker."""
+        self._scheduled_child_turns.pop(turn.x_correlation_id, None)
+        await self._issue_child_continuation_or_drain(turn)
+
+    def _schedule_child_turn(self, turn: TurnToSend, delay_s: float) -> None:
+        """Schedule a child turn whose cancellation still owns DAG cleanup."""
+        handle_id = self.scheduler.schedule_later(
+            delay_s,
+            self._run_scheduled_child_turn(turn),
+            group_id=turn.effective_root_correlation_id,
+        )
+        # Positive-delay LoopScheduler calls return an integer handle. Some
+        # isolated strategy tests supply an eager task instead; that work has
+        # already started and therefore is not pending-boundary cleanup state.
+        if isinstance(handle_id, int):
+            self._scheduled_child_turns[turn.x_correlation_id] = handle_id
+
+    async def cancel_pending_child_turns(self) -> None:
+        """Cancel never-started profiling child turns and drain their DAG state.
+
+        All scheduler cancellations happen before the first await so a timer
+        cannot fire between cancellation and bookkeeping capture on the event
+        loop thread. A handle that already fired is left alone: its wrapper
+        will issue the turn or route the terminal refusal through the normal
+        child-drain chokepoint.
+        """
+        if self.allows_pending_branch_handoff_after_sending_complete:
+            return
+
+        cancelled: list[str] = []
+        for child_corr, handle_id in list(self._scheduled_child_turns.items()):
+            if not self.scheduler.cancel_handle_id(handle_id):
+                continue
+            self._scheduled_child_turns.pop(child_corr, None)
+            cancelled.append(child_corr)
+
+        if self.branch_orchestrator is None:
+            return
+        for child_corr in cancelled:
+            await self.branch_orchestrator.on_child_stopped(child_corr)
+
     async def finalize_phase(self) -> None:
         """Persist the drained accelerated-warmup DAG for profiling."""
         if self._system_idle_gap_cap_seconds is not None:
@@ -1551,19 +1598,20 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         next_meta = self.conversation_source.get_next_turn_metadata(credit)
         turn = TurnToSend.from_previous_credit(credit, next_meta)
 
-        coro = (
-            self._issue_child_continuation_or_drain(turn)
-            if turn.agent_depth > 0
-            else self.credit_issuer.issue_credit(turn)
-        )
         if next_meta.delay_ms is not None and next_meta.delay_ms > 0:
-            self.scheduler.schedule_later(
-                next_meta.delay_ms / MILLIS_PER_SECOND,
-                coro,
-                group_id=credit.effective_root_correlation_id,
-            )
+            delay_s = next_meta.delay_ms / MILLIS_PER_SECOND
+            if turn.agent_depth > 0:
+                self._schedule_child_turn(turn, delay_s)
+            else:
+                self.scheduler.schedule_later(
+                    delay_s,
+                    self.credit_issuer.issue_credit(turn),
+                    group_id=credit.effective_root_correlation_id,
+                )
+        elif turn.agent_depth > 0:
+            await self._issue_child_continuation_or_drain(turn)
         else:
-            await coro
+            await self.credit_issuer.issue_credit(turn)
 
     async def _spawn_from_recycle_or_id(
         self,
@@ -1794,11 +1842,14 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 offset_by_corr[state.x_correlation_id] - t0_offset_ms
             ) / MILLIS_PER_SECOND
             if delay_s > 0:
-                self.scheduler.schedule_later(
-                    delay_s,
-                    self.credit_issuer.issue_credit(turn),
-                    group_id=turn.effective_root_correlation_id,
-                )
+                if turn.agent_depth > 0:
+                    self._schedule_child_turn(turn, delay_s)
+                else:
+                    self.scheduler.schedule_later(
+                        delay_s,
+                        self.credit_issuer.issue_credit(turn),
+                        group_id=turn.effective_root_correlation_id,
+                    )
             else:
                 await self.credit_issuer.issue_credit(turn)
 

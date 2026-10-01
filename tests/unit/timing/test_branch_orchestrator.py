@@ -232,6 +232,44 @@ async def test_no_join_case_releases_slot_when_descendants_drain():
     assert released == ["parent"]
 
 
+def test_terminal_wire_drain_truncates_scheduling_only_dag_state():
+    """No logical DAG residue may hold a duration phase after wire drain."""
+    sticky_router = MagicMock()
+    registry = MagicMock()
+    orch = BranchOrchestrator(
+        conversation_source=MagicMock(),
+        credit_issuer=MagicMock(),
+        sticky_router=sticky_router,
+        session_tree_registry=registry,
+    )
+    pending = _mk_pending_for_parent(
+        "parent",
+        gated_turn_index=2,
+        prereq_key="SPAWN_JOIN:b0",
+        outstanding={"child"},
+    )
+    pending.is_blocked = True
+    orch._active_joins["parent"] = pending
+    orch._child_to_join["child"] = [
+        ChildJoinEntry(
+            parent_correlation_id="parent",
+            gated_turn_index=2,
+            prereq_key="SPAWN_JOIN:b0",
+        )
+    ]
+    orch._child_modes["child"] = ConversationBranchMode.FORK
+    orch._child_root["child"] = "root"
+    orch._descendant_counts["parent"] = 1
+
+    orch.truncate_pending_after_wire_drain()
+
+    assert not orch.has_pending_branch_work()
+    assert orch.stats.children_truncated == 1
+    assert orch.stats.joins_suppressed == 1
+    sticky_router.release_child_routing.assert_called_once_with("parent")
+    registry.on_descendant_done.assert_called_once_with("root")
+
+
 @pytest.mark.asyncio
 async def test_leaf_for_unknown_child_is_noop():
     orch = BranchOrchestrator(

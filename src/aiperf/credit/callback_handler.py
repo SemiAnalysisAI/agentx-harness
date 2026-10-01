@@ -576,6 +576,14 @@ class CreditCallbackHandler:
         )
         if (
             self._branch_orchestrator is not None
+            and handler.lifecycle.is_sending_complete
+            and not allows_pending_branch_handoff
+            and all_wire_requests_returned
+            and self._branch_orchestrator.has_pending_branch_work()
+        ):
+            self._branch_orchestrator.truncate_pending_after_wire_drain()
+        if (
+            self._branch_orchestrator is not None
             and not handler.progress.all_credits_returned_event.is_set()
             and all_wire_requests_returned
             and (

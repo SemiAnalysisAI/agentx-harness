@@ -1022,6 +1022,19 @@ class PhaseRunner(TaskManagerMixin):
             if not self._lifecycle.is_sending_complete:
                 self._lifecycle.mark_sending_complete(timeout_triggered=timed_out)
                 self._progress.freeze_sent_counts()
+                if (
+                    self._branch_orchestrator is not None
+                    and not preserve_branch_handoff
+                ):
+                    await self._branch_orchestrator.cancel_pending_delayed_dispatches()
+                cancel_pending_child_turns = getattr(
+                    strategy, "cancel_pending_child_turns", None
+                )
+                if (
+                    cancel_pending_child_turns is not None
+                    and not preserve_branch_handoff
+                ):
+                    await cancel_pending_child_turns()
                 self._scheduler.cancel_all_pending()
                 if (
                     self._branch_orchestrator is not None
@@ -1075,6 +1088,14 @@ class PhaseRunner(TaskManagerMixin):
                 if allows_pending_branch_handoff
                 else self._progress.check_all_returned_or_cancelled()
             )
+            if (
+                all_wire_requests_returned
+                and not allows_pending_branch_handoff
+                and self._lifecycle.is_sending_complete
+                and self._branch_orchestrator is not None
+                and self._branch_orchestrator.has_pending_branch_work()
+            ):
+                self._branch_orchestrator.truncate_pending_after_wire_drain()
             if all_wire_requests_returned and (
                 allows_pending_branch_handoff
                 or self._branch_orchestrator is None

@@ -38,11 +38,13 @@ def _make_strategy(
     credit_issuer.issue_credit = AsyncMock(return_value=True)
 
     scheduler = MagicMock()
+    scheduler.schedule_later.return_value = 123
 
     strategy.conversation_source = conversation_source
     strategy.credit_issuer = credit_issuer
     strategy.scheduler = scheduler
     strategy.branch_orchestrator = branch_orchestrator
+    strategy._scheduled_child_turns = {}
     return strategy, credit_issuer, scheduler
 
 
@@ -165,6 +167,52 @@ async def test_child_delayed_schedules_chokepoint_coro_not_issue_credit() -> Non
     await coro
     issuer.dispatch_child_turn.assert_awaited_once()
     orch.on_child_stopped.assert_awaited_once_with("child-xcid")
+
+
+@pytest.mark.asyncio
+async def test_duration_boundary_cancels_delayed_child_and_drains_orchestrator() -> (
+    None
+):
+    """A never-started continuation must not leave its parent join pending."""
+    orch = MagicMock()
+    orch.on_child_stopped = AsyncMock()
+    strategy, issuer, scheduler = _make_strategy(
+        branch_orchestrator=orch, delay_ms=60_000.0
+    )
+
+    await strategy._dispatch_next_turn(_child_credit())
+    _, coro = scheduler.schedule_later.call_args.args
+
+    def cancel_handle(handle_id: int) -> bool:
+        assert handle_id == 123
+        coro.close()
+        return True
+
+    scheduler.cancel_handle_id.side_effect = cancel_handle
+    await strategy.cancel_pending_child_turns()
+
+    scheduler.cancel_handle_id.assert_called_once_with(123)
+    issuer.dispatch_child_turn.assert_not_awaited()
+    orch.on_child_stopped.assert_awaited_once_with("child-xcid")
+    assert strategy._scheduled_child_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_fired_delayed_child_is_not_drained_by_pending_cleanup() -> None:
+    """Once a timer fires, its live issue/refusal path owns DAG settlement."""
+    orch = MagicMock()
+    orch.on_child_stopped = AsyncMock()
+    strategy, _, scheduler = _make_strategy(branch_orchestrator=orch, delay_ms=250.0)
+
+    await strategy._dispatch_next_turn(_child_credit())
+    _, coro = scheduler.schedule_later.call_args.args
+    scheduler.cancel_handle_id.return_value = False
+
+    await strategy.cancel_pending_child_turns()
+
+    orch.on_child_stopped.assert_not_awaited()
+    await coro
+    assert strategy._scheduled_child_turns == {}
 
 
 # Root continuation keeps issue_credit

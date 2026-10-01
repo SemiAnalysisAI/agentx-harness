@@ -98,6 +98,45 @@ def registered_handler(
     return callback_handler
 
 
+def test_terminal_wire_drain_settles_dag_before_signalling_completion(
+    callback_handler,
+    mock_progress,
+    mock_lifecycle,
+    mock_stop_checker,
+    mock_strategy,
+    mock_branch_orchestrator,
+):
+    """The last wire return truncates only scheduling residue, then completes."""
+    pending = True
+
+    def _has_pending() -> bool:
+        return pending
+
+    def _truncate() -> None:
+        nonlocal pending
+        pending = False
+
+    mock_progress.in_flight = 0
+    mock_progress.check_all_returned_or_cancelled.return_value = True
+    mock_lifecycle.is_sending_complete = True
+    mock_branch_orchestrator.has_pending_branch_work.side_effect = _has_pending
+    mock_branch_orchestrator.truncate_pending_after_wire_drain.side_effect = _truncate
+    callback_handler.register_phase(
+        phase=CreditPhase.PROFILING,
+        progress=mock_progress,
+        lifecycle=mock_lifecycle,
+        stop_checker=mock_stop_checker,
+        strategy=mock_strategy,
+    )
+    callback_handler.set_branch_orchestrator(mock_branch_orchestrator)
+    context = callback_handler._phase_handlers[CreditPhase.PROFILING]
+
+    callback_handler._signal_all_credits_returned_if_ready(context)
+
+    mock_branch_orchestrator.truncate_pending_after_wire_drain.assert_called_once_with()
+    assert mock_progress.all_credits_returned_event.is_set()
+
+
 def make_credit(
     credit_id: int = 1,
     conversation_id: str = "conv1",
