@@ -78,6 +78,13 @@ _logger = AIPerfLogger(__name__)
 # Version 5 fixed the Conversation.metadata() projection of per-turn
 # theoretical prefix-cache block counts for realtime infinite-cache hit rate.
 MANIFEST_VERSION = (
+    # v27: deb5421c moved --trace-idle-gap-cap-seconds enforcement from a
+    # load-time timeline warp in the weka loader (_IdleGapTimeWarp) to the
+    # runtime scheduler, so Turn.timestamp / Turn.delay and the per-conversation
+    # start/end timestamps decoded for the same key changed. The key payload was
+    # untouched, so warm caches built before that commit kept serving the warped
+    # timeline under the same key (different dataset.dat, different trajectory
+    # sampling) -- bump explicitly per this file's contract.
     # v26: weka inter-turn delays are now always end-to-start
     # (t_k - (t_{k-1} + api_{k-1}), floored at 0) instead of start-to-start.
     # The use_end_to_start_delays flag was removed, so Turn.delay decodes to
@@ -174,7 +181,7 @@ MANIFEST_VERSION = (
     # v10: merge of the flattened-agent-splitting lineage and the
     # tool-shaping lineage (boundary-cut overhang strip; shaping decided at
     # first emission so reset re-emits reproduce the first-sent shape).
-    26
+    27
 )
 MANIFEST_FILENAME = "manifest.json"
 INPUTS_JSON_FILENAME = "inputs.json"
