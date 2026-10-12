@@ -11,7 +11,35 @@ SPDX-License-Identifier: Apache-2.0
 
 https://inferencex.semianalysis.com/datasets
 
+## Install and run AgentX
 
+Requires Python 3.11–3.13. Install the version matching the GitHub release:
+
+```bash
+pip install agentx-harness==1.0.7
+
+agentx profile \
+  --url "$SERVER_URL" --endpoint /v1/chat/completions \
+  --model "$SERVED_MODEL_NAME" --tokenizer "$TOKENIZER" \
+  --tokenizer-trust-remote-code \
+  --concurrency "$CONC" \
+  --public-dataset "$DATASET" \
+  --output-artifact-dir "$OUTPUT_DIR"
+```
+
+`agentx profile` selects the AgentX scenario automatically. Explicit flags
+override its defaults; `--config`/`-f` uses the scenario and settings in the
+YAML file. See the [AgentX guide](docs/tutorials/agentx-mvp.md) for dataset
+choices and benchmark settings. The underlying `aiperf` command remains
+available for compatibility.
+
+Install in a dedicated virtual environment: this distribution includes the
+fork's `aiperf` Python package and should not be installed alongside the
+upstream `aiperf` distribution. On Linux ARM64, the `crick` dependency requires
+a C compiler to build.
+
+The package name is `agentx-harness`; the command is `agentx`. Releases tagged
+`agentx-vX.Y.Z` publish version `X.Y.Z` automatically to PyPI.
 
 ## Original README.md Below
 

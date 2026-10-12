@@ -12,20 +12,30 @@ does and why.
 
 ---
 
-## Short command with `--scenario agentx`
+## Install and run AgentX
+
+Install the released harness with Python 3.11–3.13:
+
+```bash
+pip install agentx-harness==1.0.7
+```
 
 The `agentx` scenario supplies the defaults used by InferenceX's standalone
 command. Select the server, served model, dataset, concurrency, and output:
 
 ```bash
-aiperf profile \
-  --scenario agentx \
+agentx profile \
   --url http://127.0.0.1:8000 \
   --model moonshotai/Kimi-K3 --tokenizer moonshotai/Kimi-K3 \
   --public-dataset semianalysis_cc_traces_weka_062126 \
   --concurrency 8 \
   --output-artifact-dir ./results/agentx-c8
 ```
+
+The `agentx` command wraps AIPerf and selects `--scenario agentx` automatically
+for flag-based profiles. The equivalent compatibility command is
+`aiperf profile --scenario agentx`. An explicit `--scenario` overrides the
+wrapper default; `--config`/`-f` continues to use the scenario in the YAML file.
 
 The preset supplies streaming chat, a 3,600-second profiling duration, seed 42,
 trajectory start ratios 0.25–0.75, 10 warmup requests per lane, a 1,800-second
@@ -103,8 +113,8 @@ You'll need:
   scheme-prefixed URL; the endpoint path (e.g. `/v1/chat/completions`) is
   appended automatically based on `--endpoint-type`. If the server requires
   authentication, add `--api-key <key>` (sent as a `Bearer` token).
-- AIPerf installed: `pip install aiperf` (or run it ad hoc with
-  `uvx aiperf`).
+- AgentX Harness installed: `pip install agentx-harness==1.0.7`. It also
+  provides the compatibility `aiperf` command used in the examples below.
 - The model's **HuggingFace tokenizer** resolvable from `--model`: the Weka
   loaders rebuild every prompt through it. For a gated repo, export
   `HF_TOKEN`; if `--model` isn't a resolvable HF repo name (a local server

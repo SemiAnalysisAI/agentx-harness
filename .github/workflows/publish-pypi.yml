@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: Publish AgentX to PyPI
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/publish-pypi.yml'
+      - 'tools/build_agentx_release.py'
+      - 'tools/smoke_agentx_package.py'
+      - 'src/**'
+      - 'pyproject.toml'
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentx-pypi-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request' || startsWith(github.event.release.tag_name, 'agentx-v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+      - name: Select release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="${RELEASE_TAG:-agentx-v0.0.0.dev${GITHUB_RUN_ID}}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#agentx-v}" >> "$GITHUB_OUTPUT"
+      - name: Build wheel and source distribution
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          uv run --no-project --with tomlkit --with packaging \
+            tools/build_agentx_release.py --tag "$RELEASE_TAG"
+          uvx --from 'twine>=7' twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentx-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+        distribution: [wheel, sdist]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentx-distributions
+          path: dist
+      - name: Install distribution in a clean environment
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          uv venv "$RUNNER_TEMP/agentx-verify"
+          if [ "$DISTRIBUTION" = wheel ]; then
+            uv pip install --python "$RUNNER_TEMP/agentx-verify/bin/python" dist/*.whl
+          else
+            uv pip install --python "$RUNNER_TEMP/agentx-verify/bin/python" dist/*.tar.gz
+          fi
+      - name: Exercise the installed AgentX command
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          "$RUNNER_TEMP/agentx-verify/bin/python" tools/smoke_agentx_package.py \
+            --executable "$RUNNER_TEMP/agentx-verify/bin/agentx" \
+            --expected-version "$EXPECTED_VERSION" \
+            --output-dir "$RUNNER_TEMP/agentx-smoke"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agentx-smoke-${{ matrix.python }}-${{ matrix.distribution }}
+          path: ${{ runner.temp }}/agentx-smoke
+
+  publish:
+    needs: [build, verify]
+    if: github.event_name == 'release' && github.repository == 'SemiAnalysisAI/agentx-harness'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agentx-harness/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentx-distributions
+          path: dist
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify-pypi:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+      - name: Install the published version from PyPI
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          uv venv "$RUNNER_TEMP/agentx-pypi"
+          for attempt in 1 2 3 4 5; do
+            if uv pip install --python "$RUNNER_TEMP/agentx-pypi/bin/python" \
+              --default-index https://pypi.org/simple --refresh \
+              "agentx-harness==$RELEASE_VERSION"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            sleep 15
+          done
+      - name: Exercise the PyPI installation
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          "$RUNNER_TEMP/agentx-pypi/bin/python" tools/smoke_agentx_package.py \
+            --executable "$RUNNER_TEMP/agentx-pypi/bin/agentx" \
+            --expected-version "$EXPECTED_VERSION" \
+            --output-dir "$RUNNER_TEMP/agentx-pypi-smoke"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agentx-pypi-smoke
+          path: ${{ runner.temp }}/agentx-pypi-smoke

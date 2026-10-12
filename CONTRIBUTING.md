@@ -9,6 +9,35 @@ For technical architecture, see [`docs/architecture.md`](docs/architecture.md). 
 
 ## Development Setup
 
+### AgentX release packaging
+
+Keep the source `pyproject.toml` and `aiperf` package metadata compatible with
+upstream. `tools/build_agentx_release.py` copies Git-tracked files to a temporary
+directory and changes only that copy's distribution name, version, self-referencing
+extras, entry point, and runtime version lookup. The release also requires
+`datasets>=4.7.0` for the public AgentX corpora's heterogeneous JSON fields.
+The standalone `src/agentx_cli.py`
+wrapper delegates to the existing AIPerf commands.
+
+To build a release locally (stage new files first so they are included):
+
+```bash
+uv run --no-project --with tomlkit --with packaging \
+  tools/build_agentx_release.py --tag agentx-v1.0.7
+```
+
+Publishing a GitHub release tagged `agentx-vX.Y.Z` triggers
+`.github/workflows/publish-pypi.yml`. It builds version `X.Y.Z`, exercises wheel
+and source installations on Python 3.11–3.13 against a local HTTP server,
+publishes with PyPI Trusted Publishing, then installs that exact version from
+PyPI and repeats the benchmark check. Pre-release tags use PEP 440 suffixes,
+for example `agentx-v1.0.8rc1`.
+
+The PyPI publisher must match GitHub owner `SemiAnalysisAI`, repository
+`agentx-harness`, workflow `publish-pypi.yml`, and environment `pypi`. No PyPI
+API token is required. The package is initially owned by the maintainer's
+personal PyPI account and can later move to the organization.
+
 ### Prerequisites
 
 - **Python 3.11+**
