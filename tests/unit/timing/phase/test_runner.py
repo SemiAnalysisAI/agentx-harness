@@ -204,6 +204,62 @@ async def runner(
 
 
 class TestPhaseRunnerLifecycle:
+    async def test_sending_boundary_rolls_back_delayed_children_before_scheduler_sweep(
+        self, runner: PhaseRunner
+    ) -> None:
+        events: list[str] = []
+        orchestrator = MagicMock()
+        orchestrator.cancel_pending_delayed_dispatches = AsyncMock(
+            side_effect=lambda: events.append("cancel_children")
+        )
+        orchestrator.expire_replay_deadlines = AsyncMock(
+            side_effect=lambda: events.append("expire_joins")
+        )
+        strategy = MockStrategy()
+        strategy.cancel_pending_child_turns = AsyncMock(
+            side_effect=lambda: events.append("cancel_continuations")
+        )
+        runner._branch_orchestrator = orchestrator
+        runner._scheduler.cancel_all_pending = MagicMock(
+            side_effect=lambda: events.append("cancel_scheduler")
+        )
+        runner._lifecycle.start()
+        runner._progress.all_credits_sent_event.set()
+
+        await runner._wait_for_sending_complete(strategy)
+
+        assert events == [
+            "cancel_children",
+            "cancel_continuations",
+            "cancel_scheduler",
+            "expire_joins",
+        ]
+
+    async def test_pre_return_wait_truncates_dag_after_wire_already_drained(
+        self, runner: PhaseRunner
+    ) -> None:
+        pending = True
+
+        def _has_pending() -> bool:
+            return pending
+
+        def _truncate() -> None:
+            nonlocal pending
+            pending = False
+
+        orchestrator = MagicMock()
+        orchestrator.has_pending_branch_work.side_effect = _has_pending
+        orchestrator.truncate_pending_after_wire_drain.side_effect = _truncate
+        runner._branch_orchestrator = orchestrator
+        runner._progress.check_all_returned_or_cancelled = MagicMock(return_value=True)
+        runner._lifecycle.start()
+        runner._lifecycle.mark_sending_complete(timeout_triggered=True)
+
+        await runner._wait_for_returning_complete(MockStrategy())
+
+        orchestrator.truncate_pending_after_wire_drain.assert_called_once_with()
+        assert runner._progress.all_credits_returned_event.is_set()
+
     async def test_baseline_boundary_capture_is_fire_and_forget(
         self, runner: PhaseRunner, pub: MagicMock
     ) -> None:

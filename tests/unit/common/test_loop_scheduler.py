@@ -160,6 +160,19 @@ class TestScheduleLater:
         assert scheduler.cap_pending_delay(2.0) == 0.0
         scheduler.cancel_all_pending()
 
+    async def test_handle_id_survives_timer_reschedule(self, scheduler: LoopScheduler):
+        """Owners can still cancel a timer after an idle-cap clock jump."""
+
+        async def should_not_run():
+            raise AssertionError("cancelled timer ran")
+
+        handle_id = scheduler.schedule_later(60.0, should_not_run())
+        assert isinstance(handle_id, int)
+        scheduler.cap_pending_delay(10.0)
+
+        assert scheduler.cancel_handle_id(handle_id) is True
+        assert scheduler.pending_count == 0
+
     async def test_cap_pending_delay_for_group_isolated_and_uniform(
         self, scheduler: LoopScheduler
     ):

@@ -212,6 +212,21 @@ def _write_independent_stream_drift_trace(target_dir: Path) -> Path:
     return target_dir
 
 
+def _write_duration_cutoff_child_trace(target_dir: Path) -> Path:
+    """A child whose next recorded turn lies far beyond the phase duration."""
+    _write_trace(
+        target_dir,
+        "trace_duration_cutoff",
+        [
+            _req(0.0, [1, 2, 3], api_time=0.01, out=1),
+            _req(0.05, [1, 2, 10], api_time=0.01, out=1),
+            _req(60.05, [1, 2, 10, 11], api_time=0.01, out=1),
+            _req(60.10, [1, 2, 3, 4], api_time=0.01, out=1),
+        ],
+    )
+    return target_dir
+
+
 def _write_background_trace(target_dir: Path) -> Path:
     """One trace whose worker chain ends after the last main turn, so the loader emits an ``is_background=True`` branch (no SPAWN_JOIN) the runtime must still send and drain cleanly."""
     _write_trace(
@@ -266,10 +281,8 @@ async def _run_weka_profile(
         "--no-fixed-schedule",
         "--benchmark-duration",
         str(duration),
-        # Bounded grace: normal drains finish in ~1-2s; the bound also caps
-        # the cost of a worst-case DAG drain stall (a delay-scheduled child
-        # turn cancelled by the deadline's cancel_all_pending leaves
-        # has_pending_branch_work stuck until the grace timeout fires).
+        # Bounded grace: normal drains finish in ~1-2s; the bound also prevents
+        # a future DAG teardown regression from wedging the integration suite.
         "--benchmark-grace-period",
         "20",
         "--random-seed",
@@ -632,6 +645,38 @@ async def test_cache_warmup_handoff_preserves_order_and_spawn_joins(
     assert branch_stats.children_errored == 0, branch_stats
     assert branch_stats.parents_suspended >= 1, branch_stats
     assert branch_stats.parents_resumed >= 1, branch_stats
+
+
+async def test_duration_cutoff_cancels_delayed_child_without_grace_stall(
+    tmp_path: Path, mock_server_factory: MockServerFactory
+) -> None:
+    """A discarded child continuation drains its join at the send boundary."""
+    corpus = _write_duration_cutoff_child_trace(tmp_path / "traces")
+    async with mock_server_factory(fast=True, workers=2) as server:
+        result = await _run_weka_profile(
+            input_dir=corpus,
+            artifact_dir=tmp_path / "artifacts",
+            url=server.url,
+            duration=1.0,
+            concurrency=1,
+            extra_args=[
+                "--scenario",
+                "inferencex-agentx-mvp",
+                "--unsafe-override",
+                "--warmup-requests-per-lane",
+                "1",
+                "--trajectory-start-min-ratio",
+                "0",
+                "--trajectory-start-max-ratio",
+                "0",
+            ],
+            # The configured grace is 20s. Exiting under this bound proves the
+            # phase did not wait for the grace backstop after wire drain.
+            timeout=18.0,
+        )
+
+    _assert_success(result, "duration-cutoff delayed child teardown")
+    assert "grace_period_timeout=True" not in _combined_log_text(result)
 
 
 async def test_spawn_join_gates_main_turn_until_worker_chain_completes(

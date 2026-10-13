@@ -122,6 +122,44 @@ async def test_offset_child_uses_shared_scheduler_for_idle_cap(
     scheduler.cancel_all()
 
 
+@pytest.mark.asyncio
+async def test_phase_boundary_cancels_pending_scheduler_child_and_drains_dag() -> None:
+    """A duration cutoff must roll back a delayed child before scheduler sweep.
+
+    Regression for the full-replay failure where LoopScheduler closed the
+    never-started coroutine but BranchOrchestrator retained its child, join,
+    and descendant entries until the phase grace timeout.
+    """
+    parent = _parent_conv(
+        [_spawn_branch("b0", ["kid"], start_timestamp_ms=0.0, is_background=False)],
+        gated_turn=1,
+    )
+    scheduler = LoopScheduler()
+    orch, _, issuer = _mk_harness(
+        [parent, _child_conv("kid", 60_000.0)],
+        scheduler=scheduler,
+    )
+
+    assert await orch.intercept(_mk_credit("parent", "P", 0)) is True
+    # One timer is the child dispatch and one is the gated parent's replay
+    # deadline. The branch-specific cancellation must remove only the former.
+    assert scheduler.pending_count == 2
+    assert orch.has_pending_branch_work()
+    assert "P" in orch._active_joins
+
+    await orch.cancel_pending_delayed_dispatches()
+    assert scheduler.pending_count == 1
+    scheduler.cancel_all_pending()
+    await orch.expire_replay_deadlines()
+
+    issuer.dispatch_first_turn.assert_not_awaited()
+    issuer.dispatch_join_turn.assert_awaited_once()
+    assert scheduler.pending_count == 0
+    assert orch.stats.children_truncated == 1
+    assert orch._scheduled_delayed_dispatches == {}
+    assert not orch.has_pending_branch_work()
+
+
 def _mk_credit(conv_id: str, corr_id: str, turn_index: int):
     return MagicMock(
         x_correlation_id=corr_id,

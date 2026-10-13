@@ -23,8 +23,11 @@ firing immediately, reproducing the recorded in-subagent timing (e.g. a
 weka overflow stream whose first request landed minutes after the subagent
 spawned). Join gates and descendant counts are registered before scheduling,
 so gated parents wait for delayed children; ``cleanup()`` cancels pending
-dispatches. Datasets without timing (``--ignore-trace-delays``) carry None
-timestamps and keep the immediate-dispatch behavior.
+dispatches. At a phase deadline, pending child dispatches are cancelled through
+the orchestrator before the shared scheduler is swept so their pre-registered
+join and descendant bookkeeping is rolled back. Datasets without timing
+(``--ignore-trace-delays``) carry None timestamps and keep the
+immediate-dispatch behavior.
 
 Sticky-routing locality (FORK mode)
 -----------------------------------
@@ -310,6 +313,11 @@ class BranchOrchestrator:
         # timers uniformly with every other replay timer. The task set is a
         # compatibility fallback for isolated callers that provide no scheduler.
         self._delayed_dispatch_tasks: set[asyncio.Task] = set()
+        # child correlation ID -> (shared-scheduler handle ID, child, parent).
+        # A pending timer owns already-registered join/descendant bookkeeping;
+        # closing its coroutine through LoopScheduler alone would bypass the
+        # rollback body and leave has_pending_branch_work() true forever.
+        self._scheduled_delayed_dispatches: dict[str, tuple[int, object, str]] = {}
         # Drain observer: sync callback fired after state mutations that may
         # drain has_pending_branch_work() to False. Wired by
         # CreditCallbackHandler.set_branch_orchestrator to re-evaluate the
@@ -1262,10 +1270,18 @@ class BranchOrchestrator:
         callers without a scheduler retain the legacy task/sleep fallback.
         """
         if self._scheduler is not None:
-            self._scheduler.schedule_later(
+            handle_id = self._scheduler.schedule_later(
                 offset_ms / 1000.0,
                 self._dispatch_first_turn_after_offset(child, 0.0, parent_corr),
                 group_id=child.effective_root_correlation_id,
+            )
+            # offset_ms is strictly positive in this path, so schedule_later
+            # returns a pending handle ID rather than a running Task.
+            assert isinstance(handle_id, int)
+            self._scheduled_delayed_dispatches[child.x_correlation_id] = (
+                handle_id,
+                child,
+                parent_corr,
             )
             self.stats.children_delayed += 1
             return
@@ -1289,6 +1305,7 @@ class BranchOrchestrator:
         refusal. Dispatch and settlement run under the parent lock, matching
         the intercept path's locking.
         """
+        self._scheduled_delayed_dispatches.pop(child.x_correlation_id, None)
         await self._sleep_offset_ms(offset_ms)
         if self._cleaning_up:
             return
@@ -1301,6 +1318,37 @@ class BranchOrchestrator:
                 ChildDispatchResult.normalize(result) is ChildDispatchResult.REJECTED
             ):
                 self._rollback_failed_first_turn(child, result, parent_corr)
+                await self._finalize_failed_dispatches(parent_corr)
+
+    async def cancel_pending_delayed_dispatches(self) -> None:
+        """Cancel scheduler-pending child turns and roll back DAG bookkeeping.
+
+        PhaseRunner calls this before LoopScheduler.cancel_all_pending() at a
+        sending boundary. A coroutine that has already started is deliberately
+        left alone: it either reaches the wire and drains normally or observes
+        the phase stop condition and performs its existing refusal rollback.
+        """
+        if self._scheduler is None:
+            return
+
+        cancelled_by_parent: defaultdict[str, list[object]] = defaultdict(list)
+        # Do not await until every still-pending handle has been cancelled. This
+        # keeps a timer from firing between its cancellation and bookkeeping
+        # capture on the single event-loop thread.
+        for child_corr, (handle_id, child, parent_corr) in list(
+            self._scheduled_delayed_dispatches.items()
+        ):
+            if not self._scheduler.cancel_handle_id(handle_id):
+                continue
+            self._scheduled_delayed_dispatches.pop(child_corr, None)
+            cancelled_by_parent[parent_corr].append(child)
+
+        for parent_corr, children in cancelled_by_parent.items():
+            async with self._parent_locks[parent_corr]:
+                for child in children:
+                    self._rollback_failed_first_turn(
+                        child, ChildDispatchResult.REJECTED, parent_corr
+                    )
                 await self._finalize_failed_dispatches(parent_corr)
 
     def _ensure_future_join(
@@ -1761,6 +1809,74 @@ class BranchOrchestrator:
             return any(count > 0 for count in self._descendant_counts.values())
         return False
 
+    def truncate_pending_after_wire_drain(self) -> None:
+        """Settle scheduling-only DAG state after a terminal phase cutoff.
+
+        Once sending is complete and every frozen wire request has returned,
+        no pending join or descendant can legally produce another request.
+        Such state represents a continuation whose timer/barrier was cancelled
+        at the phase boundary, not live server work.  Drain it synchronously so
+        ``all_credits_returned_event`` can fire without waiting for the grace
+        timeout.  The caller owns both preconditions; this method deliberately
+        has no force/timeout policy of its own.
+        """
+        if self._cleaning_up or not self.has_pending_branch_work():
+            return
+
+        tracked_children = list(self._child_to_join.items())
+        pending_child_ids = set(self._child_root) | {
+            child_corr for child_corr, _ in tracked_children
+        }
+        parent_ids: set[str] = set()
+
+        for child_corr, entries in tracked_children:
+            self._child_to_join.pop(child_corr, None)
+            if entries:
+                parent = entries[0].parent_correlation_id
+                parent_ids.add(parent)
+                child_mode = self._child_modes.pop(child_corr, None)
+                if (
+                    child_mode == ConversationBranchMode.FORK
+                    and self._sticky_router is not None
+                ):
+                    self._sticky_router.release_child_routing(parent)
+                if self._descendant_counts.get(parent, 0) > 0:
+                    self._descendant_counts[parent] -= 1
+            self._tree_descendant_done(child_corr)
+
+        # ``_child_root`` is normally a subset of ``_child_to_join``.  Settle
+        # any orphaned registry entries too; keeping them would leak a tree
+        # slot even though no wire callback can arrive for the child.
+        for child_corr in pending_child_ids:
+            if child_corr in self._child_root:
+                self._tree_descendant_done(child_corr)
+            self._child_modes.pop(child_corr, None)
+
+        active_joins = len(self._active_joins)
+        future_joins = sum(len(gates) for gates in self._future_joins.values())
+        parent_ids.update(self._active_joins)
+        parent_ids.update(self._future_joins)
+        self._active_joins.clear()
+        self._future_joins.clear()
+
+        for parent in parent_ids:
+            self._release_parent_slot_if_drained(parent)
+        # A non-zero residue here has no remaining child owner.  It is stale
+        # logical accounting at the terminal boundary, so clear it explicitly.
+        self._descendant_counts.clear()
+        self._parent_locks.clear()
+
+        self.stats.children_truncated += len(tracked_children)
+        self.stats.joins_suppressed += active_joins + future_joins
+        logger.info(
+            "Terminal wire drain truncated pending DAG state: children=%d "
+            "active_joins=%d future_joins=%d",
+            len(tracked_children),
+            active_joins,
+            future_joins,
+        )
+        self._notify_drain()
+
     def snapshot_branch_stats(self) -> BranchStats:
         """Return a deep copy of the current branch stats.
 
@@ -1778,6 +1894,10 @@ class BranchOrchestrator:
         for task in self._delayed_dispatch_tasks:
             task.cancel()
         self._delayed_dispatch_tasks.clear()
+        if self._scheduler is not None:
+            for handle_id, _, _ in self._scheduled_delayed_dispatches.values():
+                self._scheduler.cancel_handle_id(handle_id)
+        self._scheduled_delayed_dispatches.clear()
         s = self.stats
         logger.info(
             "BranchOrchestrator stats: spawned=%d completed=%d errored=%d "

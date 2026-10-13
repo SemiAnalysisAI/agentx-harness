@@ -1675,6 +1675,7 @@ async def test_profiling_burst_normalizes_offsets_first_request_fires_at_zero():
 
     issuer = AsyncMock()
     issuer.issue_credit.side_effect = capture
+    issuer.dispatch_child_turn.side_effect = capture
     scheduled: list[tuple[float, object]] = []
 
     def fake_schedule_later(delay, coro, **_kwargs):
@@ -1683,6 +1684,7 @@ async def test_profiling_burst_normalizes_offsets_first_request_fires_at_zero():
     scheduler = MagicMock()
     scheduler.schedule_later.side_effect = fake_schedule_later
     branch_orchestrator = MagicMock()
+    branch_orchestrator.on_child_stopped = AsyncMock()
 
     cfg = MagicMock()
     cfg.phase = CreditPhase.PROFILING
@@ -1793,6 +1795,7 @@ async def test_profiling_global_anchor_preserves_subagent_spacing():
 
     issuer = AsyncMock()
     issuer.issue_credit.side_effect = capture
+    issuer.dispatch_child_turn.side_effect = capture
     scheduled: list[tuple[float, object]] = []
     scheduler = MagicMock()
     scheduler.schedule_later.side_effect = (
@@ -1802,6 +1805,8 @@ async def test_profiling_global_anchor_preserves_subagent_spacing():
     cfg = MagicMock()
     cfg.phase = CreditPhase.PROFILING
     cfg.concurrency = 1
+    branch_orchestrator = MagicMock()
+    branch_orchestrator.on_child_stopped = AsyncMock()
     strategy = AgenticReplayStrategy(
         config=cfg,
         conversation_source=src,
@@ -1809,7 +1814,7 @@ async def test_profiling_global_anchor_preserves_subagent_spacing():
         stop_checker=MagicMock(),
         credit_issuer=issuer,
         lifecycle=MagicMock(),
-        branch_orchestrator=MagicMock(),
+        branch_orchestrator=branch_orchestrator,
     )
     await strategy.setup_phase()
     await strategy.execute_phase()
