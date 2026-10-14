@@ -83,9 +83,9 @@ class SampledSession:
     def routing_key(self) -> str:
         """Sticky-routing key.
 
-        Returns the parent's correlation_id when set (so FORK children share
-        a worker with the parent), otherwise this session's own
-        x_correlation_id.
+        Returns the parent's correlation_id when set, otherwise this
+        session's own x_correlation_id. The router computes its own key; a
+        SPAWN child follows this only on its first turn.
         """
         return self.parent_correlation_id or self.x_correlation_id
 
@@ -214,10 +214,10 @@ class ConversationSource:
         to the parent's worker, where ``UserSessionManager.create_and_store``
         seeds ``turn_list`` by cloning the parent's in-memory session.
         SPAWN-mode children start with a fresh context, but still carry
-        ``parent_correlation_id`` so the sticky router co-locates them on the
-        parent's worker while that entry is live. The orchestrator skips
-        SPAWN sticky refcount bumps; least-loaded routing applies only once
-        the parent sticky entry is gone.
+        ``parent_correlation_id`` so their first turn co-locates on the
+        parent's worker when that entry is live; the router then pins them
+        under their own correlation id. The orchestrator skips SPAWN parent
+        refcount bumps.
 
         ``root_correlation_id`` is the depth-0 root of the spawning parent's
         tree; the child inherits it so all descendants of one root share a
@@ -257,7 +257,7 @@ class ConversationSource:
         correlation id, ``agent_depth=1``, and ``parent_correlation_id=None``
         (no real parent session exists yet). Because ``parent_correlation_id``
         is None, the child's ``routing_key`` naturally equals its own
-        ``x_correlation_id`` — the child routes freely (no sticky pin).
+        ``x_correlation_id``, so the router pins it like a root.
 
         Restricted to SPAWN mode with ``dispatch_timing="pre"`` at the validator
         level; FORK pre-dispatch would require inheriting a non-existent

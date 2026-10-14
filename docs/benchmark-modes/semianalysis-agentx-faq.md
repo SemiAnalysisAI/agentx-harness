@@ -602,10 +602,12 @@ reconstructed dataset.
 A session's subagents become **child sessions** of the parent session. AIPerf has two relationship
 modes for such children:
 
-- **Spawn**: the child starts with fresh context and sticky-co-locates on the
-  parent's AIPerf worker while that sticky entry is live (no SPAWN refcount
-  bump; least-loaded after the parent entry is gone). It may start after a
-  recorded delay relative to the parent turn that launched it.
+- **Spawn**: the child starts with fresh context on the parent's AIPerf
+  worker when the parent's sticky entry is live (least-loaded otherwise), then stays
+  on the worker it started on until it ends, even after the parent finishes
+  (it re-pins only if that worker leaves the run).
+  It may start after a recorded delay relative to the parent turn that
+  launched it.
 - **Fork**: the child inherits (continues) the parent's accumulated context,
   sticky-routed to the same worker and starting from the parent's full prompt
   prefix.
