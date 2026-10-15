@@ -18,8 +18,10 @@ from aiperf.common.models import (
     Turn,
 )
 from aiperf.config.phases import ConcurrencyPhase
+from aiperf.credit.messages import CreditReturn, FirstToken, StreamingContent
 from aiperf.credit.structs import Credit, CreditContext
 from aiperf.dataset.memory_map_utils import PayloadTurnData
+from aiperf.endpoints.openai_chat import ChatEndpoint
 from aiperf.workers.worker import (
     Worker,
     _is_terminal_context_overflow,
@@ -1124,3 +1126,119 @@ class TestMakeFirstTokenCallback:
         assert sent.credit_id == sample_credit_context.credit.id
         assert sent.phase_index == sample_credit_context.credit.phase_index
         assert sent.ttft_ns == 50_000_000
+
+    @pytest.mark.parametrize("prefill_enabled", [False, True])
+    async def test_callback_tracks_content_until_cancellation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_worker: Worker,
+        sample_credit_context: CreditContext,
+        prefill_enabled: bool,
+    ) -> None:
+        mock_worker._prefill_concurrency_enabled = prefill_enabled
+        mock_worker._streaming_coverage_enabled = True
+        mock_worker.credit_return_push_client = AsyncMock()
+        mock_worker._send_inference_result_message = AsyncMock()
+        monkeypatch.setattr(
+            "aiperf.workers.worker.time.time_ns", lambda: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            "aiperf.workers.worker.time.perf_counter_ns", lambda: 1_000_000_000
+        )
+        setup_mock_endpoint(
+            mock_worker,
+            monkeypatch,
+            [
+                None,
+                ParsedResponse(
+                    perf_ns=2_000_000_000, data=TextResponseData(text="first")
+                ),
+                ParsedResponse(
+                    perf_ns=2_500_000_000, data=TextResponseData(text="middle")
+                ),
+                ParsedResponse(
+                    perf_ns=3_000_000_000, data=TextResponseData(text="last")
+                ),
+                ParsedResponse(perf_ns=4_000_000_000, data=None),
+            ],
+        )
+        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        assert callback is not None
+        for timestamp in (
+            1_000_000_000,
+            2_000_000_000,
+            2_500_000_000,
+            3_000_000_000,
+            4_000_000_000,
+        ):
+            assert await callback(1, SSEMessage(perf_ns=timestamp)) is False
+        assert sample_credit_context.last_streaming_content_ns == 12_000_000_000
+        mock_worker._process_credit = AsyncMock(side_effect=asyncio.CancelledError)
+
+        await mock_worker._on_credit_drop_message_task(sample_credit_context)
+
+        messages = [
+            call.args[0]
+            for call in mock_worker.credit_return_push_client.send.await_args_list
+        ]
+        assert sum(isinstance(message, FirstToken) for message in messages) == int(
+            prefill_enabled
+        )
+        content_reports = [
+            message for message in messages if isinstance(message, StreamingContent)
+        ]
+        assert [message.timestamp_ns for message in content_reports] == [
+            11_000_000_000,
+            12_000_000_000,
+        ]
+        returned = messages[-1]
+        assert isinstance(returned, CreditReturn)
+        assert returned.cancelled is True
+        assert returned.last_streaming_content_ns == 12_000_000_000
+        mock_worker._send_inference_result_message.assert_not_called()
+
+    async def test_callback_warmup_does_not_track_profile_coverage(
+        self,
+        mock_worker: Worker,
+    ) -> None:
+        mock_worker._prefill_concurrency_enabled = False
+        mock_worker._streaming_coverage_enabled = True
+        credit_context = TestCreateRequestInfo._warmup_override_credit()
+        assert mock_worker._make_first_token_callback(credit_context) is None
+
+    @pytest.mark.parametrize(
+        "payload,has_content",
+        [
+            param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"hello"}}]}', True, id="text"),
+            param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"reasoning_content":"thinking"}}]}', True, id="reasoning"),
+            param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}', False, id="role"),
+            param('data: {"object":"chat.completion.chunk","choices":[],"usage":{"completion_tokens":10}}', False, id="usage"),
+            param('data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}', False, id="finish"),
+            param(': keepalive', False, id="keepalive"),
+            param('data: [DONE]', False, id="done"),
+        ],
+    )  # fmt: skip
+    async def test_callback_counts_only_parsed_content(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_worker: Worker,
+        sample_credit_context: CreditContext,
+        payload: str,
+        has_content: bool,
+    ) -> None:
+        mock_worker._streaming_coverage_enabled = True
+        mock_worker._prefill_concurrency_enabled = False
+        mock_worker.credit_return_push_client = AsyncMock()
+        monkeypatch.setattr(
+            mock_worker.inference_client,
+            "endpoint",
+            ChatEndpoint(mock_worker.model_endpoint),
+        )
+        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        assert callback is not None
+
+        assert await callback(1, SSEMessage.parse(payload, perf_ns=1)) is False
+
+        assert (
+            sample_credit_context.last_streaming_content_ns is not None
+        ) is has_content

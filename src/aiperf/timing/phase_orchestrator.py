@@ -210,6 +210,9 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
         self._credit_router.set_first_token_callback(
             self._callback_handler.on_first_token
         )
+        self._credit_router.set_streaming_content_callback(
+            self._callback_handler.on_streaming_content
+        )
 
         # Phase configuration
         self._ordered_phase_configs = config.phase_configs
