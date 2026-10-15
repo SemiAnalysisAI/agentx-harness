@@ -333,6 +333,9 @@ def _load_or_init_metric_baseline(current: list[str]) -> list[str]:
 # are not FiniteFloat. Most are: integer enums, free-form pass-through ints,
 # or fields validated downstream rather than at field level.
 NUMERIC_BOUNDS_WHITELIST: set[str] = {
+    # ScenarioSpec.environment_defaults: values are forwarded to Environment
+    # subsystems, whose own fields carry the bounds.
+    "ScenarioSpec.environment_defaults",
     # SweepVariation.index: zero-based index, bounded by sweep size at
     # runtime; no useful field-level upper bound.
     "SweepVariation.index",
