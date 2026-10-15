@@ -496,8 +496,22 @@ class TestLookupAndPopulate:
         raw["version"] = 22
         manifest_path.write_bytes(orjson.dumps(raw))
 
-        assert mmap_cache.MANIFEST_VERSION == 26
+        assert mmap_cache.MANIFEST_VERSION == 27
         assert mmap_cache.lookup("pre-overlap-frontier", compressed=False) is None
+
+    def test_lookup_rejects_pre_runtime_idle_cap_manifest(self, tmp_path: Path) -> None:
+        # v26 entries were written before the load-time idle-gap warp was
+        # removed; they decode a different timeline for the same key.
+        cache_root = mmap_cache.cache_dir()
+        _populate_entry(cache_root, cache_key="pre-runtime-idle-cap")
+        manifest_path = (
+            cache_root / "pre-runtime-idle-cap" / mmap_cache.MANIFEST_FILENAME
+        )
+        raw = orjson.loads(manifest_path.read_bytes())
+        raw["version"] = 26
+        manifest_path.write_bytes(orjson.dumps(raw))
+
+        assert mmap_cache.lookup("pre-runtime-idle-cap", compressed=False) is None
 
     def test_lookup_compressed_mismatch_returns_none(self, tmp_path: Path) -> None:
         cache_root = mmap_cache.cache_dir()
