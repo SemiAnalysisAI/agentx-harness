@@ -280,6 +280,7 @@ class PhaseRunner(TaskManagerMixin):
             ),
             replay_barrier=self._replay_barrier,
             cache_bust_target=self._resolve_cache_bust_target(),
+            runtime=self._runtime,
         )
 
     def _maybe_construct_branch_orchestrator(
@@ -446,14 +447,14 @@ class PhaseRunner(TaskManagerMixin):
             self._on_phase_complete()
 
     def _capture_baseline_boundary(self, phase_id: str, kind: BaselineKind) -> int:
-        boundary_ns = time.time_ns()
+        boundary_ns = self._runtime.timestamp_ns()
         self.execute_async(self._publish_phase_baseline_request(phase_id, kind))
         return boundary_ns
 
     async def _capture_baseline_boundary_before_completion(
         self, phase_id: str, kind: BaselineKind
     ) -> int:
-        boundary_ns = time.time_ns()
+        boundary_ns = self._runtime.timestamp_ns()
         await self._publish_phase_baseline_request(phase_id, kind)
         return boundary_ns
 
@@ -516,6 +517,7 @@ class PhaseRunner(TaskManagerMixin):
             session_tree_registry=self._session_tree_registry,
             concurrency_manager=self._concurrency_manager,
             progress=self._progress,
+            runtime=self._runtime,
         )
 
     def _register_strategy_with_callback_handler(
@@ -630,7 +632,11 @@ class PhaseRunner(TaskManagerMixin):
         ):
             await self._branch_orchestrator.dispatch_pre_session_branches()
 
-        self._execution_task = self.execute_async(strategy.execute_phase())
+        self._execution_task = (
+            self._scheduler.execute_async(strategy.execute_phase())
+            if self._runtime.is_virtual
+            else self.execute_async(strategy.execute_phase())
+        )
 
         await self._wait_for_sending_complete(strategy)
 
@@ -1077,6 +1083,7 @@ class PhaseRunner(TaskManagerMixin):
         drain (that paused work IS the handoff payload).
         """
         timed_out = False
+        failed = False
         try:
             allows_pending_branch_handoff = (
                 getattr(
@@ -1146,14 +1153,15 @@ class PhaseRunner(TaskManagerMixin):
                 # Wait with timeout to avoid hanging indefinitely
                 drain_timeout = Environment.TIMING.CANCEL_DRAIN_TIMEOUT
                 try:
-                    await asyncio.wait_for(
-                        self._progress.all_credits_returned_event.wait(),
-                        timeout=drain_timeout,
+                    await self._runtime.wait_wall_event(
+                        self._progress.all_credits_returned_event, drain_timeout
                     )
                     self.info(
                         f"All cancelled credits returned for phase {self._config.phase}"
                     )
                 except TimeoutError:
+                    if self._runtime.is_virtual:
+                        raise RuntimeError("Cancelled credits did not drain") from None
                     self.error(
                         f"Timeout waiting {drain_timeout}s for cancelled credits to return. "
                         f"Some credits may be stuck. Forcing phase completion."
@@ -1165,22 +1173,34 @@ class PhaseRunner(TaskManagerMixin):
                         self._lifecycle.mark_complete(grace_period_triggered=True)
                         self._progress.freeze_completed_counts()
                     self._progress.all_credits_returned_event.set()
+        except BaseException:
+            failed = self._runtime.is_virtual
+            raise
         finally:
-            if not self._lifecycle.is_complete:
-                self._lifecycle.mark_complete(grace_period_triggered=timed_out)
-                self._progress.freeze_completed_counts()
-            if phase_id is not None and self._baseline_end_ns is None:
-                self._baseline_end_ns = (
-                    await self._capture_baseline_boundary_before_completion(
-                        phase_id, BaselineKind.END
-                    )
+            if not failed:
+                await self._publish_returning_complete(
+                    timed_out=timed_out, phase_id=phase_id
                 )
-            stats = self._create_final_stats()
-            self.notice(self._format_phase_complete(stats))
-            await self._phase_publisher.publish_progress(stats)
-            await self._phase_publisher.publish_phase_complete(
-                stats, branch_stats=self._snapshot_branch_stats()
+
+    async def _publish_returning_complete(
+        self, *, timed_out: bool, phase_id: str | None
+    ) -> None:
+        """Capture the completed phase boundary and publish its final counters."""
+        if not self._lifecycle.is_complete:
+            self._lifecycle.mark_complete(grace_period_triggered=timed_out)
+            self._progress.freeze_completed_counts()
+        if phase_id is not None and self._baseline_end_ns is None:
+            self._baseline_end_ns = (
+                await self._capture_baseline_boundary_before_completion(
+                    phase_id, BaselineKind.END
+                )
             )
+        stats = self._create_final_stats()
+        self.notice(self._format_phase_complete(stats))
+        await self._phase_publisher.publish_progress(stats)
+        await self._phase_publisher.publish_phase_complete(
+            stats, branch_stats=self._snapshot_branch_stats()
+        )
 
     def _release_stuck_slots(self) -> None:
         """Release concurrency slots for credits that will never return."""
@@ -1222,7 +1242,7 @@ class PhaseRunner(TaskManagerMixin):
         if timeout is None:
             self.debug(lambda: f"Waiting for event '{name}' indefinitely")
             if task_to_cancel is None:
-                await event.wait()
+                await self._runtime.wait_event(event)
             else:
                 await self._wait_for_event_or_task_exception(
                     event, task_to_cancel, name
@@ -1243,7 +1263,7 @@ class PhaseRunner(TaskManagerMixin):
 
         try:
             self.info(f"Waiting for event '{name}' with timeout of {timeout}s")
-            await asyncio.wait_for(event.wait(), timeout=timeout)
+            await self._runtime.wait_event(event, timeout=timeout)
             self.debug(lambda: f"Event '{name}' set before timeout of {timeout}s")
             return False
 
@@ -1265,7 +1285,7 @@ class PhaseRunner(TaskManagerMixin):
         done-callback only discards it from the task set, so an exception it
         raises is otherwise never retrieved and the wait hangs forever (#1041).
         """
-        event_task = asyncio.ensure_future(event.wait())
+        event_task = asyncio.ensure_future(self._runtime.wait_event(event))
         try:
             await asyncio.wait({event_task, task}, return_when=asyncio.FIRST_COMPLETED)
             # A failure wins over a same-tick event completion; FIRST_COMPLETED

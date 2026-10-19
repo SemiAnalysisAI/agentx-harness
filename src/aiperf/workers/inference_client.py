@@ -63,6 +63,7 @@ class InferenceClient(AIPerfLifecycleMixin):
         service_id: str,
         *,
         strip_record_payload_bytes: bool = False,
+        benchmark_id: str | None = None,
         **kwargs,
     ):
         super().__init__(model_endpoint=model_endpoint, service_id=service_id, **kwargs)
@@ -87,7 +88,14 @@ class InferenceClient(AIPerfLifecycleMixin):
         TransportClass = plugins.get_class(
             PluginType.TRANSPORT, str(self.model_endpoint.transport)
         )
-        self.transport = TransportClass(model_endpoint=self.model_endpoint)
+        transport_kwargs = (
+            {"benchmark_id": benchmark_id}
+            if self.model_endpoint.transport == TransportType.SGLANG_SIMULATOR
+            else {}
+        )
+        self.transport = TransportClass(
+            model_endpoint=self.model_endpoint, **transport_kwargs
+        )
         self.attach_child_lifecycle(self.transport)
 
     async def _send_request_to_transport(
@@ -271,8 +279,20 @@ class InferenceClient(AIPerfLifecycleMixin):
             if self.strip_record_payload_bytes:
                 record.request_info.payload_bytes = None
 
-        # If this is the first turn, calculate the credit drop latency
-        if request_info.turn_index == 0 and request_info.drop_perf_ns is not None:
+        if (
+            self.model_endpoint.transport == TransportType.SGLANG_SIMULATOR
+            and record.server_timing is None
+        ):
+            from aiperf.simulation.record_timing import normalize_unavailable_timing
+
+            normalize_unavailable_timing(record)
+
+        # The worker credit-drop clock has no counterpart in virtual time.
+        if (
+            record.server_timing is None
+            and request_info.turn_index == 0
+            and request_info.drop_perf_ns is not None
+        ):
             record.credit_drop_latency = (
                 record.start_perf_ns - request_info.drop_perf_ns
             )

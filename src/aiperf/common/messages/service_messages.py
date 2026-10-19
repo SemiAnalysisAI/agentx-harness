@@ -71,3 +71,7 @@ class BaseServiceErrorMessage(BaseServiceMessage):
     message_type: MessageTypeT = MessageType.SERVICE_ERROR
 
     error: ErrorDetails = Field(..., description="Error information")
+    abort_run: bool = Field(
+        default=False,
+        description="Cancel profiling and collect partial results before shutdown.",
+    )

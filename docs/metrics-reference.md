@@ -214,6 +214,16 @@ any knowledge of the individual request/response data.
 
 ### Time to First Token (TTFT)
 
+With the opt-in `sglang_simulator` transport, generation boundaries come from the
+server's virtual clock. TTFT uses the first generated token; request latency uses
+the last generated token. Full-response metrics end at the virtual terminal.
+ITL and throughput retain their formulas and use native usage counts. These
+measure simulated generation, excluding physical HTTP and detokenization delays.
+Merged SSE chunks do not change these measurements. TTST, ICL, TTFO, HTTP setup,
+and network tracing are unavailable in this mode. Missing timing metadata produces
+an error record with no timing samples. Ordinary transports keep the definitions
+below.
+
 **Type:** [Record Metric](#record-metrics)
 
 Measures how long it takes to receive the first token (or chunk of tokens) after sending a request. This is critical for user-perceived responsiveness in streaming scenarios, as it represents how quickly the model begins generating output.

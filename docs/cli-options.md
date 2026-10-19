@@ -397,8 +397,8 @@ API authentication key for the endpoint. When provided, automatically included i
 
 #### `--transport`, `--transport-type` `<str>`
 
-Transport protocol to use for API requests. If not specified, auto-detected from the URL scheme (`http`/`https` -> `TransportType.HTTP`). Currently supports `http` transport using aiohttp with connection pooling, TCP optimization, and Server-Sent Events (SSE) for streaming. Explicit override rarely needed.
-<br/>_Choices: [`http`]_
+Transport protocol to use for API requests. If not specified, auto-detected from the URL scheme (`http`/`https` -> `TransportType.HTTP`). The `http` transport uses aiohttp with connection pooling and Server-Sent Events (SSE). Select `sglang_simulator` explicitly for coordinated simulator runs.
+<br/>_Choices: [`http`, `sglang_simulator`]_
 
 #### `--use-legacy-max-tokens`
 
@@ -1960,8 +1960,8 @@ API authentication key for the endpoint. When provided, automatically included i
 
 #### `--transport`, `--transport-type` `<str>`
 
-Transport protocol to use for API requests. If not specified, auto-detected from the URL scheme (`http`/`https` -> `TransportType.HTTP`). Currently supports `http` transport using aiohttp with connection pooling, TCP optimization, and Server-Sent Events (SSE) for streaming. Explicit override rarely needed.
-<br/>_Choices: [`http`]_
+Transport protocol to use for API requests. If not specified, auto-detected from the URL scheme (`http`/`https` -> `TransportType.HTTP`). The `http` transport uses aiohttp with connection pooling and Server-Sent Events (SSE). Select `sglang_simulator` explicitly for coordinated simulator runs.
+<br/>_Choices: [`http`, `sglang_simulator`]_
 
 #### `--use-legacy-max-tokens`
 

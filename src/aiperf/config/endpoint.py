@@ -208,9 +208,9 @@ class EndpointConfig(BaseConfig):
         TransportType | None,
         Field(
             default=None,
-            description="Transport plugin name. Currently only 'http' (aiohttp-based "
-            "HTTP/1.1) is shipped. Auto-detected from URL when unset; explicit "
-            "setting overrides auto-detection.",
+            description="Transport plugin name. Uses 'http' (aiohttp-based HTTP/1.1) "
+            "when auto-detected from the URL. Select 'sglang_simulator' explicitly "
+            "for coordinated simulator runs.",
         ),
     ]
 

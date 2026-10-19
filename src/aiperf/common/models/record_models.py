@@ -42,6 +42,7 @@ from aiperf.common.models.error_models import ErrorDetails, ErrorDetailsCount
 from aiperf.common.models.export_models import JsonMetricResult, TelemetryExportData
 from aiperf.common.models.model_endpoint_info import ModelEndpointInfo
 from aiperf.common.models.server_metrics_models import ServerMetricsResults
+from aiperf.common.models.server_timing import ServerTiming
 from aiperf.common.models.spec_decode_models import SpecDecodeAcceptanceRecord
 from aiperf.common.models.trace_models import BaseTraceData, TraceDataExport
 from aiperf.common.models.usage_models import Usage
@@ -1145,6 +1146,11 @@ class RequestRecord(AIPerfBaseModel):
     recv_start_perf_ns: int | None = Field(
         default=None,
         description="The start time of the streaming response in nanoseconds (perf_counter_ns).",
+    )
+    server_timing: ServerTiming | None = Field(
+        default=None,
+        description="Optional simulator generation boundaries in the request performance-clock domain. "
+        "An empty object marks unavailable timing; None preserves client-observed timing.",
     )
     status: int | None = Field(
         default=None,

@@ -14,6 +14,7 @@ from aiperf.common.models import (
     DatasetMetadata,
     TurnMetadata,
 )
+from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
 from aiperf.config.rate_series import RateSeriesConfig
 from aiperf.credit.sticky_router import StickyCreditRouter
 from aiperf.credit.structs import Credit
@@ -1007,6 +1008,31 @@ class TestEdgeCases:
         router.cancel_all_credits.assert_awaited_once()
         assert r._progress.all_credits_returned_event.is_set()
         r._concurrency_manager.release_stuck_slots.assert_not_called()
+
+    async def test_virtual_cancel_drain_failure_is_not_published_as_completion(
+        self, runner: PhaseRunner, pub: MagicMock
+    ) -> None:
+        runner._runtime = VirtualTimingRuntime()
+        runner._runtime.wait_wall_event = AsyncMock(side_effect=TimeoutError)
+        runner._lifecycle.start()
+        runner._lifecycle.mark_sending_complete()
+        runner._progress.check_all_returned_or_cancelled = MagicMock(return_value=False)
+        runner._progress.create_stats = MagicMock(
+            return_value=CreditPhaseStats(
+                phase=CreditPhase.PROFILING,
+                start_ns=1,
+                final_requests_sent=1,
+                requests_sent=1,
+                requests_completed=0,
+                requests_cancelled=0,
+            )
+        )
+        runner._wait_for_event_with_timeout = AsyncMock(return_value=True)
+        with pytest.raises(RuntimeError, match="Cancelled credits did not drain"):
+            await runner._wait_for_returning_complete(MagicMock())
+        pub.publish_phase_complete.assert_not_awaited()
+        assert not runner._lifecycle.is_complete
+        assert not runner._progress.all_credits_returned_event.is_set()
 
 
 class TestFixedScheduleConfigCorrection:

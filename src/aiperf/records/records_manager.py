@@ -2280,6 +2280,14 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         metric_duration_coverage, fatal_errors = (
             self._validate_profile_metric_duration_coverage(phase, cancelled)
         )
+        # A failed simulation may never commit its final phase boundary. Zero
+        # exports as an unknown timestamp; physical time is a different clock.
+        fallback_timestamp_ns = (
+            (lambda: 0)
+            if cancelled and self.run.cfg.endpoint.transport == "sglang_simulator"
+            else time.time_ns
+        )
+
         # Cross-accumulator analyzer plugins (e.g. energy efficiency) run after
         # all accumulators have summarized, reading peers via the SummaryContext.
         records_results.extend(await self._run_analyzers(summary_ctx))
@@ -2290,8 +2298,8 @@ class RecordsManager(PullClientMixin, BaseComponentService):
                 warmup_records=warmup_records_results,
                 timeslices=timeslices or None,
                 completed=phase_stats.total_records,
-                start_ns=phase_stats.start_ns or time.time_ns(),
-                end_ns=phase_stats.requests_end_ns or time.time_ns(),
+                start_ns=phase_stats.start_ns or fallback_timestamp_ns(),
+                end_ns=phase_stats.requests_end_ns or fallback_timestamp_ns(),
                 error_summary=self._error_tracker.get_error_summary_for_phase(phase),
                 was_cancelled=cancelled,
                 successful_request_count=phase_stats.success_records,

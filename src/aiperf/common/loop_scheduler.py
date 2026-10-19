@@ -85,6 +85,10 @@ class LoopScheduler:
         )
         self._drain_observer: Callable[[], None] | None = None
 
+    @property
+    def runtime(self) -> TimingRuntime:
+        return self._runtime
+
     def set_exception_handler(self, handler: Callable[[asyncio.Task], None]) -> None:
         """Set callback for unhandled task exceptions."""
         self._exception_handler = handler
@@ -133,9 +137,8 @@ class LoopScheduler:
             handle_id = id(handle_container[0])
             self._handles.pop(handle_id, None)
             self._handle_groups.pop(handle_id, None)
-        task = self._loop.create_task(coro)
+        task = self._runtime.create_task(coro, on_done=self._done_callback)
         self._tasks.add(task)
-        task.add_done_callback(self._done_callback)
 
     def _track_handle_and_return_id(
         self,
@@ -164,9 +167,8 @@ class LoopScheduler:
             The task that was created.
             The task will be automatically cleaned up when it completes.
         """
-        task = self._loop.create_task(coro)
+        task = self._runtime.create_task(coro, on_done=self._done_callback)
         self._tasks.add(task)
-        task.add_done_callback(self._done_callback)
         return task
 
     def schedule_later(

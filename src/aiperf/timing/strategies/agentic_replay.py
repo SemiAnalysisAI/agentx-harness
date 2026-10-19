@@ -72,6 +72,7 @@ from aiperf.common.environment import Environment
 from aiperf.common.mixins import AIPerfLoggerMixin
 from aiperf.common.scenario.base import TrajectoryWarmupFailedError
 from aiperf.common.scenario.context_overflow import is_context_overflow_response
+from aiperf.common.timing_runtime import RealTimingRuntime, TimingRuntime
 from aiperf.credit.dispatch import ChildDispatchResult, TurnAdmission
 from aiperf.credit.structs import TurnToSend
 from aiperf.timing.conversation_source import SampledSession
@@ -122,6 +123,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         branch_orchestrator: BranchOrchestrator | None = None,
         session_tree_registry: SessionTreeRegistry | None = None,
         progress: PhaseProgressTracker | None = None,
+        runtime: TimingRuntime | None = None,
         **kwargs,
     ) -> None:
         super().__init__(logger_name="AgenticReplayTiming")
@@ -141,6 +143,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         self.config = config
         self.conversation_source: TrajectorySource = conversation_source
         self.scheduler = scheduler
+        self._runtime = runtime if runtime is not None else RealTimingRuntime()
         self.stop_checker = stop_checker
         self.credit_issuer = credit_issuer
         self.lifecycle = lifecycle
@@ -529,7 +532,9 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._system_idle_started_at = None
             self._cancel_system_idle_watchdog()
             return
-        now = time.monotonic()
+        now = (
+            self._runtime.timer_time() if self._runtime.is_virtual else time.monotonic()
+        )
         if follows_request_return or self._system_idle_started_at is None:
             self._system_idle_started_at = now
 
@@ -584,13 +589,13 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if self._system_idle_watchdog is not None:
             return
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             # Some direct unit/API callers exercise the synchronous fast path
             # without an event loop. They still get the immediate schedule
             # shift below; only the independent future recheck is unavailable.
             return
-        self._system_idle_watchdog = loop.call_later(
+        self._system_idle_watchdog = self._runtime.call_later(
             max(0.0, delay_seconds),
             self._run_system_idle_watchdog,
         )
@@ -812,7 +817,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 self._cache_warmup_duration,
                 self._finish_accelerated_warmup(),
             )
-        results = await asyncio.gather(
+        results = await self._runtime.gather(
             *(
                 self._dispatch_accelerated_trajectory(trajectory, lane)
                 for lane, trajectory in enumerate(self.conversation_source.trajectories)
@@ -1334,7 +1339,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # settles: a bare gather would re-raise the first failure while the
         # sibling coroutines keep issuing credits into a failing phase,
         # unreachable by the phase runner's cancellation.
-        results = await asyncio.gather(
+        results = await self._runtime.gather(
             *(
                 self._dispatch_one_profiling_trajectory(
                     trajectory, lane, phase_t0_offset_ms
@@ -1553,10 +1558,15 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         turn = TurnToSend.from_previous_credit(credit, next_meta)
 
         if next_meta.delay_ms is None or next_meta.delay_ms <= 0:
-            if turn.agent_depth > 0:
-                await self._issue_child_continuation_or_drain(turn)
+            coro = (
+                self._issue_child_continuation_or_drain(turn)
+                if turn.agent_depth > 0
+                else self.credit_issuer.issue_credit(turn)
+            )
+            if self._runtime.is_virtual:
+                self.scheduler.execute_async(coro)
             else:
-                await self.credit_issuer.issue_credit(turn)
+                await coro
             return
         delay_s = next_meta.delay_ms / MILLIS_PER_SECOND
         if turn.agent_depth > 0:
@@ -1679,7 +1689,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         )
 
         turn = self._build_turn_for_session(session, 0)
-        await self.credit_issuer.issue_credit(turn)
+        if self._runtime.is_virtual:
+            self.scheduler.execute_async(self.credit_issuer.issue_credit(turn))
+        else:
+            await self.credit_issuer.issue_credit(turn)
 
     async def _on_rootless_child_done(self, lane: int) -> None:
         """Account a rootless lane's background child completing.

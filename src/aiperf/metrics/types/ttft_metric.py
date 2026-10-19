@@ -47,7 +47,14 @@ class TTFTMetric(BaseRecordMetric[int]):
             )
 
         request_ts: int = record.request.start_perf_ns
-        first_response_ts: int = record.content_responses[0].perf_ns
+        timing = record.request.server_timing
+        first_response_ts = (
+            timing.first_token_perf_ns
+            if timing is not None
+            else record.content_responses[0].perf_ns
+        )
+        if first_response_ts is None:
+            raise NoMetricValue("Server generation timing is unavailable.")
         if first_response_ts < request_ts:
             raise ValueError(
                 "First response timestamp is before request start timestamp, cannot compute TTFT."

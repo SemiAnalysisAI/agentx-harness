@@ -66,17 +66,47 @@ The Timing Manager controls and coordinates the timing of requests during benchm
 - Supporting advanced timing scenarios, such as replaying traces with specific inter-arrival times or simulating bursty traffic
 - Ensuring that requests are dispatched to workers at the correct intervals for reliable measurement
 
-`PhaseRunner` shares an optional `TimingRuntime` between `LoopScheduler` and
-`PhaseLifecycle`. The default `RealTimingRuntime` uses Python performance and
-wall clocks plus asyncio callback timers. Task execution and cancellation remain
-in `LoopScheduler`; the runtime only supplies clocks and timer handles. Timer
-deadlines use the runtime's timer clock, while performance timestamps use
-`now_ns()`. Absolute scheduling bridges those two clock origins.
+`PhaseRunner` shares a `TimingRuntime` with credit issuance, concurrency waits,
+`LoopScheduler`, and `PhaseLifecycle`. The default `RealTimingRuntime` uses Python
+clocks and asyncio timers. Timer deadlines use `timer_time()`; performance
+timestamps use `now_ns()`. Absolute scheduling bridges those two clock origins.
 
-This is an internal injection point, not a virtual-time execution mode. Phase
-deadline waits, strategy-specific timers, worker timestamps, and credit transport
-still use their existing behavior. They must be coordinated before a simulator
-can drive an entire benchmark. No CLI option selects an alternative runtime.
+The experimental `sglang_simulator` transport, together with
+`AIPERF_TIMING_SIMULATOR_COORDINATOR=tcp://127.0.0.1:<port>`, selects an externally
+advanced runtime for agentic replay. AgentX still runs its original dataset
+loader, workers, branches, joins, and phase logic. SGLang must run in `OFFLINE`
+mode with its optional coordinator enabled.
+Published timestamps use a fixed synthetic epoch; they are not wall-clock dates.
+
+At each virtual timestamp, the timing manager:
+
+1. Processes request completions only after both the worker return and the
+   simulator's matching terminal event arrive.
+2. Drains callbacks and due workload timers, including tool waits and child
+   dispatches. Explicit activity tracking accounts for tasks waiting on capacity
+   or phase events; it does not inspect asyncio internals.
+3. Sends newly issued request IDs, cancellations, and the next timer deadline to
+   the simulator. Time may advance only after the corresponding HTTP payloads
+   have arrived at the server.
+
+Completions precede deadlines at the same timestamp; phase deadlines precede
+new workload timers. Warmup and profiling share the server cache and clock but
+retain separate phase identities and statistics. Final result publication waits
+for the simulator's `FINISHED` acknowledgment, including native request cleanup.
+Wall-clock timeouts detect broken connections or stalled participants; they do
+not determine workload timing. Unsupported options fail during configuration.
+If coordinated execution fails, the timing manager requests cancellation with
+the original service error. The controller collects available records within
+a bounded timeout and exits nonzero without publishing phase success.
+Cancelled output retains available request records; uncommitted phase boundaries
+are reported as unknown rather than replaced with wall-clock timestamps.
+
+Workload input still passes through the native loader and prompt composer. Weka
+traces supply their own response history, so simulated output text does not
+replace that history. The server schedules the actual tokenized prompts and
+uses those token IDs for cache reuse. Chat-template and cache-bust overhead can
+make wire token counts differ from trace proxy lengths; response metadata and
+usage must agree on the actual prompt, completion, and cached token counts.
 
 ### Worker Manager
 

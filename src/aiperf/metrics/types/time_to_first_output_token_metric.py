@@ -60,6 +60,10 @@ class TimeToFirstOutputTokenMetric(BaseRecordMetric[int]):
         Returns:
             The time to first output token in nanoseconds
         """
+        if record.request.server_timing is not None:
+            raise NoMetricValue(
+                "Server generation bounds do not identify reasoning tokens."
+            )
         try:
             # Try and find the first non-reasoning token output and extract the timestamp.
             # This is done by checking for the first response that is either a TextResponseData or a ReasoningResponseData

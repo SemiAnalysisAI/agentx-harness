@@ -3,8 +3,11 @@
 
 import asyncio
 import time
-from collections.abc import Callable
-from typing import Any, Protocol
+from collections.abc import Callable, Coroutine
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, Protocol, TypeVar
+
+T = TypeVar("T")
 
 
 class CallbackHandle(Protocol):
@@ -20,7 +23,7 @@ class TimerHandle(CallbackHandle, Protocol):
 
 
 class TimingRuntime(Protocol):
-    """Clock reads and timers; coroutine execution stays on the asyncio loop.
+    """Clocks and semantic waits; coroutine execution stays on the asyncio loop.
 
     ``now_ns`` is monotonic performance time. ``timestamp_ns`` is the timestamp
     published with phase events. Timer deadlines use ``timer_time`` seconds;
@@ -44,6 +47,32 @@ class TimingRuntime(Protocol):
 
     def call_soon(self, callback: Callable[..., Any], *args: Any) -> CallbackHandle: ...
 
+    def create_task(
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        on_done: Callable[[asyncio.Task[T]], None] | None = None,
+    ) -> asyncio.Task[T]: ...
+
+    async def wait_event(
+        self, event: asyncio.Event, timeout: float | None = None
+    ) -> None: ...
+
+    async def wait_wall_event(self, event: asyncio.Event, timeout: float) -> None: ...
+
+    async def gather(
+        self, *coros: Coroutine[Any, Any, T], return_exceptions: bool = False
+    ) -> list[T | BaseException]: ...
+
+    async def sleep(self, delay: float) -> None: ...
+
+    def activity_scope(
+        self, *, label: str = "work"
+    ) -> AbstractContextManager[None]: ...
+
+    @property
+    def is_virtual(self) -> bool: ...
+
 
 class RealTimingRuntime:
     """Default runtime using the existing Python clocks and asyncio timers."""
@@ -65,13 +94,50 @@ class RealTimingRuntime:
 
     def call_later(
         self, delay: float, callback: Callable[..., Any], *args: Any
-    ) -> asyncio.TimerHandle:
+    ) -> TimerHandle:
         return self._event_loop().call_later(delay, callback, *args)
 
     def call_at(
         self, when: float, callback: Callable[..., Any], *args: Any
-    ) -> asyncio.TimerHandle:
+    ) -> TimerHandle:
         return self._event_loop().call_at(when, callback, *args)
 
-    def call_soon(self, callback: Callable[..., Any], *args: Any) -> asyncio.Handle:
+    def call_soon(self, callback: Callable[..., Any], *args: Any) -> CallbackHandle:
         return self._event_loop().call_soon(callback, *args)
+
+    @property
+    def is_virtual(self) -> bool:
+        return False
+
+    def create_task(
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        on_done: Callable[[asyncio.Task[T]], None] | None = None,
+    ) -> asyncio.Task[T]:
+        task = self._event_loop().create_task(coro)
+        if on_done is not None:
+            task.add_done_callback(on_done)
+        return task
+
+    async def wait_event(
+        self, event: asyncio.Event, timeout: float | None = None
+    ) -> None:
+        if timeout is None:
+            await event.wait()
+        else:
+            await asyncio.wait_for(event.wait(), timeout)
+
+    async def sleep(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+
+    async def wait_wall_event(self, event: asyncio.Event, timeout: float) -> None:
+        await asyncio.wait_for(event.wait(), timeout)
+
+    async def gather(
+        self, *coros: Coroutine[Any, Any, T], return_exceptions: bool = False
+    ) -> list[T | BaseException]:
+        return await asyncio.gather(*coros, return_exceptions=return_exceptions)
+
+    def activity_scope(self, *, label: str = "work") -> AbstractContextManager[None]:
+        return nullcontext()

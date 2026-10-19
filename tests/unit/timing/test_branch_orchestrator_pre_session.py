@@ -23,14 +23,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from aiperf.common.enums import CacheBustTarget, ConversationBranchMode
+from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.common.models import (
     ConversationBranchInfo,
     ConversationMetadata,
     DatasetMetadata,
     TurnMetadata,
 )
+from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
 from aiperf.plugin.enums import DatasetSamplingStrategy
 from aiperf.timing.branch_orchestrator import BranchOrchestrator
+from aiperf.timing.concurrency import DynamicConcurrencyLimit
 
 
 def _mk_conv(
@@ -105,6 +108,34 @@ def _pre_session_metadata() -> list[ConversationMetadata]:
     )
     early = _mk_conv("early", [TurnMetadata()], [])
     return [root, early]
+
+
+@pytest.mark.asyncio
+async def test_virtual_pre_dispatch_registers_before_waiting_for_capacity() -> None:
+    runtime = VirtualTimingRuntime()
+    scheduler = LoopScheduler(runtime=runtime)
+    capacity = DynamicConcurrencyLimit(0, runtime=runtime)
+    source = _mk_source(_pre_session_metadata())
+    sent = []
+
+    async def dispatch(child):
+        await capacity.acquire()
+        sent.append(child.conversation_id)
+        return True
+
+    issuer = MagicMock(dispatch_first_turn=AsyncMock(side_effect=dispatch))
+    orch = BranchOrchestrator(
+        conversation_source=source, credit_issuer=issuer, scheduler=scheduler
+    )
+    with runtime.activity_scope():
+        await orch.dispatch_pre_session_branches()
+    assert ("root", "root:pre") in orch._pre_dispatched_branches
+    await runtime.drain_current()
+    assert sent == []
+    capacity.set_limit(1)
+    await runtime.drain_current()
+    assert sent == ["early"]
+    assert orch.stats.children_spawned == 1
 
 
 @pytest.mark.asyncio

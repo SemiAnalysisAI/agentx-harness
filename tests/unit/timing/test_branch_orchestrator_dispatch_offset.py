@@ -19,8 +19,10 @@ from aiperf.common.models import (
     TurnPrerequisite,
 )
 from aiperf.credit.dispatch import ChildDispatchResult
+from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
 from aiperf.plugin.enums import DatasetSamplingStrategy
 from aiperf.timing.branch_orchestrator import BranchOrchestrator
+from aiperf.timing.concurrency import DynamicConcurrencyLimit
 
 
 async def _tick(n: int = 3) -> None:
@@ -206,6 +208,85 @@ async def test_missing_timestamps_keep_immediate_dispatch():
     assert issuer.dispatch_first_turn.await_count == 1
     assert gate.offsets == []
     assert orch.stats.children_delayed == 0
+
+
+@pytest.mark.asyncio
+async def test_virtual_fork_does_not_hold_callback_or_parent_lock_for_capacity() -> (
+    None
+):
+    runtime = VirtualTimingRuntime()
+    scheduler = LoopScheduler(runtime=runtime)
+    capacity = DynamicConcurrencyLimit(0, runtime=runtime)
+    parent = _parent_conv(
+        [_spawn_branch("b0", ["a", "b"], start_timestamp_ms=None, is_background=False)],
+        gated_turn=1,
+    )
+    orch, _, issuer = _mk_harness(
+        [parent, _child_conv("a", None), _child_conv("b", None)],
+        scheduler=scheduler,
+    )
+    sent = []
+
+    async def dispatch(child):
+        await capacity.acquire()
+        sent.append(child.x_correlation_id)
+        return True
+
+    issuer.dispatch_first_turn.side_effect = dispatch
+    with runtime.activity_scope(label="callback"):
+        assert await orch.intercept(_mk_credit("parent", "P", 0))
+    assert orch.stats.children_spawned == 2
+    assert sent == []
+    await runtime.drain_current()
+    assert not orch._parent_locks["P"].locked()
+    # The next terminal in the same Grant can release capacity before dispatch.
+    capacity.set_limit(1)
+    await runtime.drain_current()
+    assert sent == ["corr-a"]
+    with runtime.activity_scope(label="callback"):
+        capacity.release()
+        await orch.on_child_leaf_reached("corr-a")
+    await runtime.drain_current()
+    assert sent == ["corr-a", "corr-b"]
+    with runtime.activity_scope(label="callback"):
+        capacity.release()
+        await orch.on_child_leaf_reached("corr-b")
+    await runtime.drain_current()
+    issuer.dispatch_join_turn.assert_not_awaited()
+    assert runtime.next_deadline_ns == 10_000_000_000
+    runtime.advance_to(10_000_000_000)
+    await runtime.drain_current()
+    issuer.dispatch_join_turn.assert_awaited_once()
+    assert orch.stats.parents_resumed == 1
+    assert scheduler.is_idle()
+
+
+@pytest.mark.asyncio
+async def test_virtual_delayed_child_uses_clock_and_releases_parent_lock() -> None:
+    runtime = VirtualTimingRuntime()
+    scheduler = LoopScheduler(runtime=runtime)
+    capacity = DynamicConcurrencyLimit(0, runtime=runtime)
+    parent = _parent_conv([_spawn_branch("b0", ["kid"], start_timestamp_ms=1_000.0)])
+    orch, _, issuer = _mk_harness(
+        [parent, _child_conv("kid", 5_000.0)], scheduler=scheduler
+    )
+
+    async def dispatch(child):
+        await capacity.acquire()
+        return True
+
+    issuer.dispatch_first_turn.side_effect = dispatch
+    with runtime.activity_scope(label="callback"):
+        await orch.intercept(_mk_credit("parent", "P", 0))
+    await runtime.drain_current()
+    assert runtime.next_deadline_ns == 4_000_000_000
+    runtime.advance_to(4_000_000_000)
+    await runtime.drain_current()
+    assert not orch._parent_locks["P"].locked()
+    capacity.set_limit(1)
+    await runtime.drain_current()
+    assert scheduler.is_idle()
+    issuer.dispatch_first_turn.assert_awaited_once()
 
 
 @pytest.mark.asyncio

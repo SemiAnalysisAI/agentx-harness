@@ -475,6 +475,14 @@ transport:
     metadata:
       transport_type: http
       url_schemes: [http, https]
+  sglang_simulator:
+    class: aiperf.transports.sglang_simulator_transport:SGLangSimulatorTransport
+    description: |
+      Explicit transport for coordinated SGLang Simulator runs.
+      Preserves HTTP/SSE handling with stable request IDs and an unlimited connection pool.
+    metadata:
+      transport_type: sglang_simulator
+      url_schemes: []
 
 # =============================================================================
 # Dataset Composers

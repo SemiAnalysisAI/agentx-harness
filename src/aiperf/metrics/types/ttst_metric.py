@@ -38,6 +38,10 @@ class TTSTMetric(BaseRecordMetric[int]):
             ValueError: If the second response is before the first response.
         """
 
+        if record.request.server_timing is not None:
+            raise NoMetricValue(
+                "Server generation bounds do not identify content chunks."
+            )
         if len(record.content_responses) < 2:
             raise NoMetricValue(
                 "Record must have at least two content responses to calculate TTST."

@@ -10,6 +10,7 @@ import pytest
 
 from aiperf.common.enums import ConversationBranchMode, CreditPhase
 from aiperf.common.models.dataset_models import TurnMetadata
+from aiperf.common.timing_runtime import RealTimingRuntime
 from aiperf.credit.structs import Credit
 from aiperf.timing.strategies.agentic_replay import AgenticReplayStrategy
 
@@ -24,6 +25,7 @@ def _make_strategy(
 ) -> tuple[AgenticReplayStrategy, MagicMock, MagicMock]:
     """Build a strategy with only the attributes ``_dispatch_next_turn`` reads."""
     strategy = AgenticReplayStrategy.__new__(AgenticReplayStrategy)
+    strategy._runtime = RealTimingRuntime()
     strategy.config = MagicMock(phase=phase)
     strategy._cache_warmup_duration = None
     strategy._cache_warmup_requests_per_lane = 10 if accelerated_warmup else None

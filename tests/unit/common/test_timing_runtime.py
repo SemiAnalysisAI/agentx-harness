@@ -37,6 +37,7 @@ def runtime() -> Mock:
         runtime.timer_time() + delay, callback, *args
     )
     runtime.call_soon.side_effect = lambda callback, *args: Mock(spec=CallbackHandle)
+    runtime.create_task.side_effect = RealTimingRuntime().create_task
     return runtime
 
 

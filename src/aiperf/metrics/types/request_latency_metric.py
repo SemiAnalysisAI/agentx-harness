@@ -42,7 +42,14 @@ class RequestLatencyMetric(BaseRecordMetric[int]):
             raise NoMetricValue(
                 "Request latency requires at least 1 non-empty content response."
             )
-        final_response_ts = record.content_responses[-1].perf_ns
+        timing = record.request.server_timing
+        final_response_ts = (
+            timing.last_token_perf_ns
+            if timing is not None
+            else record.content_responses[-1].perf_ns
+        )
+        if final_response_ts is None:
+            raise NoMetricValue("Server generation timing is unavailable.")
 
         if final_response_ts < request_ts:
             raise ValueError("Final response timestamp is less than request timestamp.")

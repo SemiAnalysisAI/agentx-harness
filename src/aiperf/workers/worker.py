@@ -81,7 +81,7 @@ from aiperf.dataset.memory_map_utils import (
 )
 from aiperf.dataset.protocols import DatasetClientStoreProtocol
 from aiperf.plugin import plugins
-from aiperf.plugin.enums import PluginType
+from aiperf.plugin.enums import PluginType, TransportType
 from aiperf.records.payload_retention import resolve_strip_record_payload_bytes
 from aiperf.workers.inference_client import InferenceClient
 from aiperf.workers.session_manager import UserSession, UserSessionManager
@@ -637,6 +637,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         self.inference_client: InferenceClient = InferenceClient(
             model_endpoint=self.model_endpoint,
             service_id=self.service_id,
+            benchmark_id=str(self.run.benchmark_id),
             strip_record_payload_bytes=resolve_strip_record_payload_bytes(
                 self.run.cfg, self.model_endpoint
             ),
@@ -1318,8 +1319,15 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             content_perf_ns = self._content_response_perf_ns_for_record(record)
         if not content_perf_ns:
             return None
-        final_response_perf_ns = content_perf_ns[-1]
-        if final_response_perf_ns < record.start_perf_ns:
+        final_response_perf_ns = (
+            record.server_timing.last_token_perf_ns
+            if record.server_timing is not None
+            else content_perf_ns[-1]
+        )
+        if (
+            final_response_perf_ns is None
+            or final_response_perf_ns < record.start_perf_ns
+        ):
             return None
         return final_response_perf_ns - record.start_perf_ns
 
@@ -1351,12 +1359,21 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             output_sequence_length = self._output_sequence_length_for_responses(
                 parsed_responses
             )
-        if len(content_perf_ns) < 2 or output_sequence_length is None:
+        if output_sequence_length is None:
             return None
         if output_sequence_length < 2:
             return None
-        request_latency_ns = content_perf_ns[-1] - record.start_perf_ns
-        ttft_ns = content_perf_ns[0] - record.start_perf_ns
+        if record.server_timing is not None:
+            first = record.server_timing.first_token_perf_ns
+            last = record.server_timing.last_token_perf_ns
+            if first is None or last is None or not content_perf_ns:
+                return None
+        elif len(content_perf_ns) >= 2:
+            first, last = content_perf_ns[0], content_perf_ns[-1]
+        else:
+            return None
+        request_latency_ns = last - record.start_perf_ns
+        ttft_ns = first - record.start_perf_ns
         if request_latency_ns < 0 or ttft_ns < 0:
             return None
         return (request_latency_ns - ttft_ns) / (output_sequence_length - 1)
@@ -1711,6 +1728,14 @@ class Worker(BaseComponentService, ProcessHealthMixin):
 
         Note: Uses execute_async() to avoid blocking on network I/O.
         """
+        if (
+            self.model_endpoint.transport == TransportType.SGLANG_SIMULATOR
+            and record.server_timing is None
+        ):
+            from aiperf.simulation.record_timing import normalize_unavailable_timing
+
+            normalize_unavailable_timing(record)
+
         # All records will flow through here to be sent to the inference results push client.
         self.task_stats.task_finished(record.valid)
 
