@@ -153,6 +153,8 @@ class TimingManager(BaseComponentService):
                 pub_client=self.pub_client,
                 service_id=self.service_id,
                 final_phase_config=self.config.phase_configs[-1],
+                artifact_dir=self.run.artifact_dir,
+                benchmark_id=self.run.benchmark_id,
             )
             self.phase_publisher = self._simulation_publisher
             runtime = VirtualTimingRuntime(

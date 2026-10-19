@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Native generation bounds must be independent of physical SSE coalescing."""
 
@@ -95,7 +96,10 @@ def parsed(record: RequestRecord, timestamps: list[int]) -> ParsedResponseRecord
     return ParsedResponseRecord(
         request=record,
         responses=[
-            ParsedResponse(perf_ns=ts, data=TextResponseData(text="abc"))
+            ParsedResponse(
+                perf_ns=VIRTUAL_TIMESTAMP_ORIGIN_NS + ts,
+                data=TextResponseData(text="abc"),
+            )
             for ts in timestamps
         ],
     )
@@ -112,9 +116,13 @@ def test_generation_metrics_do_not_depend_on_content_chunking(
     assert RequestLatencyMetric()._parse_record(result, metrics) == 30
     assert FullDecodeDurationMetric()._parse_record(result, metrics) == 20
     assert record.timestamp_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS
-    assert record.start_perf_ns == 0 and record.end_perf_ns == 30
+    assert record.start_perf_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS
+    assert record.end_perf_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + 30
     assert record.recv_start_perf_ns is None and record.trace_data is None
-    assert all(response.perf_ns == 30 for response in record.responses)
+    assert all(
+        response.perf_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + 30
+        for response in record.responses
+    )
     assert result.valid
 
 
@@ -272,14 +280,38 @@ def test_incremental_snapshot_stamps_only_following_responses() -> None:
     apply_simulator_timing(record, "request")
     assert record.error is None
     assert [response.perf_ns for response in record.responses] == [
-        10,
-        10,
-        10,
-        30,
-        30,
-        30,
-        30,
+        VIRTUAL_TIMESTAMP_ORIGIN_NS + ts for ts in [10, 10, 10, 30, 30, 30, 30]
     ]
+
+
+@pytest.mark.parametrize("arrival_ns", [0, 2**53 + 1])
+def test_virtual_perf_origin_preserves_exact_intervals_and_raw_metadata(
+    arrival_ns: int,
+) -> None:
+    value = snapshot(
+        arrival_ns=arrival_ns,
+        first_token_ns=arrival_ns + 10,
+        last_token_ns=arrival_ns + 30,
+        commit_ns=arrival_ns + 40,
+        terminal_ns=arrival_ns + 40,
+    )
+    record = record_with(value)
+    raw = [response.get_raw() for response in record.responses]
+    # Applying the adapter twice must not shift already-normalized timestamps.
+    for _ in range(2):
+        apply_simulator_timing(record, "request")
+        assert record.valid
+        record.create_error_from_invalid()
+        assert record.error is None
+        assert record.start_perf_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + arrival_ns
+        assert record.end_perf_ns - record.start_perf_ns == 40
+        assert record.server_timing.first_token_perf_ns - record.start_perf_ns == 10
+        assert record.server_timing.last_token_perf_ns - record.start_perf_ns == 30
+        assert all(
+            response.perf_ns == record.end_perf_ns for response in record.responses
+        )
+        assert [response.get_raw() for response in record.responses] == raw
+        assert record.responses[1].get_json() == value
 
 
 def test_timing_survives_record_serialization() -> None:

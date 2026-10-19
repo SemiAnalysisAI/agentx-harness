@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -20,7 +21,7 @@ from aiperf.common.models import (
 )
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import PluginType, TransportType
-from aiperf.simulation.identity import request_id
+from aiperf.simulation.identity import VIRTUAL_TIMESTAMP_ORIGIN_NS, request_id
 from aiperf.transports.aiohttp_transport import AioHttpTransport
 from aiperf.transports.sglang_simulator_transport import SGLangSimulatorTransport
 from aiperf.workers.inference_client import InferenceClient, detect_transport_from_url
@@ -194,7 +195,7 @@ async def test_send_preserves_payload_and_callback_with_coordinator_identity(
     assert post.call_args.kwargs["first_token_callback"] is callback
     assert post.call_args.kwargs["cancel_after_ns"] is None
     assert orjson.dumps(body) == original
-    assert result.server_timing.first_token_perf_ns == 10
+    assert result.server_timing.first_token_perf_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + 10
 
 
 @pytest.mark.asyncio

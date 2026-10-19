@@ -224,6 +224,24 @@ and network tracing are unavailable in this mode. Missing timing metadata produc
 an error record with no timing samples. Ordinary transports keep the definitions
 below.
 
+Coordinated simulator runs also export `phase_windows.json`. It preserves exact
+integer virtual `start_ns`, `sent_end_ns`, and `requests_end_ns`, the configured
+duration and grace limits, and a request-ID prefix identifying each phase. These
+times use the elapsed virtual clock; `timestamp_origin_ns` maps request-record
+timestamps onto it. `protocol_finished` becomes true only after the simulator
+acknowledges completion. The fixed measurement endpoint is always
+`start_ns + configured_duration_ns`; an early stop is marked
+`incomplete_measurement`. Actual drain/grace completion remains separate.
+
+Native output TPS continues to count successful exported requests across its
+observation window. To measure all committed output in a fixed window, including
+output from requests later cancelled, combine these phase boundaries with the
+server's optional `SGLANG_SIMULATOR_TOKEN_EVENTS` ledger. Filter by owning phase
+and the half-open measurement interval, then divide by the configured duration.
+Report warmup and grace-completed latency samples separately; cancelled requests
+have no successful latency record. The server ledger records visible output,
+not computation discarded after cancellation.
+
 **Type:** [Record Metric](#record-metrics)
 
 Measures how long it takes to receive the first token (or chunk of tokens) after sending a request. This is critical for user-perceived responsiveness in streaming scenarios, as it represents how quickly the model begins generating output.

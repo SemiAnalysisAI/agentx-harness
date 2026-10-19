@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Validate simulator SSE snapshots before admitting virtual metric samples."""
 
@@ -190,13 +191,27 @@ def apply_simulator_timing(record: RequestRecord, rid: str) -> RequestRecord:
         record.error = record.error or ErrorDetails.from_exception(exc)
         normalize_unavailable_timing(record)
         return record
+    # Native record validation reserves zero for unavailable timestamps. Use one
+    # positive origin for every perf timestamp, preserving all virtual intervals.
+    origin = VIRTUAL_TIMESTAMP_ORIGIN_NS
     record.server_timing = ServerTiming(
-        first_token_perf_ns=snapshot.first_token_ns,
-        last_token_perf_ns=snapshot.last_token_ns,
+        first_token_perf_ns=(
+            origin + snapshot.first_token_ns
+            if snapshot.first_token_ns is not None
+            else None
+        ),
+        last_token_perf_ns=(
+            origin + snapshot.last_token_ns
+            if snapshot.last_token_ns is not None
+            else None
+        ),
     )
-    record.timestamp_ns = VIRTUAL_TIMESTAMP_ORIGIN_NS + snapshot.arrival_ns
-    record.start_perf_ns = snapshot.arrival_ns
-    record.end_perf_ns = snapshot.terminal_ns
+    record.timestamp_ns = origin + snapshot.arrival_ns
+    record.start_perf_ns = record.timestamp_ns
+    assert snapshot.terminal_ns is not None  # Validated by _read_snapshots.
+    record.end_perf_ns = origin + snapshot.terminal_ns
+    for response in record.responses:
+        response.perf_ns += origin
     # HTTP establishment and network tracing are physical, outside the model.
     record.recv_start_perf_ns = None
     record.trace_data = None
