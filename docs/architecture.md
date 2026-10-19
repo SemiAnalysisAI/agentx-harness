@@ -71,7 +71,12 @@ The Timing Manager controls and coordinates the timing of requests during benchm
 clocks and asyncio timers. Timer deadlines use `timer_time()`; performance
 timestamps use `now_ns()`. Absolute scheduling bridges those two clock origins.
 
-The experimental `sglang_simulator` transport, together with
+This fork maintains a local AgentX adapter for the SGLang simulator's
+Ready/Grant v1 protocol. SGLang does not depend on this fork: other workload
+drivers can implement the same protocol. Ordinary HTTP against `BLOCKING` mode
+uses real clocks and requires no simulator adapter.
+
+The optional `sglang_simulator` transport, together with
 `AIPERF_TIMING_SIMULATOR_COORDINATOR=tcp://127.0.0.1:<port>`, selects an externally
 advanced runtime for agentic replay. AgentX still runs its original dataset
 loader, workers, branches, joins, and phase logic. SGLang must run in `OFFLINE`
@@ -93,6 +98,9 @@ Completions precede deadlines at the same timestamp; phase deadlines precede
 new workload timers. Warmup and profiling share the server cache and clock but
 retain separate phase identities and statistics. Final result publication waits
 for the simulator's `FINISHED` acknowledgment, including native request cleanup.
+At grace expiry, phase completion waits for each cancellation terminal, worker
+return, and native accounting callback. Pending DAG joins are then cleaned up
+without waiting for workload timers beyond the cutoff.
 Wall-clock timeouts detect broken connections or stalled participants; they do
 not determine workload timing. Unsupported options fail during configuration.
 If coordinated execution fails, the timing manager requests cancellation with

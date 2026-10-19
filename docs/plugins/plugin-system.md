@@ -129,14 +129,18 @@ AIPerf supports 34 plugin categories organized by function, including `api_route
 | `endpoint` | `EndpointType` | API endpoint implementations (chat, completions, embeddings, etc.) |
 | `transport` | `TransportType` | Network transport (HTTP via aiohttp) |
 
-The experimental `sglang_simulator` transport must be selected explicitly with
-`--transport sglang_simulator` and used with
+This fork maintains `sglang_simulator` as a local AgentX adapter for the SGLang
+simulator's Ready/Grant v1 protocol. The simulator does not depend on AgentX or
+this adapter; other workload drivers can use the same protocol. Ordinary HTTP
+against simulator `BLOCKING` mode uses real clocks and requires no adapter.
+
+For accelerated `OFFLINE` runs, select the transport explicitly with
+`--transport sglang_simulator` and set
 `AIPERF_TIMING_SIMULATOR_COORDINATOR`. HTTP URL detection continues to select
 the ordinary `http` transport.
 
-Both AgentX and SGLang need the coordinated simulator development changes;
-this integration is not available in released packages. Install both checkouts
-from source. In the SGLang terminal, set:
+Use this AgentX fork and a SGLang checkout with the optional coordinator.
+In the SGLang terminal, set:
 
 ```bash
 export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE

@@ -67,6 +67,9 @@ class SimulatorCreditRouter:
         self._artifact_dir = artifact_dir
         self._timeout_s = timeout_s
         self._pending: dict[str, _PendingCredit] = {}
+        self._cancelling: set[str] = set()
+        self._cancellations_drained = asyncio.Event()
+        self._cancellations_drained.set()
         self._issued: set[str] = set()
         self._operations: list[Submit | Cancel] = []
         self._return_callback: ReturnCallback | None = None
@@ -108,8 +111,14 @@ class SimulatorCreditRouter:
         for rid, pending in self._pending.items():
             if not pending.cancelled:
                 pending.cancelled = True
+                self._cancelling.add(rid)
+                self._cancellations_drained.clear()
                 self._operations.append(Cancel(rid))
         await self._router.cancel_all_credits()
+
+    async def wait_for_cancellation_drain(self, timeout: float) -> None:
+        """Wait for cancellation terminals, worker returns, and native callbacks."""
+        await self.runtime.wait_wall_event(self._cancellations_drained, timeout)
 
     def mark_credits_complete(self) -> None:
         """Keep the native router's session cleanup accounting."""
@@ -211,6 +220,10 @@ class SimulatorCreditRouter:
                 )
             del self._pending[terminal.rid]
             await self._guard(self._apply_return(worker_id, returned))
+            if cancelled:
+                self._cancelling.remove(terminal.rid)
+                if not self._cancelling:
+                    self._cancellations_drained.set()
 
     async def drive(self) -> None:
         """Run until all phases and native simulator cleanup have completed."""

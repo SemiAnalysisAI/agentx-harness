@@ -11,11 +11,12 @@ import pytest
 from pytest import param
 
 from aiperf.common.enums import CreditPhase
+from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
 from aiperf.credit.messages import CreditReturn
 from aiperf.credit.sticky_router import StickyCreditRouter
 from aiperf.credit.structs import Credit
 from aiperf.simulation.identity import request_id
-from aiperf.simulation.protocol import Grant, Ready, SimulationError, Terminal
+from aiperf.simulation.protocol import Cancel, Grant, Ready, SimulationError, Terminal
 from aiperf.simulation.router import SimulatorCreditRouter
 from tests.unit.timing.conftest import make_credit
 
@@ -77,6 +78,14 @@ def setup_router(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
         runtime=runtime,
         timeout_s=0.1,
     )
+    return router, native, client, runtime
+
+
+@pytest.fixture
+def setup_virtual_router(setup_router: tuple[Any, ...]) -> tuple[Any, ...]:
+    router, native, client, _ = setup_router
+    runtime = VirtualTimingRuntime()
+    router.runtime = runtime
     return router, native, client, runtime
 
 
@@ -155,6 +164,173 @@ async def test_router_cancel_precedes_native_disconnect_and_waits_for_cleanup(
     await router.drive()
     assert runtime.now_ns() == 10
     callback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drain_deduplicates_and_resets_for_next_batch(
+    setup_virtual_router: tuple[Any, ...],
+) -> None:
+    router, native, _, runtime = setup_virtual_router
+    callback = AsyncMock()
+    router.set_return_callback(callback)
+
+    with runtime.activity_scope():
+        await router.wait_for_cancellation_drain(timeout=1)
+
+    for number in (1, 2):
+        item = credit(number)
+        rid = request_id("run", 0, number)
+        await router.send_credit(item)
+        # Dispatch must remain usable without a running driver or activity scope.
+        await asyncio.wait_for(router.cancel_all_credits(), 1)
+        await asyncio.wait_for(router.cancel_all_credits(), 1)
+        assert (
+            sum(isinstance(op, Cancel) and op.rid == rid for op in router._operations)
+            == 1
+        )
+
+        waiter = runtime.create_task(router.wait_for_cancellation_drain(timeout=1))
+        try:
+            await asyncio.wait_for(runtime.drain_current(), 1)
+            assert not waiter.done()
+            assert runtime.next_deadline_ns is None
+            await native.set_return_callback.call_args.args[0](
+                "worker", CreditReturn(credit=item, cancelled=True)
+            )
+            await asyncio.wait_for(runtime.drain_current(), 1)
+            assert not waiter.done()
+            await router._apply_grant(
+                Grant("run", number, 0, [Terminal(rid, "CANCELLED", 0)])
+            )
+            await asyncio.wait_for(runtime.drain_current(), 1)
+            await waiter
+            assert callback.await_count == number
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    assert runtime.now_ns() == 0
+    runtime.assert_drained()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drain_waits_for_callback_after_pending_entry_removed(
+    setup_virtual_router: tuple[Any, ...],
+) -> None:
+    router, native, _, runtime = setup_virtual_router
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    callback_completed = asyncio.Event()
+    item = credit(1)
+    rid = request_id("run", 0, 1)
+
+    async def returned(worker: str, message: CreditReturn) -> None:
+        callback_started.set()
+        await runtime.wait_event(release_callback)
+        callback_completed.set()
+
+    router.set_return_callback(returned)
+    await router.send_credit(item)
+    await router.cancel_all_credits()
+    await native.set_return_callback.call_args.args[0](
+        "worker", CreditReturn(credit=item, cancelled=True)
+    )
+    grant = asyncio.create_task(
+        router._apply_grant(Grant("run", 0, 0, [Terminal(rid, "CANCELLED", 0)]))
+    )
+    waiter = None
+    try:
+        await asyncio.wait_for(callback_started.wait(), 1)
+        assert rid not in router._pending
+        waiter = runtime.create_task(router.wait_for_cancellation_drain(timeout=1))
+        await asyncio.wait_for(runtime.drain_current(), 1)
+        assert not waiter.done()
+        assert not callback_completed.is_set()
+        release_callback.set()
+        await asyncio.wait_for(grant, 1)
+        await asyncio.wait_for(runtime.drain_current(), 1)
+        await waiter
+        assert callback_completed.is_set()
+    finally:
+        release_callback.set()
+        grant.cancel()
+        tasks = [grant]
+        if waiter is not None:
+            waiter.cancel()
+            tasks.append(waiter)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert runtime.now_ns() == 0
+    runtime.assert_drained()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [param("mismatch", id="terminal-mismatch"), param("callback", id="callback-error")],
+)  # fmt: skip
+async def test_cancellation_drain_does_not_report_success_after_return_failure(
+    setup_virtual_router: tuple[Any, ...], failure: str
+) -> None:
+    router, native, _, runtime = setup_virtual_router
+    callback = AsyncMock(
+        side_effect=ValueError("callback failed") if failure == "callback" else None
+    )
+    router.set_return_callback(callback)
+    item = credit(1)
+    await router.send_credit(item)
+    await router.cancel_all_credits()
+    await native.set_return_callback.call_args.args[0](
+        "worker", CreditReturn(credit=item, cancelled=True)
+    )
+
+    async def wait_for_failure() -> None:
+        with pytest.raises(TimeoutError):
+            await router.wait_for_cancellation_drain(timeout=0.05)
+
+    waiter = runtime.create_task(wait_for_failure())
+    try:
+        await asyncio.wait_for(runtime.drain_current(), 1)
+        terminal = Terminal(
+            request_id("run", 0, 1),
+            "COMPLETED" if failure == "mismatch" else "CANCELLED",
+            0,
+        )
+        error = SimulationError if failure == "mismatch" else ValueError
+        message = "terminal mismatch" if failure == "mismatch" else "callback failed"
+        with pytest.raises(error, match=message):
+            await router._apply_grant(Grant("run", 0, 0, [terminal]))
+        await asyncio.wait_for(waiter, 1)
+        if failure == "mismatch":
+            callback.assert_not_awaited()
+        else:
+            callback.assert_awaited_once()
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+    assert runtime.now_ns() == 0
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drain_timeout_does_not_release_unmatched_request(
+    setup_virtual_router: tuple[Any, ...],
+) -> None:
+    router, native, _, runtime = setup_virtual_router
+    callback = AsyncMock()
+    router.set_return_callback(callback)
+    item = credit(1)
+    rid = request_id("run", 0, 1)
+    await router.send_credit(item)
+    await router.cancel_all_credits()
+    await native.set_return_callback.call_args.args[0](
+        "worker", CreditReturn(credit=item, cancelled=True)
+    )
+    with runtime.activity_scope(), pytest.raises(TimeoutError):
+        await router.wait_for_cancellation_drain(timeout=0.001)
+    assert rid in router._pending
+    callback.assert_not_awaited()
+    assert runtime.now_ns() == 0
+    assert runtime.next_deadline_ns is None
+    runtime.assert_drained()
 
 
 @pytest.mark.asyncio
