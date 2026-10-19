@@ -49,9 +49,10 @@ wrapper default; `--config`/`-f` continues to use the scenario in the YAML file.
 The preset supplies streaming chat, a 3,600-second profiling duration, seed 42,
 trajectory start ratios 0.25–0.75, 10 warmup requests per lane, a 1,800-second
 warmup grace period, a 0.10 live failure threshold, a 300-second trace idle cap,
-393 dataset entries, server token counts, disabled GPU telemetry, 30-second
-stats, and 1-second metric slices. It also defaults these runtime settings for
-the profiling process and its child services:
+393 dataset entries, server token counts, disabled GPU telemetry, and 30-second
+stats. Timeslice metrics are off unless `--slice-duration` is passed. It also
+defaults these runtime settings for the profiling process and its child
+services:
 
 | Environment setting | Default |
 | --- | --- |

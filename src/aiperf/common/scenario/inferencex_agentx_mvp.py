@@ -58,7 +58,6 @@ AGENTX = INFERENCEX_AGENTX_MVP.model_copy(
             "use_server_token_count": True,
             "no_gpu_telemetry": True,
             "conversation_num_dataset_entries": 393,
-            "slice_duration": 1.0,
         },
         "environment_defaults": {
             "DATASET": {"CONFIGURATION_TIMEOUT": 1800},
