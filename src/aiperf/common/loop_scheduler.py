@@ -25,11 +25,16 @@ Example::
 """
 
 import asyncio
-import time
 from collections.abc import Callable, Coroutine
 from typing import TypeAlias
 
 from aiperf.common.constants import NANOS_PER_SECOND
+from aiperf.common.timing_runtime import (
+    CallbackHandle,
+    RealTimingRuntime,
+    TimerHandle,
+    TimingRuntime,
+)
 
 HandleId: TypeAlias = int
 """Unique identifier for a scheduled coroutine that can be used to cancel it."""
@@ -51,19 +56,25 @@ class LoopScheduler:
         self,
         loop: asyncio.AbstractEventLoop | None = None,
         exception_handler: Callable[[asyncio.Task], None] | None = None,
+        *,
+        runtime: TimingRuntime | None = None,
     ) -> None:
         """
         Args:
             loop: Event loop to use. If None, uses asyncio.get_running_loop().
                 Must be called from within an async context if loop is not provided.
             exception_handler: Called when a task raises an unhandled exception.
+            runtime: Optional clock and timer source. Tasks still use the event loop.
         """
         self._loop: asyncio.AbstractEventLoop = loop or asyncio.get_running_loop()
+        self._runtime = (
+            runtime if runtime is not None else RealTimingRuntime(self._loop)
+        )
         self._tasks: set[asyncio.Task] = set()
         # Maps handle ID → (handle, coroutine) so we can close() coroutines when handles are cancelled.
         # Use id(handle) as key to avoid recursion when handles contain circular refs (handle_container).
         self._handles: dict[
-            HandleId, tuple[asyncio.TimerHandle | asyncio.Handle, Coroutine]
+            HandleId, tuple[TimerHandle | CallbackHandle, Coroutine]
         ] = {}
         # Optional logical replay-tree ownership for pending timers. Kept in a
         # parallel map so the long-standing ``_handles`` tuple contract remains
@@ -107,7 +118,7 @@ class LoopScheduler:
 
     def _safe_callback(
         self,
-        handle_container: list[asyncio.TimerHandle | asyncio.Handle],
+        handle_container: list[TimerHandle | CallbackHandle | None],
         coro: Coroutine,
     ) -> None:
         """
@@ -128,7 +139,7 @@ class LoopScheduler:
 
     def _track_handle_and_return_id(
         self,
-        handle: asyncio.TimerHandle | asyncio.Handle,
+        handle: TimerHandle | CallbackHandle,
         coro: Coroutine,
         *,
         group_id: str | None = None,
@@ -181,7 +192,7 @@ class LoopScheduler:
             return self.execute_async(coro)
 
         handle_container = [None]
-        handle = self._loop.call_later(
+        handle = self._runtime.call_later(
             delay_sec, self._safe_callback, handle_container, coro
         )
         handle_container[0] = handle
@@ -195,19 +206,19 @@ class LoopScheduler:
         group_id: str | None = None,
     ) -> HandleId | asyncio.Task:
         """
-        Schedule coroutine at an absolute loop.time() timestamp.
+        Schedule coroutine at an absolute runtime timer timestamp.
 
-        Internally, it calls loop.call_at() and returns the handle ID.
+        The default runtime uses loop.time() and loop.call_at().
 
         Args:
-            loop_time: Target time from loop.time().
+            loop_time: Target in the runtime's timer_time() clock domain.
             coro: Coroutine object to execute.
 
         Returns:
             Handle for cancellation. Cancelled coroutines are properly closed.
         """
         handle_container = [None]
-        handle = self._loop.call_at(
+        handle = self._runtime.call_at(
             loop_time, self._safe_callback, handle_container, coro
         )
         handle_container[0] = handle
@@ -239,7 +250,8 @@ class LoopScheduler:
         Precision: Input is float seconds, uvloop timer resolution is ~1ms.
         """
         # Always sample loop.time() FIRST to avoid early firing bias.
-        cur_loop_time, cur_perf_sec = self._loop.time(), time.perf_counter()
+        cur_loop_time = self._runtime.timer_time()
+        cur_perf_sec = self._runtime.now_ns() / NANOS_PER_SECOND
         offset_sec = perf_sec - cur_perf_sec
 
         if offset_sec <= 0:
@@ -272,7 +284,10 @@ class LoopScheduler:
         Precision: Input is nanoseconds, but uvloop timer resolution is ~1ms.
         """
         # Always sample loop.time() FIRST to avoid early firing bias.
-        cur_loop_time, cur_perf_ns = self._loop.time(), time.perf_counter_ns()
+        cur_loop_time, cur_perf_ns = (
+            self._runtime.timer_time(),
+            self._runtime.now_ns(),
+        )
         offset_sec = (perf_time_ns - cur_perf_ns) / NANOS_PER_SECOND
 
         if offset_sec <= 0:
@@ -351,7 +366,7 @@ class LoopScheduler:
         if not self._handles:
             return 0.0
 
-        now = self._loop.time()
+        now = self._runtime.timer_time()
         # ``cap_pending_delay(0)`` deliberately moves due work into the
         # event loop's ready queue with ``call_soon``.  A second cap may run
         # before that callback gets a turn.  Such an asyncio.Handle has no
@@ -384,11 +399,11 @@ class LoopScheduler:
                 # in some event-loop implementations until another timed wake
                 # occurs. Queue it as ready work explicitly; this also states
                 # the max_delay_sec=0 contract directly.
-                replacement = self._loop.call_soon(
+                replacement = self._runtime.call_soon(
                     self._safe_callback, handle_container, coro
                 )
             else:
-                replacement = self._loop.call_at(
+                replacement = self._runtime.call_at(
                     target, self._safe_callback, handle_container, coro
                 )
             handle_container[0] = replacement
@@ -411,7 +426,7 @@ class LoopScheduler:
         if not selected:
             return 0.0
 
-        now = self._loop.time()
+        now = self._runtime.timer_time()
         if any(
             not callable(getattr(handle, "when", None)) for _, handle, _ in selected
         ):
@@ -428,11 +443,11 @@ class LoopScheduler:
             handle.cancel()
             handle_container = [None]
             if target <= now:
-                replacement = self._loop.call_soon(
+                replacement = self._runtime.call_soon(
                     self._safe_callback, handle_container, coro
                 )
             else:
-                replacement = self._loop.call_at(
+                replacement = self._runtime.call_at(
                     target, self._safe_callback, handle_container, coro
                 )
             handle_container[0] = replacement
