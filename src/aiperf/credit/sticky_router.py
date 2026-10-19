@@ -137,6 +137,14 @@ class CreditRouterProtocol(Protocol):
         """
         ...
 
+    async def wait_for_cancellation_drain(self, timeout: float) -> None:
+        """Settle router-side cancellation callbacks before reading phase counters.
+
+        Routers without an additional cancellation barrier return immediately;
+        the phase runner still waits for outstanding credit returns.
+        """
+        ...
+
     def mark_credits_complete(self) -> None:
         """Mark that all credits have been issued and returned.
 
@@ -513,6 +521,9 @@ class StickyCreditRouter(CommunicationMixin):
             )
         else:
             self.debug("No in-flight credits to cancel")
+
+    async def wait_for_cancellation_drain(self, timeout: float) -> None:
+        """Native returns flow directly to the phase runner's progress barrier."""
 
     def mark_credits_complete(self) -> None:
         """Mark credits complete - suppresses orphan warnings during shutdown."""

@@ -187,7 +187,7 @@ class SimulatorCreditRouter:
         # FirstToken was withheld, so the terminal must release prefill accounting.
         if returned.first_token_sent:
             returned = msgspec.structs.replace(returned, first_token_sent=False)
-        with self.runtime.activity_scope(label="callback"):
+        with self.runtime.activity_scope():
             await self._return_callback(worker_id, returned)
 
     async def _write_event(self, event: Ready | Grant) -> None:

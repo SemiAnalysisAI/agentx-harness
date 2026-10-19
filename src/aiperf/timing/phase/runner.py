@@ -24,7 +24,6 @@ from aiperf.common.timing_runtime import RealTimingRuntime, TimingRuntime
 from aiperf.credit.issuer import CreditIssuer
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import PluginType, TimingMode
-from aiperf.simulation.router import SimulatorCreditRouter
 from aiperf.timing.branch_orchestrator import BranchOrchestrator
 from aiperf.timing.phase.lifecycle import PhaseLifecycle
 from aiperf.timing.phase.progress_tracker import PhaseProgressTracker
@@ -1134,7 +1133,7 @@ class PhaseRunner(TaskManagerMixin):
                 )
                 await self._credit_router.cancel_all_credits()
                 drain_timeout = Environment.TIMING.CANCEL_DRAIN_TIMEOUT
-                await self._wait_for_simulator_cancellations(drain_timeout)
+                await self._wait_for_cancellation_drain(drain_timeout)
                 stats = self._progress.create_stats(self._lifecycle)
                 need = (
                     stats.final_requests_sent
@@ -1184,13 +1183,12 @@ class PhaseRunner(TaskManagerMixin):
                     timed_out=timed_out, phase_id=phase_id
                 )
 
-    async def _wait_for_simulator_cancellations(self, timeout: float) -> None:
-        """Settle simulator callbacks before reading native cancellation counters."""
-        if isinstance(self._credit_router, SimulatorCreditRouter):
-            try:
-                await self._credit_router.wait_for_cancellation_drain(timeout)
-            except TimeoutError:
-                raise RuntimeError("Cancelled credits did not drain") from None
+    async def _wait_for_cancellation_drain(self, timeout: float) -> None:
+        """Settle router callbacks before reading cancellation counters."""
+        try:
+            await self._credit_router.wait_for_cancellation_drain(timeout)
+        except TimeoutError:
+            raise RuntimeError("Cancelled credits did not drain") from None
 
     async def _publish_returning_complete(
         self, *, timed_out: bool, phase_id: str | None

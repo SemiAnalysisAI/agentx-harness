@@ -130,7 +130,7 @@ async def test_grace_cancellation_drains_callback_with_pending_dag(
     client.request.side_effect = exchange
 
     async def run_phase() -> None:
-        with runtime.activity_scope(label="phases"):
+        with runtime.run_scope():
             runner._lifecycle.start()
             runner._progress.increment_sent(TurnToSend("trace", "session", 0, 2))
             await router.send_credit(credit)

@@ -70,6 +70,10 @@ The Timing Manager controls and coordinates the timing of requests during benchm
 `LoopScheduler`, and `PhaseLifecycle`. The default `RealTimingRuntime` uses Python
 clocks and asyncio timers. Timer deadlines use `timer_time()`; performance
 timestamps use `now_ns()`. Absolute scheduling bridges those two clock origins.
+The orchestrator enters an explicit `run_scope()` across warmup and profiling;
+ordinary activity scopes only track runnable and blocked work. Phase cancellation
+uses the credit-router protocol's drain barrier, without depending on a concrete
+router implementation.
 
 This fork maintains a local AgentX adapter for the SGLang simulator's
 Ready/Grant v1 protocol. SGLang does not depend on this fork: other workload

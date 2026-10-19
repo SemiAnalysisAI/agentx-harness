@@ -66,9 +66,11 @@ class TimingRuntime(Protocol):
 
     async def sleep(self, delay: float) -> None: ...
 
-    def activity_scope(
-        self, *, label: str = "work"
-    ) -> AbstractContextManager[None]: ...
+    def activity_scope(self) -> AbstractContextManager[None]: ...
+
+    def run_scope(self) -> AbstractContextManager[None]:
+        """Track a complete benchmark run across all phase boundaries."""
+        ...
 
     @property
     def is_virtual(self) -> bool: ...
@@ -139,5 +141,8 @@ class RealTimingRuntime:
     ) -> list[T | BaseException]:
         return await asyncio.gather(*coros, return_exceptions=return_exceptions)
 
-    def activity_scope(self, *, label: str = "work") -> AbstractContextManager[None]:
+    def activity_scope(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def run_scope(self) -> AbstractContextManager[None]:
         return nullcontext()

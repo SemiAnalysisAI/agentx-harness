@@ -260,9 +260,7 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
     async def _execute_phases(self) -> None:
         """Track phase work continuously across the warmup/profiling handoff."""
         scope = (
-            self._runtime.activity_scope(label="phases")
-            if self._runtime is not None
-            else nullcontext()
+            self._runtime.run_scope() if self._runtime is not None else nullcontext()
         )
         with scope:
             await self._run_phases()

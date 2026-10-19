@@ -233,7 +233,7 @@ async def test_virtual_fork_does_not_hold_callback_or_parent_lock_for_capacity()
         return True
 
     issuer.dispatch_first_turn.side_effect = dispatch
-    with runtime.activity_scope(label="callback"):
+    with runtime.activity_scope():
         assert await orch.intercept(_mk_credit("parent", "P", 0))
     assert orch.stats.children_spawned == 2
     assert sent == []
@@ -243,12 +243,12 @@ async def test_virtual_fork_does_not_hold_callback_or_parent_lock_for_capacity()
     capacity.set_limit(1)
     await runtime.drain_current()
     assert sent == ["corr-a"]
-    with runtime.activity_scope(label="callback"):
+    with runtime.activity_scope():
         capacity.release()
         await orch.on_child_leaf_reached("corr-a")
     await runtime.drain_current()
     assert sent == ["corr-a", "corr-b"]
-    with runtime.activity_scope(label="callback"):
+    with runtime.activity_scope():
         capacity.release()
         await orch.on_child_leaf_reached("corr-b")
     await runtime.drain_current()
@@ -276,7 +276,7 @@ async def test_virtual_delayed_child_uses_clock_and_releases_parent_lock() -> No
         return True
 
     issuer.dispatch_first_turn.side_effect = dispatch
-    with runtime.activity_scope(label="callback"):
+    with runtime.activity_scope():
         await orch.intercept(_mk_credit("parent", "P", 0))
     await runtime.drain_current()
     assert runtime.next_deadline_ns == 4_000_000_000

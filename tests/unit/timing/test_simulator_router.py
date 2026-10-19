@@ -45,7 +45,7 @@ class Clock:
     def assert_drained(self) -> None:
         assert self.next_deadline_ns is None
 
-    def activity_scope(self, *, label: str) -> Any:
+    def activity_scope(self) -> Any:
         return nullcontext()
 
 

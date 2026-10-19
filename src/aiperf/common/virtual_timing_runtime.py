@@ -4,8 +4,8 @@
 import asyncio
 import heapq
 import math
-from collections.abc import Callable, Coroutine
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
@@ -52,8 +52,8 @@ class VirtualTimingRuntime(RealTimingRuntime):
     ) -> None:
         super().__init__(loop)
         self.activity = TimingActivity()
-        self.started = self.activity.started
-        self.finished = self.activity.finished
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
         self._now_ns = 0
         self._timestamp_origin_ns = timestamp_origin_ns
         self._sequence = 0
@@ -72,8 +72,20 @@ class VirtualTimingRuntime(RealTimingRuntime):
     def timer_time(self) -> float:
         return self._now_ns / _NANOSECONDS
 
-    def activity_scope(self, *, label: str = "work") -> AbstractContextManager[None]:
-        return self.activity.scope(label=label)
+    def activity_scope(self) -> AbstractContextManager[None]:
+        return self.activity.scope()
+
+    @contextmanager
+    def run_scope(self) -> Iterator[None]:
+        """Track the single benchmark run and signal its start and finish."""
+        if self.started.is_set():
+            raise RuntimeError("The benchmark run scope may only run once")
+        with self.activity_scope():
+            self.started.set()
+            try:
+                yield
+            finally:
+                self.finished.set()
 
     def create_task(
         self,

@@ -124,3 +124,10 @@ def test_real_runtime_clock_reads_do_not_require_an_event_loop() -> None:
     before = runtime.now_ns()
     assert runtime.timestamp_ns() > 0
     assert runtime.now_ns() >= before
+
+
+def test_real_runtime_scopes_preserve_unrestricted_execution() -> None:
+    runtime = RealTimingRuntime()
+    for _ in range(2):
+        with runtime.run_scope(), runtime.activity_scope():
+            assert not runtime.is_virtual

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pytest import param
 
 from aiperf.common.enums import BaselineKind, CreditPhase
 from aiperf.common.environment import Environment
@@ -172,6 +173,7 @@ def pub() -> MagicMock:
 def router() -> MagicMock:
     m = MagicMock()
     m.send_credit = m.cancel_all_credits = AsyncMock()
+    m.wait_for_cancellation_drain = AsyncMock()
     m.wait_for_workers = AsyncMock()
     m.mark_credits_complete = MagicMock()
     return m
@@ -1006,14 +1008,22 @@ class TestEdgeCases:
             await r._wait_for_returning_complete(MagicMock())
 
         router.cancel_all_credits.assert_awaited_once()
+        router.wait_for_cancellation_drain.assert_awaited_once()
         assert r._progress.all_credits_returned_event.is_set()
         r._concurrency_manager.release_stuck_slots.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "router_timeout",
+        [param(True, id="router-barrier"), param(False, id="phase-progress")],
+    )  # fmt: skip
     async def test_virtual_cancel_drain_failure_is_not_published_as_completion(
-        self, runner: PhaseRunner, pub: MagicMock
+        self, runner: PhaseRunner, pub: MagicMock, router_timeout: bool
     ) -> None:
         runner._runtime = VirtualTimingRuntime()
-        runner._runtime.wait_wall_event = AsyncMock(side_effect=TimeoutError)
+        if router_timeout:
+            runner._credit_router.wait_for_cancellation_drain.side_effect = TimeoutError
+        else:
+            runner._runtime.wait_wall_event = AsyncMock(side_effect=TimeoutError)
         runner._lifecycle.start()
         runner._lifecycle.mark_sending_complete()
         runner._progress.check_all_returned_or_cancelled = MagicMock(return_value=False)

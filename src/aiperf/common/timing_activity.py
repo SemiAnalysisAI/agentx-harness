@@ -27,8 +27,6 @@ class TimingActivity:
     """
 
     def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.finished = asyncio.Event()
         self._changed = asyncio.Event()
         self._entries: set[_Activity] = set()
         self._current: ContextVar[_Activity | None] = ContextVar(
@@ -65,16 +63,12 @@ class TimingActivity:
             raise RuntimeError(f"Unfinished timing activities: {len(self._entries)}")
 
     @contextmanager
-    def scope(self, *, label: str = "work") -> Iterator[None]:
-        if label == "phases" and self.started.is_set():
-            raise RuntimeError("The phases activity scope may only run once")
+    def scope(self) -> Iterator[None]:
         existing = self._owned_entry()
         entry = existing or _Activity(task=asyncio.current_task())
         token = self._current.set(entry)
         self._entries.add(entry)
         self._changed.set()
-        if label == "phases":
-            self.started.set()
         try:
             yield
         except Exception as exc:
@@ -84,8 +78,6 @@ class TimingActivity:
             self._current.reset(token)
             if existing is None:
                 self._entries.discard(entry)
-            if label == "phases":
-                self.finished.set()
             self._changed.set()
 
     @contextmanager

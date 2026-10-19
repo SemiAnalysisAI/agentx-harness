@@ -5,6 +5,7 @@ import asyncio
 import inspect
 
 import pytest
+from pytest import param
 
 from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
@@ -12,6 +13,44 @@ from aiperf.timing.concurrency import (
     DynamicConcurrencyLimit,
     GlobalPhaseConcurrencyLimiter,
 )
+
+
+@pytest.mark.asyncio
+async def test_run_scope_owns_lifecycle_across_nested_activity() -> None:
+    runtime = VirtualTimingRuntime()
+    with runtime.activity_scope():
+        assert not runtime.started.is_set()
+    assert not runtime.finished.is_set()
+
+    with runtime.run_scope():
+        assert runtime.started.is_set()
+        with runtime.activity_scope():
+            assert not runtime.activity.idle
+        assert not runtime.finished.is_set()
+        assert not runtime.activity.idle
+    assert runtime.finished.is_set()
+    runtime.assert_drained()
+
+    with pytest.raises(RuntimeError, match="only run once"), runtime.run_scope():
+        pytest.fail("A completed virtual run must not restart")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [param(ValueError, id="failure"), param(asyncio.CancelledError, id="cancelled")],
+)  # fmt: skip
+async def test_run_scope_closes_on_failure_or_cancellation(
+    failure: type[BaseException],
+) -> None:
+    runtime = VirtualTimingRuntime()
+    error = failure("stopped")
+    with pytest.raises(failure) as caught, runtime.run_scope():
+        raise error
+    assert caught.value is error
+    assert runtime.started.is_set()
+    assert runtime.finished.is_set()
+    assert runtime.activity.idle
 
 
 @pytest.mark.asyncio
@@ -85,7 +124,7 @@ async def test_gather_tracks_capacity_wait_and_all_lanes() -> None:
         capacity.release()
 
     async def phases() -> None:
-        with runtime.activity_scope(label="phases"):
+        with runtime.run_scope():
             await runtime.gather(lane(0), lane(1), lane(2))
 
     task = runtime.create_task(phases())
