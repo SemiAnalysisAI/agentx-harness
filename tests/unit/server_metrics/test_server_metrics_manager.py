@@ -5,6 +5,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import TypeAdapter
 
 from aiperf.common.enums import BaselineKind, CommandType, CreditPhase
 from aiperf.common.messages import (
@@ -16,13 +17,15 @@ from aiperf.common.messages.server_metrics_messages import ServerMetricsRecordMe
 from aiperf.common.models import CreditPhaseStats, ErrorDetails
 from aiperf.common.models.server_metrics_models import ServerMetricsRecord
 from aiperf.config.flags.cli_config import CLIConfig
+from aiperf.config.phases import PhaseConfig
 from aiperf.credit.messages import (
     CreditPhaseCompleteMessage,
     CreditPhaseStartMessage,
 )
 from aiperf.plugin.enums import EndpointType, TimingMode
 from aiperf.server_metrics.manager import ServerMetricsManager
-from aiperf.timing.config import CreditPhaseConfig
+from aiperf.timing.config import CreditPhaseConfig, _build_agentic_warmup_config
+from aiperf.timing.phase.publisher import PhasePublisher
 from tests.unit.conftest import make_run_from_cli
 
 
@@ -498,6 +501,38 @@ class TestManagerCallbackFunctionality:
 
 
 class TestPhaseTransitionRace:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", [BaselineKind.START, BaselineKind.END])
+    async def test_agentic_auto_warmup_baselines_are_not_profiling(
+        self, cfg_with_endpoint: CLIConfig, kind: BaselineKind
+    ) -> None:
+        phase = TypeAdapter(PhaseConfig).validate_python(
+            {
+                "name": "profiling",
+                "type": "concurrency",
+                "concurrency": 8,
+                "duration": 3600,
+                "timing_mode": TimingMode.AGENTIC_REPLAY,
+            }
+        )
+        warmup = _build_agentic_warmup_config(phase)
+        assert warmup is not None
+        pub_client = AsyncMock()
+        publisher = PhasePublisher(pub_client=pub_client, service_id="timing-manager")
+        await publisher.publish_phase_baseline_request(warmup, "auto-warmup", kind)
+        message = pub_client.publish.call_args.args[0]
+
+        manager = ServerMetricsManager(run=make_run_from_cli(cfg_with_endpoint))
+        collector = MagicMock()
+        manager._collectors = {"http://localhost:8000/metrics": collector}
+        with patch.object(
+            manager, "_collect_and_process_metrics_for_phase", new_callable=AsyncMock
+        ) as collect:
+            await manager.collect_baseline(message)
+
+        assert message.phase_kind == "warmup"
+        collect.assert_awaited_once_with(collector, CreditPhase.WARMUP)
+
     """Phase-tagging transitions must be compare-and-set: message handlers run
     as independent tasks, so CREDIT_PHASE_START(PROFILING) can interleave with
     the awaited warmup-final scrapes inside _on_credit_phase_complete."""
