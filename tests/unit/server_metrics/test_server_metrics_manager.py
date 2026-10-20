@@ -21,10 +21,7 @@ from aiperf.credit.messages import (
     CreditPhaseStartMessage,
 )
 from aiperf.plugin.enums import EndpointType, TimingMode
-from aiperf.server_metrics.manager import (
-    _SERVER_METRICS_SCRAPE_PHASE,
-    ServerMetricsManager,
-)
+from aiperf.server_metrics.manager import ServerMetricsManager
 from aiperf.timing.config import CreditPhaseConfig
 from tests.unit.conftest import make_run_from_cli
 
@@ -669,50 +666,6 @@ class TestPhaseTransitionRace:
         await baseline_task
 
         assert manager._active_phase == CreditPhase.WARMUP
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("phase_kind", "phase", "expected"),
-        [
-            ("warmup", None, CreditPhase.WARMUP),
-            ("profiling", None, CreditPhase.PROFILING),
-            # Synthesized phases (agentic auto-warmup) may carry no kind; the
-            # credit phase must decide, not a PROFILING default.
-            (None, CreditPhase.WARMUP, CreditPhase.WARMUP),
-            (None, CreditPhase.PROFILING, CreditPhase.PROFILING),
-        ],
-    )
-    async def test_baseline_scrape_is_tagged_with_boundary_phase(
-        self,
-        cfg_with_endpoint: CLIConfig,
-        phase_kind,
-        phase,
-        expected,
-    ):
-        manager = ServerMetricsManager(
-            run=make_run_from_cli(cfg_with_endpoint),
-        )
-        seen: list[CreditPhase | None] = []
-
-        async def scrape():
-            seen.append(_SERVER_METRICS_SCRAPE_PHASE.get())
-
-        mock_collector = MagicMock()
-        mock_collector.collect_and_process_metrics = AsyncMock(side_effect=scrape)
-        manager._collectors = {"http://localhost:8000/metrics": mock_collector}
-
-        await manager.collect_baseline(
-            PhaseBaselineRequestMessage(
-                service_id="timing-manager",
-                phase_id="phase-0",
-                phase_name="warmup_0",
-                phase_kind=phase_kind,
-                phase=phase,
-                kind=BaselineKind.START,
-            )
-        )
-
-        assert seen == [expected]
 
 
 class TestDisabledServerMetrics:

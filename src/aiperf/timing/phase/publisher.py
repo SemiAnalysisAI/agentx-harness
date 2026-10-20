@@ -74,7 +74,6 @@ class PhasePublisher:
             phase_name=config.phase_name
             or f"{config.phase.value}_{config.phase_index}",
             phase_kind=config.phase_kind,
-            phase=config.phase,
             kind=kind,
         )
         await self._pub_client.publish(msg)
