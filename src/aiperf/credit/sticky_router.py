@@ -584,8 +584,8 @@ class StickyCreditRouter(CommunicationMixin):
         id rides inside CreditReturn (FirstToken does not need it). Unpack it and
         delegate to the common handler.
 
-        Ordering note: CreditReturn/FirstToken now arrive on this PULL channel while
-        WorkerReady/WorkerShutdown stay on the DEALER, so a worker's returns and its
+        Ordering note: CreditReturn/FirstToken/StreamingContent arrive on this PULL
+        channel while WorkerReady/WorkerShutdown stay on the DEALER, so returns and
         lifecycle messages are no longer mutually ordered (on the single bidirectional
         DEALER they were). That is safe because a worker only emits WorkerShutdown
         after all its returns have been sent, and the timing manager's phase /
@@ -600,7 +600,7 @@ class StickyCreditRouter(CommunicationMixin):
     async def _handle_router_message(
         self, worker_id: str, message: WorkerToRouterMessage
     ) -> None:
-        """Handle CreditReturn, FirstToken, WorkerReady, WorkerShutdown from workers."""
+        """Dispatch worker return, streaming activity, and lifecycle messages."""
         match message:
             case CreditReturn():
                 self._track_credit_returned(

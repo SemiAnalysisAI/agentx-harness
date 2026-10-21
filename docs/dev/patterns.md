@@ -131,7 +131,7 @@ Adaptive scale is a YAML-only timing strategy configured on the phase it control
 ## Streaming Coverage Across Cancellation
 
 Scenario liveness is independent of successful-request accounting. For scenarios with
-`minimum_profile_metric_coverage_ratio`, `Worker._make_first_token_callback` keeps observing parsed
+`minimum_profile_metric_coverage_ratio`, `Worker._make_content_callback` keeps observing parsed
 profiling content after the first token. Returning `False` keeps the transport callback active;
 `credit_context.first_token_sent` still prevents duplicate prefill releases.
 

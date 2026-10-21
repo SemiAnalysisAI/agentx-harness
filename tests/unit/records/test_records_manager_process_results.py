@@ -516,12 +516,17 @@ class TestProcessResultsAccumulatorPath:
         content = StreamingContent(
             phase=CreditPhase.PROFILING,
             phase_index=1,
-            timestamp_ns=message.last_streaming_content_ns,
+            timestamp_ns=phase_start_ns
+            + (1709 if credit_returns else 1790) * 1_000_000_000,
         )
         decoded_content = msgspec.msgpack.decode(
             msgspec.msgpack.encode(content), type=WorkerToRouterMessage
         )
         await router._handle_router_message("worker", decoded_content)
+        assert (
+            progress.create_stats(lifecycle).last_streaming_content_ns
+            == content.timestamp_ns
+        )
         assert progress.in_flight == 1
         assert not progress.all_credits_returned_event.is_set()
         if credit_returns:

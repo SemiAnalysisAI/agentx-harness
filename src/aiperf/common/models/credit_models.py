@@ -39,7 +39,7 @@ class BasePhaseStats(AIPerfBaseModel):
         default=None,
         ge=0,
         description="Latest parsed streaming content timestamp (wall-clock nanoseconds) "
-        "reported by a returned credit in this phase, including cancelled requests.",
+        "reported by streaming activity or a returned credit in this phase, including cancelled requests.",
     )
     start_ns: int | None = Field(
         default=None,

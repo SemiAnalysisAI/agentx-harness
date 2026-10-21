@@ -944,7 +944,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         x_correlation_id = credit_context.credit.x_correlation_id
         credit = credit_context.credit
 
-        first_token_callback = self._make_first_token_callback(credit_context)
+        first_token_callback = self._make_content_callback(credit_context)
 
         try:
             if await self._try_payload_bytes_fast_path(
@@ -967,7 +967,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         finally:
             self._handle_terminal_disposition(credit, credit_context, x_correlation_id)
 
-    def _make_first_token_callback(
+    def _make_content_callback(
         self, credit_context: CreditContext
     ) -> FirstTokenCallback | None:
         """Observe content for prefill release and scenario coverage when needed.
@@ -986,7 +986,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         wall_clock_offset_ns = time.time_ns() - time.perf_counter_ns()
         last_report_perf_ns: int | None = None
 
-        async def on_first_token(ttft_ns: int, message: SSEMessage) -> bool:
+        async def on_content(ttft_ns: int, message: SSEMessage) -> bool:
             nonlocal last_report_perf_ns
             parsed = self.inference_client.endpoint.parse_response(message)
             if parsed is None or parsed.data is None:
@@ -1023,7 +1023,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
                 credit_context.first_token_sent = True
             return not track_coverage
 
-        return on_first_token
+        return on_content
 
     async def _process_credit_with_session(
         self,

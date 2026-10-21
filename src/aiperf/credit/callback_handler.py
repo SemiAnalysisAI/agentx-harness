@@ -358,10 +358,10 @@ class CreditCallbackHandler:
             )
             return
 
-        # 1. ATOMIC COUNTING (no await before this!)
         handler.progress.observe_streaming_content(
             credit_return.last_streaming_content_ns
         )
+        # 1. ATOMIC COUNTING (no await before this!)
         # DAG children are off the phase's planning books — they inherit
         # the root's session slot and are tracked by the
         # ``BranchOrchestrator``. Their returns are signalled via the

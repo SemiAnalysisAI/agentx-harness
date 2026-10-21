@@ -841,13 +841,17 @@ requires TTFT, inter-token-latency, or parsed streaming content observations to 
 least 95% of the phase. The worker retains the last content timestamp even when a long request is
 cancelled after the grace period and produces no metric record. That timestamp contributes the
 separate `streaming_content_ratio` in `metric_duration_coverage`; cancelled requests still do not
-contribute successful request counts, throughput, or latency samples. Role-only chunks, usage-only
+contribute successful request counts, throughput, or latency samples. Text, reasoning content, and
+tool-call deltas count as content activity. Role-only chunks, usage-only
 chunks, keepalives, and cancellation itself do not prove content activity. The ratio uses the
 configured duration and is clamped to [0, 1], including activity during the grace period.
 
 This catches a server that stops producing content while allowing a sparse low-concurrency run to
 end with a long request in flight. Cancellation without recent content still fails the check.
-Activity is scoped to the concrete profiling phase. A stalled run
+The gate establishes recent content activity, not continued admission of new requests: a single
+ongoing stream can satisfy it even if the server has stopped admitting new requests. Admission
+stalls are outside this check's scope; inspect TTFT and server diagnostics separately.
+Activity is scoped to the concrete profiling phase. A run that fails the coverage check
 exits non-zero, the JSON artifact is retained with `submission_valid: false` and reason
 `insufficient_profile_metric_coverage`, and the error directs the operator to the server logs.
 Warmup observations and intentionally short `--unsafe-override` smoke runs do not count.

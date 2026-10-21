@@ -1079,14 +1079,46 @@ class TestPayloadBytesFastPath:
 
 
 @pytest.mark.asyncio
-class TestMakeFirstTokenCallback:
-    """Coverage for the REAL Worker._make_first_token_callback factory."""
+@pytest.mark.parametrize("last_content_ns", [None, 12_000_000_000])
+async def test_credit_task_fallback_preserves_last_content(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_worker: Worker,
+    sample_credit_context: CreditContext,
+    last_content_ns: int | None,
+) -> None:
+    sample_credit_context.last_streaming_content_ns = last_content_ns
+    credit = sample_credit_context.credit
+    task = Mock(spec=asyncio.Task)
+    task.cancelled.return_value = True
+    mock_worker.credit_tasks[credit.id] = task
+    mock_worker.credit_return_push_client = AsyncMock()
+    schedule = Mock()
+    monkeypatch.setattr(mock_worker, "execute_async", schedule)
+
+    mock_worker._on_credit_drop_message_task_done(task, sample_credit_context)
+
+    schedule.assert_called_once()
+    await schedule.call_args.args[0]
+    mock_worker.credit_return_push_client.send.assert_awaited_once()
+    returned = mock_worker.credit_return_push_client.send.await_args.args[0]
+    assert isinstance(returned, CreditReturn)
+    assert returned.credit is credit
+    assert returned.cancelled is True
+    assert returned.last_streaming_content_ns == last_content_ns
+    assert sample_credit_context.returned is True
+    assert sample_credit_context.credit is None
+    assert credit.id not in mock_worker.credit_tasks
+
+
+@pytest.mark.asyncio
+class TestMakeContentCallback:
+    """Coverage for the REAL Worker._make_content_callback factory."""
 
     async def test_returns_none_when_prefill_concurrency_disabled(
         self, mock_worker, sample_credit_context
     ):
         mock_worker._prefill_concurrency_enabled = False
-        assert mock_worker._make_first_token_callback(sample_credit_context) is None
+        assert mock_worker._make_content_callback(sample_credit_context) is None
 
     async def test_callback_skips_meaningless_content(
         self, monkeypatch, mock_worker, sample_credit_context
@@ -1095,7 +1127,7 @@ class TestMakeFirstTokenCallback:
         mock_worker.credit_return_push_client = AsyncMock()
         setup_mock_endpoint(mock_worker, monkeypatch, None)
 
-        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        callback = mock_worker._make_content_callback(sample_credit_context)
         assert callback is not None
 
         result = await callback(50_000_000, SSEMessage(perf_ns=100_000_000))
@@ -1115,7 +1147,7 @@ class TestMakeFirstTokenCallback:
             ParsedResponse(perf_ns=100_000_000, data=TextResponseData(text="hi")),
         )
 
-        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        callback = mock_worker._make_content_callback(sample_credit_context)
         assert callback is not None
 
         result = await callback(50_000_000, SSEMessage(perf_ns=100_000_000))
@@ -1162,7 +1194,7 @@ class TestMakeFirstTokenCallback:
                 ParsedResponse(perf_ns=4_000_000_000, data=None),
             ],
         )
-        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        callback = mock_worker._make_content_callback(sample_credit_context)
         assert callback is not None
         for timestamp in (
             1_000_000_000,
@@ -1204,13 +1236,14 @@ class TestMakeFirstTokenCallback:
         mock_worker._prefill_concurrency_enabled = False
         mock_worker._streaming_coverage_enabled = True
         credit_context = TestCreateRequestInfo._warmup_override_credit()
-        assert mock_worker._make_first_token_callback(credit_context) is None
+        assert mock_worker._make_content_callback(credit_context) is None
 
     @pytest.mark.parametrize(
         "payload,has_content",
         [
             param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"hello"}}]}', True, id="text"),
             param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"reasoning_content":"thinking"}}]}', True, id="reasoning"),
+            param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}', True, id="tool-call"),
             param('data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}', False, id="role"),
             param('data: {"object":"chat.completion.chunk","choices":[],"usage":{"completion_tokens":10}}', False, id="usage"),
             param('data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}', False, id="finish"),
@@ -1234,7 +1267,7 @@ class TestMakeFirstTokenCallback:
             "endpoint",
             ChatEndpoint(mock_worker.model_endpoint),
         )
-        callback = mock_worker._make_first_token_callback(sample_credit_context)
+        callback = mock_worker._make_content_callback(sample_credit_context)
         assert callback is not None
 
         assert await callback(1, SSEMessage.parse(payload, perf_ns=1)) is False
