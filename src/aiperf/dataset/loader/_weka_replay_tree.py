@@ -458,22 +458,22 @@ def plan_session_tree(
     # conversation. This matches vLLM's own admission check (prompt tokens +
     # requested output tokens against the model's context window on each
     # individual request), which is what the flag is actually guarding
-    # against. Mirrors weka_trace._trace_peak_context_length's own asymmetry:
-    # --synthesis-max-osl capping is applied only to the ROOT conversation's
-    # own requests (conv.agent_depth == 0) - subagent/co-session children's
-    # output_tokens are deliberately left uncapped, matching weka_trace's own
-    # "subagent child turns emit the RECORDED output_length" rule (see
-    # weka_trace.py: child_req.input_length + _peak_output_tokens(
-    # child_req.output_length, max_osl=None) for subagents, vs max_osl=max_osl
-    # for the parent/flat chain). Without this, --max-context-length would
-    # over-drop sessions whose root peak only exceeds the limit because of an
-    # output_tokens value the loader will actually clamp at Turn-building time.
+    # against. weka_trace mirrors this check but applies --synthesis-max-osl
+    # capping only to its ROOT conversation's own requests, deliberately
+    # leaving subagent children's output_tokens uncapped there (its own
+    # "subagent child turns emit the RECORDED output_length" rule). This
+    # loader does NOT follow that asymmetry: _build_turn's _capped_max_tokens
+    # clamps every turn's max_tokens to --synthesis-max-osl unconditionally,
+    # at every depth - so the peak check below must apply the same cap at
+    # every depth too, or a SPAWN child with a large recorded output_tokens
+    # could trip --max-context-length on a value the loader will actually
+    # clamp at Turn-building time, over-dropping the whole session.
     if options.max_context_length is not None:
         peak = 0
         for conv in out:
             for req in conv.instance.requests:
                 output_tokens = req.output_tokens
-                if conv.agent_depth == 0 and options.synthesis_max_osl is not None:
+                if options.synthesis_max_osl is not None:
                     output_tokens = min(output_tokens, options.synthesis_max_osl)
                 total = req.input_tokens + output_tokens
                 if total > peak:

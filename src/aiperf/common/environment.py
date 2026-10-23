@@ -542,12 +542,17 @@ class _DatasetSettings(BaseSettings):
 
     WEKA_REPLAY_SESSION_MODE: str = Field(
         default="tree",
-        description="weka_replay session-tree planning mode: 'tree' builds the "
-        "causal/co-session tree rooted at the session's main conversation "
-        "(spawn/co-session children as SPAWN branches); 'independent' emits every "
-        "non-causal stream of the session as its own top-level conversation, with "
-        "no cross-conversation SPAWN linkage. See TreeFilterOptions.session_mode "
-        "in _weka_replay_tree.py.",
+        description="weka_replay session-tree planning mode: 'tree' builds a "
+        "single rooted tree -- the session's primary main instance, with "
+        "every OTHER non-causal stream (co-sessions, helpers) attached to it "
+        "as a background SPAWN branch; 'independent' instead makes every "
+        "non-causal stream its own top-level root conversation (no "
+        "co-session anchoring). Either way, a verified CAUSAL sub-agent "
+        "(linked by fan_out_group) still attaches to its real spawning "
+        "parent as a SPAWN branch -- this setting only changes how the "
+        "session's NON-causal streams relate to each other, never real "
+        "spawn linkage. See TreeFilterOptions.session_mode in "
+        "_weka_replay_tree.py.",
     )
     WEKA_REPLAY_INCLUDE_ORPHANS: bool = Field(
         default=False,

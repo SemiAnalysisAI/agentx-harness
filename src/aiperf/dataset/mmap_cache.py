@@ -78,6 +78,16 @@ _logger = AIPerfLogger(__name__)
 # Version 5 fixed the Conversation.metadata() projection of per-turn
 # theoretical prefix-cache block counts for realtime infinite-cache hit rate.
 MANIFEST_VERSION = (
+    # v28: weka_replay content-identity resolution changed twice since v27:
+    # (a) churn-matching no longer requires the request's resolved-id prefix
+    # to be fully intact (removed a gate that was silently zeroing out real
+    # cache-control-churn matches across the whole real corpus); (b) each
+    # request's system_blocks[0] is now dropped when under 200 bytes (the
+    # capture's own per-request billing/preamble header, mirroring wekai's
+    # effectiveSystemBlocks). Both change which blocks mint vs. reuse for the
+    # SAME input file and settings, so a cached weka_replay entry built
+    # before this fix decodes different synthesized text/block counts than a
+    # fresh load would.
     # v27: cache key now includes the five AIPERF_DATASET_WEKA_REPLAY_* knobs
     # (SESSION_MODE / INCLUDE_ORPHANS / INCLUDE_EPHEMERAL / INCLUDE_ROLES /
     # SAMPLING_PASSTHROUGH) and "weka_replay" joins TRACE_VERBATIM_DATASET_TYPES.
@@ -181,7 +191,7 @@ MANIFEST_VERSION = (
     # v10: merge of the flattened-agent-splitting lineage and the
     # tool-shaping lineage (boundary-cut overhang strip; shaping decided at
     # first emission so reset re-emits reproduce the first-sent shape).
-    27
+    28
 )
 MANIFEST_FILENAME = "manifest.json"
 INPUTS_JSON_FILENAME = "inputs.json"

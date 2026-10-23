@@ -648,10 +648,12 @@ class TestMaxContextLength:
         assert diag.dropped_for_max_context_length == 0
 
 
-class TestMaxContextLengthSynthesisMaxOslAsymmetry:
-    """``synthesis_max_osl`` caps the ROOT's peak-context output_tokens only
-    (mirroring weka_trace._trace_peak_context_length's own asymmetry) -
-    a subagent's huge output_tokens must still trigger the drop uncapped."""
+class TestMaxContextLengthSynthesisMaxOslAppliesAtEveryDepth:
+    """``synthesis_max_osl`` caps peak-context output_tokens at every depth,
+    matching ``_build_turn``'s own unconditional ``_capped_max_tokens`` (no
+    weka_trace-style root-only asymmetry here): a subagent's huge recorded
+    output_tokens must not trigger a drop the loader's own Turn-building
+    would never have actually dispatched uncapped."""
 
     def test_root_huge_output_capped_below_threshold_is_kept(self):
         main = build_instance(
@@ -668,7 +670,7 @@ class TestMaxContextLengthSynthesisMaxOslAsymmetry:
         assert plan is not None
         assert diag.dropped_for_max_context_length == 0
 
-    def test_subagent_huge_output_not_capped_still_drops(self):
+    def test_subagent_huge_output_also_capped_is_kept(self):
         main = build_instance(
             instance_id="i:main",
             role="main",
@@ -694,6 +696,37 @@ class TestMaxContextLengthSynthesisMaxOslAsymmetry:
         )
         session_dict = build_session(session_id="sess_i", instances=[main, child])
         plan, diag = _plan(session_dict, max_context_length=1000, synthesis_max_osl=500)
+        assert plan is not None
+        assert diag.dropped_for_max_context_length == 0
+
+    def test_subagent_huge_output_uncapped_still_drops_without_osl_flag(self):
+        main = build_instance(
+            instance_id="j:main",
+            role="main",
+            requests=[
+                build_request(
+                    request_id=1, ts=_ts(0), input_tokens=100, output_tokens=50
+                )
+            ],
+        )
+        child = build_instance(
+            instance_id="j:child",
+            role="sub-agent",
+            fan_out_group="1",
+            parent_spawn_request_id=1,
+            requests=[
+                build_request(
+                    request_id=2,
+                    ts=_ts(100),
+                    input_tokens=100,
+                    output_tokens=50_000,
+                )
+            ],
+        )
+        session_dict = build_session(session_id="sess_j", instances=[main, child])
+        plan, diag = _plan(
+            session_dict, max_context_length=1000, synthesis_max_osl=None
+        )
         assert plan is None
         assert diag.dropped_for_max_context_length == 1
 
