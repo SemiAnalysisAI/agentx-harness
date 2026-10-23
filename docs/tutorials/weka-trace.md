@@ -281,3 +281,7 @@ Log lines to look for: per trace `detected N agents (...)`, the corpus summary `
 - [Trace Benchmarking](../benchmark-modes/trace-replay.md) — general deterministic workload replay.
 - [Input Sequence Length (ISL) Tokenization](../reference/isl-tokenization.md) — how `--isl` is reconciled across bare-text, chat-template wrapping, and cache-bust marker overhead.
 - [ISL Budget Compensation Derivation](../reference/isl-budget-compensation.md) — the math behind chat-template overhead compensation in the synthetic composer.
+
+The HuggingFace loader removes Arrow-generated null padding for fields outside
+each discriminated request schema before validation. Non-null unknown fields
+and null required fields still fail; the file loader schema remains strict.
