@@ -311,8 +311,18 @@
     ],
     [
       "C901",
+      "src/aiperf/dataset/loader/_weka_replay_tree.py",
+      "plan_session_tree"
+    ],
+    [
+      "C901",
       "src/aiperf/dataset/loader/weka_parallel_convert.py",
       "_process_task"
+    ],
+    [
+      "C901",
+      "src/aiperf/dataset/loader/weka_replay.py",
+      "WekaReplayLoader.convert_to_conversations"
     ],
     [
       "C901",

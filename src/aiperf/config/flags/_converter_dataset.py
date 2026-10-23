@@ -829,6 +829,15 @@ def _apply_trace_delay_flags(d: dict[str, Any], cli: CLIConfig) -> None:
         d["trace_idle_gap_cap_seconds"] = cli.trace_idle_gap_cap_seconds
 
 
+# FILE formats that are Weka-flavored custom dataset loaders: weka_trace
+# (hash_id trace replay) and weka_replay (session-tree replay, see
+# _weka_replay_*.py). Both implement the --max-context-length peak-length
+# filter; checked by string value, never by DatasetFormat.WEKA_REPLAY
+# attribute access, since that enum member only exists once a later step
+# registers the weka_replay loader in plugins.yaml.
+_WEKA_FILE_FORMATS = frozenset({"weka_trace", "weka_replay"})
+
+
 def _is_weka_dataset(d: dict[str, Any]) -> bool:
     """True when ``d`` is a Weka file format or Weka public-dataset alias."""
     from aiperf.common.enums import DatasetType
@@ -836,7 +845,7 @@ def _is_weka_dataset(d: dict[str, Any]) -> bool:
     dtype = d.get("type")
     if dtype == DatasetType.FILE:
         fmt = d.get("format")
-        return fmt is not None and str(fmt) == "weka_trace"
+        return fmt is not None and str(fmt) in _WEKA_FILE_FORMATS
     if dtype == DatasetType.PUBLIC:
         public = d.get("dataset")
         return public is not None and "weka" in str(public).lower()
@@ -859,7 +868,7 @@ def _is_definitely_non_weka_dataset(d: dict[str, Any]) -> bool:
         # format=None is a content-auto-detected trace (possibly weka): ambiguous.
         if fmt is None:
             return False
-        return str(fmt) != "weka_trace"
+        return str(fmt) not in _WEKA_FILE_FORMATS
     if dtype == DatasetType.PUBLIC:
         public = d.get("dataset")
         return public is None or "weka" not in str(public).lower()

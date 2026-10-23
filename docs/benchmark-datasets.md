@@ -67,6 +67,11 @@ This document describes datasets that AIPerf can use to generate stimulus. Addit
       <td style="text-align: center;">✅</td>
       <td>Synthetic multi-turn coding-agent traces with shared prompt layers, repository context, and cache-aware turn growth. Generated via <a href="tutorials/agentic-code-generator.md"><code>aiperf synthesize agentic-code</code></a> and replayed as a Mooncake trace.</td>
     </tr>
+    <tr>
+      <td><strong>Weka Replay</strong></td>
+      <td style="text-align: center;">✅</td>
+      <td>Raw <code>wekai</code> router replay-v3/v4/v5 session captures, preserving the real multi-level sub-agent tree <a href="tutorials/weka-replay.md"><code>--input-file replay.jsonl --custom-dataset-type weka_replay</code></a></td>
+    </tr>
   </tbody>
 </table>
 

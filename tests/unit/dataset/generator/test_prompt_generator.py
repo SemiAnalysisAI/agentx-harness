@@ -75,6 +75,7 @@ class TestPromptGeneratorComprehensive:
         assert generator.prefix_prompts == prefix_prompts
         assert generator.tokenizer == tokenizer
         assert generator._tokenized_corpus is not None
+        assert generator.tokenized_corpus is generator._tokenized_corpus
         assert generator._corpus_size > 0
         assert len(generator._prefix_prompts) == 0
         assert len(generator._cache) == 0

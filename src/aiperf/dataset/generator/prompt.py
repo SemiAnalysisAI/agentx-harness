@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -141,6 +142,14 @@ class PromptGenerator(BaseGenerator):
         if shared_system_length is not None:
             self._generate_shared_system_prompt()
         # Note: User context prompts are generated on-demand in generate_user_context_prompt()
+
+    @property
+    def tokenized_corpus(self) -> Sequence[int]:
+        """Read-only view of the pre-tokenized prompt corpus. Exposed for loaders
+        that synthesize their own content outside ``PromptGenerator.generate()``
+        (e.g. weka_replay, which keys content by its own per-block hash identity
+        rather than PromptGenerator's own hash_ids scheme)."""
+        return self._tokenized_corpus
 
     def _initialize_corpus(self) -> None:
         """Load and tokenize the corpus once, storing it for reuse.

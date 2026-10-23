@@ -840,6 +840,21 @@ custom_dataset_loader:
       default_block_size: 64
       default_prompt_corpus: coding
 
+  weka_replay:
+    class: aiperf.dataset.loader.weka_replay:WekaReplayLoader
+    description: |
+      Native loader for wekai router replay captures (replay-v3/v4/v5 JSONL:
+      header line, one session per line, optional replay-index-v1 trailer).
+      Preserves the recorded multi-level sub-agent tree from fan_out_group
+      causal links as SPAWN branches, absolute request timestamps,
+      server-reported token counts, and real sampling params. Content is
+      synthesized from per-block hashes with cache_control-churn handling.
+      Usage: --custom-dataset-type weka_replay --input-file replay.jsonl
+    metadata:
+      is_trace: true
+      default_block_size: 64
+      default_prompt_corpus: coding
+
 # =============================================================================
 # Dataset Samplers
 # =============================================================================

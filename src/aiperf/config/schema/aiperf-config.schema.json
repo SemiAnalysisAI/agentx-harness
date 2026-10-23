@@ -12658,7 +12658,8 @@
         "speed_bench_throughput_32k_low_entropy",
         "speed_bench_throughput_32k_mixed",
         "speed_bench_throughput_32k_high_entropy",
-        "weka_trace"
+        "weka_trace",
+        "weka_replay"
       ],
       "title": "DatasetFormat",
       "type": "string"

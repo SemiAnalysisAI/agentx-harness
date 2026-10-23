@@ -248,6 +248,50 @@ class TestComputeCacheKey:
         assert k1 is not None and k2 is not None
         assert k1 != k2, "random_seed must distinguish the cache key"
 
+    @pytest.mark.parametrize(
+        ("attr", "off_value", "on_value"),
+        [
+            ("WEKA_REPLAY_SESSION_MODE", "tree", "independent"),
+            ("WEKA_REPLAY_INCLUDE_ORPHANS", False, True),
+            ("WEKA_REPLAY_INCLUDE_EPHEMERAL", False, True),
+            ("WEKA_REPLAY_INCLUDE_ROLES", "", "main,sub-agent"),
+            ("WEKA_REPLAY_SAMPLING_PASSTHROUGH", "temperature,top_p", "temperature"),
+        ],
+    )  # fmt: skip
+    def test_key_changes_with_weka_replay_env_knobs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        attr: str,
+        off_value: object,
+        on_value: object,
+    ) -> None:
+        # Each AIPERF_DATASET_WEKA_REPLAY_* knob gates _weka_replay_tree's
+        # filtering/mode decisions or the sampling passthrough baked into the
+        # synthesized request -- both change decoded mmap content, so two runs
+        # differing only in one of these knobs must NOT share a cache entry.
+        from aiperf.common.environment import Environment
+        from aiperf.plugin.enums import CustomDatasetType
+
+        trace = _write_input_file(
+            tmp_path,
+            b'{"session_id": "s1", "timestamp": 0, "input_length": 8, '
+            b'"output_length": 4}\n',
+        )
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                input_file=str(trace),
+                custom_dataset_type=CustomDatasetType.MOONCAKE_TRACE,
+            )
+        )
+
+        monkeypatch.setattr(Environment.DATASET, attr, off_value)
+        off = mmap_cache.compute_cache_key_from_run(run)
+        monkeypatch.setattr(Environment.DATASET, attr, on_value)
+        on = mmap_cache.compute_cache_key_from_run(run)
+        assert off is not None and on is not None and off != on
+
     def test_settings_payload_includes_seed_corpus_osl(self, tmp_path: Path) -> None:
         # Regression guard for the wrong-cache-hit findings: random_seed,
         # prompts.corpus, and the per-record OSL fallback must enter the key.
@@ -496,7 +540,7 @@ class TestLookupAndPopulate:
         raw["version"] = 22
         manifest_path.write_bytes(orjson.dumps(raw))
 
-        assert mmap_cache.MANIFEST_VERSION == 26
+        assert mmap_cache.MANIFEST_VERSION == 27
         assert mmap_cache.lookup("pre-overlap-frontier", compressed=False) is None
 
     def test_lookup_compressed_mismatch_returns_none(self, tmp_path: Path) -> None:
@@ -710,6 +754,7 @@ class TestTraceVerbatimGate:
             "sagemaker_data_capture",
             "raw_payload",
             "inputs_json",
+            "weka_replay",
         ],
     )
     def test_predicate_true_for_trace_custom_types(self, custom_type: str) -> None:
