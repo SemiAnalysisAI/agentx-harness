@@ -33,6 +33,7 @@ from aiperf.credit.messages import (
     CancelCredits,
     CreditReturn,
     FirstToken,
+    StreamingContent,
     WorkerReady,
     WorkerShutdown,
     WorkerToRouterMessage,
@@ -169,6 +170,12 @@ class CreditRouterProtocol(Protocol):
         """
         ...
 
+    def set_streaming_content_callback(
+        self, callback: Callable[[StreamingContent], Awaitable[None]]
+    ) -> None:
+        """Register the phase-coverage observer for in-flight content."""
+        ...
+
 
 # =============================================================================
 # Sticky Credit Router
@@ -286,6 +293,9 @@ class StickyCreditRouter(CommunicationMixin):
         self._on_first_token_callback: (
             Callable[[FirstToken], Awaitable[None]] | None
         ) = None
+        self._on_streaming_content_callback: (
+            Callable[[StreamingContent], Awaitable[None]] | None
+        ) = None
 
         # Sticky sessions: owner correlation id -> _StickyEntry
         # Routes all turns of a session (and FORK children pinned to it) to the
@@ -326,6 +336,12 @@ class StickyCreditRouter(CommunicationMixin):
     ) -> None:
         """Set callback for first token events (enables prefill concurrency release)."""
         self._on_first_token_callback = callback
+
+    def set_streaming_content_callback(
+        self, callback: Callable[[StreamingContent], Awaitable[None]]
+    ) -> None:
+        """Set the coverage observer without changing request or prefill counts."""
+        self._on_streaming_content_callback = callback
 
     async def wait_for_workers(self, timeout: float) -> None:
         """Close the startup race where a phase issues its first credit before
@@ -590,8 +606,8 @@ class StickyCreditRouter(CommunicationMixin):
         id rides inside CreditReturn (FirstToken does not need it). Unpack it and
         delegate to the common handler.
 
-        Ordering note: CreditReturn/FirstToken now arrive on this PULL channel while
-        WorkerReady/WorkerShutdown stay on the DEALER, so a worker's returns and its
+        Ordering note: CreditReturn/FirstToken/StreamingContent arrive on this PULL
+        channel while WorkerReady/WorkerShutdown stay on the DEALER, so returns and
         lifecycle messages are no longer mutually ordered (on the single bidirectional
         DEALER they were). That is safe because a worker only emits WorkerShutdown
         after all its returns have been sent, and the timing manager's phase /
@@ -606,7 +622,7 @@ class StickyCreditRouter(CommunicationMixin):
     async def _handle_router_message(
         self, worker_id: str, message: WorkerToRouterMessage
     ) -> None:
-        """Handle CreditReturn, FirstToken, WorkerReady, WorkerShutdown from workers."""
+        """Dispatch worker return, streaming activity, and lifecycle messages."""
         match message:
             case CreditReturn():
                 self._track_credit_returned(
@@ -623,6 +639,9 @@ class StickyCreditRouter(CommunicationMixin):
                 if self._on_first_token_callback:
                     # Forward TTFT to orchestrator so it can release the prefill slot.
                     await self._on_first_token_callback(message)
+            case StreamingContent():
+                if self._on_streaming_content_callback:
+                    await self._on_streaming_content_callback(message)
             case WorkerReady():
                 self._register_worker(worker_id)
             case WorkerShutdown():
