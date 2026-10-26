@@ -175,11 +175,13 @@ def build_cli_overrides(
     )
     from aiperf.config.flags._converter_runtime import build_logging_runtime
     from aiperf.config.flags._converter_telemetry import build_wandb
+    from aiperf.config.flags.converter import _apply_scenario_fields
 
     out: dict[str, Any] = {}
     _apply_endpoint_overrides(out, cli)
     _apply_input_overrides(out, cli)
     _apply_recipe_and_multirun(out, cli, benchmark_config=benchmark_config)
+    _apply_scenario_fields(out, cli)
     _apply_artifacts_overrides(out, cli)
     _apply_optional_section(out, "gpu_telemetry", build_gpu_telemetry_override(cli))
     _apply_optional_section(out, "server_metrics", build_server_metrics_override(cli))

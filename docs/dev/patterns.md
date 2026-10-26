@@ -24,7 +24,11 @@ zero. Presets also use the existing duration and trajectory default fields.
 Explicit GPU telemetry suppresses a default that disables it. Scenario invariants
 still apply.
 The CLI preset does not supply benchmark values for `--config`; YAML continues
-to own those values.
+to own those values. Explicit `--scenario` and `--unsafe-override` flags still
+override the corresponding YAML fields; omitted flags preserve the YAML values.
+The selected scenario's invariants apply after configuration resolution,
+including automatic injection of `endpoint.extra.ignore_eos=true` for
+`inferencex-agentx-mvp`.
 
 `aiperf profile` applies runtime defaults with
 `Environment.defaults(spec.environment_defaults)`. Keys refer to existing
