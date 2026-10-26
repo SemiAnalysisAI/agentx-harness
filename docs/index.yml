@@ -249,6 +249,8 @@ navigation:
     path: reference/yaml-config-roadmap.md
   - page: Mocking a ROCm Environment
     path: reference/mock-amdsmi.md
+  - page: Replay Capture Format (replay-vN)
+    path: reference/replay-capture-format.md
 
 - section: Server Metrics
   collapsed: true

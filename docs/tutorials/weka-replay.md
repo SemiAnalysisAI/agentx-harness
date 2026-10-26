@@ -10,6 +10,8 @@ sidebar-title: Weka Replay Captures
 
 ## What a `replay-vN` capture is
 
+For the full field-by-field schema, see the [Replay Capture Format reference](../reference/replay-capture-format.md). This section covers only what you need to use the loader.
+
 A `replay-v3`/`v4`/`v5` file is a header line followed by one JSON object per **session** (optionally a trailing index on v5). Each session lists its **instances** (the main agent plus any sub-agents), and each instance carries an ordered list of **requests** with real absolute timestamps, exact server-reported token and cache counts, and real sampling parameters (`temperature`, `top_p`, `top_k`, `thinking`). What it does *not* record is message text: every content block is a hash, byte count, and an approximate token count, never the real string.
 
 Sub-agent spawns are recorded via `parent_spawn_request_id` (the request that spawned this instance) plus `fan_out_group` (that same id, as a string — a sanity cross-check rather than a second source of truth) and `fan_out_position` (sibling order within a fan-out). A link only counts as a real, structure-building spawn when the parent request genuinely belongs to another instance in the same session and the child didn't start before it; anything else (a dangling/self-referential/time-inverted link, or a spawn-group marker with no parent id at all) is demoted to a non-causal stream instead of asserted as a spawn — see [Tree shape](#tree-shape) below.
@@ -173,6 +175,7 @@ All five are part of the dataset mmap cache's key, so changing one correctly inv
 
 ## Related tutorials
 
+- [Replay Capture Format reference](../reference/replay-capture-format.md) — the full field-by-field schema this loader consumes.
 - [Replaying Agentic Coding Sessions with Weka Traces](weka-trace.md) — the converted-intermediate-format sibling loader.
 - [DAG Benchmarking (Sub-Agents)](../benchmark-modes/dag.md) — the SPAWN/SPAWN_JOIN mechanism this loader builds on.
 - [YAML Configuration Files](yaml-config.md) — background on the config shape used above.
