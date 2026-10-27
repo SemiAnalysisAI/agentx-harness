@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from aiperf.dataset.loader._weka_replay_content import TurnContent
+from aiperf.dataset.loader._weka_replay_identity import Resolution, wire_blocks
 from aiperf.dataset.loader._weka_replay_ir import (
     BlockKind,
     BlockSlotIR,
@@ -13,9 +15,12 @@ from aiperf.dataset.loader._weka_replay_ir import (
     SessionIR,
 )
 from aiperf.dataset.loader._weka_replay_synth import (
+    _METRIC_BLOCK_TOKENS,
     ChunkedCorpusStream,
     ReplaySessionSynthesizer,
     ReplaySynthConfig,
+    _render_wire,
+    _RenderItem,
 )
 
 _SAMPLING = SamplingIR(temperature=None, top_p=None, top_k=None, thinking=None)
@@ -349,3 +354,344 @@ class TestTheoreticalCacheHitMetric:
         total = sum(t for _, t in metrics.values())
         assert total > 0
         assert hit / total < 0.2
+
+
+class TestFinishTrieEquivalence:
+    """Proves the incremental-trie ``finish()`` produces byte-identical
+    ``(hit_blocks, total_blocks)`` results to the original O(n^2) pairwise
+    linear scan it replaced, across several hand-built fixtures.
+
+    ``_naive_finish`` is a deliberately dumb reimplementation of the
+    algorithm ``finish()`` used before the trie rewrite — the same
+    semantics (longest common prefix against any earlier wire, scanned
+    linearly), not exported, used only as this test's reference oracle.
+    """
+
+    @staticmethod
+    def _naive_finish(
+        records: list[tuple[float, str, int, tuple[int, ...]]],
+        identity,
+    ) -> dict[tuple[str, int], tuple[int, int]]:
+        ordered = sorted(records, key=lambda record: record[0])
+        seen_wires: list[tuple[int, ...]] = []
+        result: dict[tuple[str, int], tuple[int, int]] = {}
+
+        for _ts_ms, instance_id, request_id, wire in ordered:
+            best_hit = 0
+            for prior in seen_wires:
+                common = 0
+                for a, b in zip(prior, wire, strict=False):
+                    if a != b:
+                        break
+                    common += 1
+                if common > best_hit:
+                    best_hit = common
+                if best_hit == len(wire):
+                    break
+
+            hit_tokens = sum(
+                identity.anchor_and_length(cid)[1] for cid in wire[:best_hit]
+            )
+            total_tokens = sum(identity.anchor_and_length(cid)[1] for cid in wire)
+            hit_blocks = hit_tokens // _METRIC_BLOCK_TOKENS
+            total_blocks = -(-total_tokens // _METRIC_BLOCK_TOKENS)
+            result[(instance_id, request_id)] = (hit_blocks, total_blocks)
+            seen_wires.append(wire)
+
+        return result
+
+    def _assert_matches_naive(
+        self, synth: ReplaySessionSynthesizer
+    ) -> dict[tuple[str, int], tuple[int, int]]:
+        expected = self._naive_finish(synth._wire_records, synth._identity)
+        actual = synth.finish()
+        assert actual == expected
+        return actual
+
+    def test_single_instance_growing_wires_no_resets(self):
+        """(a) one instance, strictly growing wires, no resets."""
+
+        def messages(n: int) -> tuple[BlockSlotIR, ...]:
+            return tuple(
+                make_block(slot_index=i, hash=f"m{i}", tokens_est=64) for i in range(n)
+            )
+
+        requests = tuple(
+            make_request(
+                request_id=i,
+                ts_ms=float(i),
+                input_tokens=64 * (i + 1),
+                messages=messages(i + 1),
+            )
+            for i in range(5)
+        )
+        instance = make_instance(requests=requests)
+        session = make_session(instances=(instance,))
+        synth = ReplaySessionSynthesizer(
+            session, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+        synth.build_instance_turns(instance)
+
+        self._assert_matches_naive(synth)
+
+    def test_two_sibling_instances_share_prefix_then_diverge(self):
+        """(b) two sibling instances sharing a system/tools prefix, then
+        diverging on their own message content."""
+        sys_block = make_block(
+            kind=BlockKind.SYSTEM, slot_index=0, hash="sys-shared", tokens_est=64
+        )
+        tools_block = make_block(
+            kind=BlockKind.TOOLS, slot_index=0, hash="tools-shared", tokens_est=64
+        )
+        msg_a = make_block(slot_index=0, hash="msg-a", tokens_est=64)
+        msg_b = make_block(slot_index=0, hash="msg-b", tokens_est=64)
+
+        req_a = make_request(
+            request_id=0,
+            ts_ms=0.0,
+            input_tokens=192,
+            system=(sys_block,),
+            tools=tools_block,
+            messages=(msg_a,),
+        )
+        req_b = make_request(
+            request_id=0,
+            ts_ms=1.0,
+            input_tokens=192,
+            system=(sys_block,),
+            tools=tools_block,
+            messages=(msg_b,),
+        )
+
+        instance_a = make_instance(instance_id="inst-a", requests=(req_a,))
+        instance_b = make_instance(instance_id="inst-b", requests=(req_b,))
+        session = make_session(instances=(instance_a, instance_b))
+        synth = ReplaySessionSynthesizer(
+            session, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+        synth.build_instance_turns(instance_a)
+        synth.build_instance_turns(instance_b)
+
+        result = self._assert_matches_naive(synth)
+        # instance_b's shared system+tools prefix (2 blocks) must register as
+        # a hit against instance_a's already-emitted wire.
+        hit_b, _ = result[("inst-b", 0)]
+        assert hit_b > 0
+
+    def test_mid_session_reset_finds_best_match_past_immediate_predecessor(self):
+        """(c) a wire with a mid-session reset/context-truncation: the best
+        match for the third request lives two requests back, not in its
+        immediate (unrelated) predecessor."""
+        req0 = make_request(
+            request_id=0,
+            ts_ms=0.0,
+            input_tokens=128,
+            messages=(
+                make_block(slot_index=0, hash="m0", tokens_est=64),
+                make_block(slot_index=1, hash="m1", tokens_est=64),
+            ),
+        )
+        # Full reset: shares nothing with req0.
+        req1 = make_request(
+            request_id=1,
+            ts_ms=1.0,
+            input_tokens=64,
+            messages=(make_block(slot_index=0, hash="reset-x", tokens_est=64),),
+        )
+        # Reuses req0's first block even though its immediate predecessor
+        # (req1) shares nothing with it at all.
+        req2 = make_request(
+            request_id=2,
+            ts_ms=2.0,
+            input_tokens=128,
+            messages=(
+                make_block(slot_index=0, hash="m0", tokens_est=64),
+                make_block(slot_index=1, hash="m-new", tokens_est=64),
+            ),
+        )
+        instance = make_instance(requests=(req0, req1, req2))
+        session = make_session(instances=(instance,))
+        synth = ReplaySessionSynthesizer(
+            session, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+        synth.build_instance_turns(instance)
+
+        result = self._assert_matches_naive(synth)
+        hit2, _ = result[(instance.instance_id, 2)]
+        assert hit2 > 0
+
+    def test_fully_disjoint_wire_has_zero_overlap_with_any_prior(self):
+        """(d) an instance whose wire is not a superset of (or sharing any
+        prefix with) any prior wire at all."""
+        req0 = make_request(
+            request_id=0,
+            ts_ms=0.0,
+            input_tokens=64,
+            messages=(make_block(slot_index=0, hash="alpha", tokens_est=64),),
+        )
+        req1 = make_request(
+            request_id=1,
+            ts_ms=1.0,
+            input_tokens=64,
+            messages=(make_block(slot_index=0, hash="beta", tokens_est=64),),
+        )
+        instance = make_instance(requests=(req0, req1))
+        session = make_session(instances=(instance,))
+        synth = ReplaySessionSynthesizer(
+            session, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+        synth.build_instance_turns(instance)
+
+        result = self._assert_matches_naive(synth)
+        hit1, _ = result[(instance.instance_id, 1)]
+        assert hit1 == 0
+
+
+def _naive_build_instance_turns(
+    synth: ReplaySessionSynthesizer, instance: InstanceIR
+) -> list[TurnContent]:
+    """Reference copy of ``build_instance_turns`` as it existed before the
+    skip-matched-prefix optimization: builds a ``_RenderItem`` for every
+    block of every wire unconditionally (even ones a later slice discards),
+    then slices the matched prefix away only when rendering. Operates
+    in-place on ``synth``'s own identity/corpus-stream/diagnostics state, so
+    its cid assignments and diagnostics are directly comparable to the
+    optimized method's.
+    """
+    turns: list[TurnContent] = []
+    prev_wire_cids: tuple[int, ...] | None = None
+
+    for request in instance.requests:
+        blocks = wire_blocks(request)
+        resolutions = synth._identity.resolve_request(instance.instance_id, request)
+        synth._assign_minted_lengths(request, blocks, resolutions)
+
+        items: list[_RenderItem] = []
+        wire_cids: list[int] = []
+        for block, (cid, resolution) in zip(blocks, resolutions, strict=True):
+            if resolution == Resolution.MINTED:
+                synth._diag.minted_blocks += 1
+            else:
+                synth._diag.reused_blocks += 1
+
+            anchor, length = synth._identity.anchor_and_length(cid)
+            text = synth._corpus_stream.text_for(anchor, length)
+
+            seen_key = (anchor, length)
+            if seen_key not in synth._seen_content_ids:
+                synth._seen_content_ids.add(seen_key)
+                synth._diag.chars_emitted += len(text)
+                synth._diag.unique_content_tokens_emitted += length
+
+            role = block.role if block.kind == BlockKind.MESSAGE else "system"
+            items.append(_RenderItem(kind=block.kind, role=role, text=text))
+            wire_cids.append(cid)
+
+        wire_cids_t = tuple(wire_cids)
+        is_extension = (
+            prev_wire_cids is not None
+            and len(wire_cids_t) > len(prev_wire_cids)
+            and wire_cids_t[: len(prev_wire_cids)] == prev_wire_cids
+        )
+
+        if prev_wire_cids is None:
+            reset = False
+            raw_messages = _render_wire(items, joiner=synth._cfg.system_joiner)
+        elif is_extension:
+            reset = False
+            raw_messages = _render_wire(
+                items[len(prev_wire_cids) :], joiner=synth._cfg.system_joiner
+            )
+        else:
+            reset = True
+            raw_messages = _render_wire(items, joiner=synth._cfg.system_joiner)
+
+        turns.append(
+            TurnContent(raw_messages=raw_messages, raw_tools=None, reset_context=reset)
+        )
+        synth._wire_records.append(
+            (request.ts_ms, instance.instance_id, request.request_id, wire_cids_t)
+        )
+        synth._diag.requests_processed += 1
+        prev_wire_cids = wire_cids_t
+
+    return turns
+
+
+class TestSkipMatchedPrefixOptimizationEquivalence:
+    """Snapshot-compares the optimized ``build_instance_turns`` (which skips
+    building a ``_RenderItem`` for blocks in an already-matched, about-to-be-
+    sliced-away prefix) against the pre-optimization reference above, on a
+    fixture exercising every branch: turn 0, a growing extension, an exact-
+    repeat retry (full reset), a genuine divergence (full reset), and an
+    extension resuming right after that reset.
+    """
+
+    def test_full_turn_content_and_diagnostics_match_naive_reference(self):
+        growing = [
+            make_block(slot_index=i, hash=f"m{i}", tokens_est=64) for i in range(3)
+        ]
+        req0 = make_request(
+            request_id=0, ts_ms=0.0, input_tokens=64, messages=(growing[0],)
+        )
+        req1 = make_request(
+            request_id=1,
+            ts_ms=1.0,
+            input_tokens=128,
+            messages=(growing[0], growing[1]),
+        )
+        req2 = make_request(
+            request_id=2,
+            ts_ms=2.0,
+            input_tokens=192,
+            messages=(growing[0], growing[1], growing[2]),
+        )
+        # Exact repeat of req2's wire: must be a full reset, not a zero-delta
+        # extension.
+        req3 = make_request(
+            request_id=3,
+            ts_ms=3.0,
+            input_tokens=192,
+            messages=(growing[0], growing[1], growing[2]),
+        )
+        # Genuine divergence: shares nothing with req3.
+        diverged = make_block(slot_index=0, hash="diverged", tokens_est=64)
+        req4 = make_request(
+            request_id=4, ts_ms=4.0, input_tokens=64, messages=(diverged,)
+        )
+        # Resume growing right after the reset.
+        extra = make_block(slot_index=1, hash="extra", tokens_est=64)
+        req5 = make_request(
+            request_id=5,
+            ts_ms=5.0,
+            input_tokens=128,
+            messages=(diverged, extra),
+        )
+
+        requests = (req0, req1, req2, req3, req4, req5)
+        instance_optimized = make_instance(requests=requests)
+        instance_naive = make_instance(requests=requests)
+
+        session_optimized = make_session(instances=(instance_optimized,))
+        session_naive = make_session(instances=(instance_naive,))
+
+        synth_optimized = ReplaySessionSynthesizer(
+            session_optimized, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+        synth_naive = ReplaySessionSynthesizer(
+            session_naive, corpus=FakeCorpus(), cfg=ReplaySynthConfig()
+        )
+
+        optimized_turns = synth_optimized.build_instance_turns(instance_optimized)
+        naive_turns = _naive_build_instance_turns(synth_naive, instance_naive)
+
+        assert optimized_turns == naive_turns
+        assert optimized_turns[0].reset_context is False  # turn 0
+        assert optimized_turns[1].reset_context is False  # growing extension
+        assert optimized_turns[2].reset_context is False  # growing extension
+        assert optimized_turns[3].reset_context is True  # exact-repeat retry
+        assert optimized_turns[4].reset_context is True  # genuine divergence
+        assert optimized_turns[5].reset_context is False  # resumed extension
+
+        assert synth_optimized.diagnostics == synth_naive.diagnostics
+        assert synth_optimized.finish() == synth_naive.finish()

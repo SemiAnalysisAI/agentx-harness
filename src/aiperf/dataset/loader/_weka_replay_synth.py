@@ -224,28 +224,13 @@ class ReplaySessionSynthesizer:
             resolutions = self._identity.resolve_request(instance.instance_id, request)
             self._assign_minted_lengths(request, blocks, resolutions)
 
-            items: list[_RenderItem] = []
-            wire_cids: list[int] = []
-            for block, (cid, resolution) in zip(blocks, resolutions, strict=True):
-                if resolution == Resolution.MINTED:
-                    self._diag.minted_blocks += 1
-                else:
-                    self._diag.reused_blocks += 1
-
-                anchor, length = self._identity.anchor_and_length(cid)
-                text = self._corpus_stream.text_for(anchor, length)
-
-                seen_key = (anchor, length)
-                if seen_key not in self._seen_content_ids:
-                    self._seen_content_ids.add(seen_key)
-                    self._diag.chars_emitted += len(text)
-                    self._diag.unique_content_tokens_emitted += length
-
-                role = block.role if block.kind == BlockKind.MESSAGE else "system"
-                items.append(_RenderItem(kind=block.kind, role=role, text=text))
-                wire_cids.append(cid)
-
-            wire_cids_t = tuple(wire_cids)
+            # Cheap (no text materialization): lets `is_extension` below be
+            # known before deciding which blocks actually need a rendered
+            # `_RenderItem` -- the matched leading prefix never reaches
+            # `raw_messages` either way (it's sliced off below exactly as
+            # before), so building its render items is pure waste on every
+            # non-reset turn of a long-running instance.
+            wire_cids_t = tuple(cid for cid, _ in resolutions)
             # Strictly longer, not just equal: an exact repeat (retry) has an
             # identical wire of the same length and must be a reset, not a
             # zero-length "extension" with an empty delta.
@@ -254,19 +239,47 @@ class ReplaySessionSynthesizer:
                 and len(wire_cids_t) > len(prev_wire_cids)
                 and wire_cids_t[: len(prev_wire_cids)] == prev_wire_cids
             )
+            # Turn 0 and a full reset both need every block's render item;
+            # only a confirmed extension can skip the already-matched
+            # leading prefix (it would just be sliced away below anyway).
+            skip_prefix = len(prev_wire_cids) if is_extension else 0
 
-            if prev_wire_cids is None:
-                # Turn 0 of the instance: always the full initial wire.
-                reset = False
-                raw_messages = _render_wire(items, joiner=self._cfg.system_joiner)
-            elif is_extension:
-                reset = False
-                raw_messages = _render_wire(
-                    items[len(prev_wire_cids) :], joiner=self._cfg.system_joiner
-                )
-            else:
-                reset = True
-                raw_messages = _render_wire(items, joiner=self._cfg.system_joiner)
+            items: list[_RenderItem] = []
+            for idx, (block, (cid, resolution)) in enumerate(
+                zip(blocks, resolutions, strict=True)
+            ):
+                if resolution == Resolution.MINTED:
+                    self._diag.minted_blocks += 1
+                else:
+                    self._diag.reused_blocks += 1
+
+                # Unconditional regardless of `skip_prefix`: first-seen
+                # bookkeeping must happen exactly once per content id no
+                # matter which turn/position first introduces it, so this
+                # diagnostic can never depend on whether this turn happens
+                # to render that block's text.
+                anchor, length = self._identity.anchor_and_length(cid)
+                seen_key = (anchor, length)
+                if seen_key not in self._seen_content_ids:
+                    self._seen_content_ids.add(seen_key)
+                    self._diag.chars_emitted += len(
+                        self._corpus_stream.text_for(anchor, length)
+                    )
+                    self._diag.unique_content_tokens_emitted += length
+
+                if idx < skip_prefix:
+                    continue
+
+                text = self._corpus_stream.text_for(anchor, length)
+                role = block.role if block.kind == BlockKind.MESSAGE else "system"
+                items.append(_RenderItem(kind=block.kind, role=role, text=text))
+
+            # `items` already holds exactly the suffix past `skip_prefix`
+            # (nothing before it was ever appended), so no further slicing is
+            # needed here -- for turn 0 / a reset, skip_prefix is 0 and
+            # `items` covers the full wire, identically to before.
+            reset = not (prev_wire_cids is None or is_extension)
+            raw_messages = _render_wire(items, joiner=self._cfg.system_joiner)
 
             turns.append(
                 TurnContent(
@@ -340,30 +353,36 @@ class ReplaySessionSynthesizer:
 
         For each request (processed in ``ts_ms`` order across all
         instances), the "hit" portion is the longest common prefix between
-        its own resolved wire and any wire already fully emitted so far —
-        scanned linearly against every prior wire, not just an exact-match
-        lookup, so a longer shared prefix against an older wire still counts
-        even if no earlier wire was byte-for-byte identical. Correctness
-        over speed, per plan section 9's own stress-test framing; this is
-        O(requests^2) worst case, fine for the hermetic test fixtures this
-        module is validated against.
+        its own resolved wire and any wire already fully emitted so far.
+        Computed via an incremental prefix trie (plain dict-of-dicts) over
+        resolved content-id sequences, scoped to this one session and
+        discarded along with this synthesizer once the session is done:
+        walking the trie from the root along ``wire``'s own content ids, for
+        as long as a matching child exists, reaches exactly the longest
+        prefix of ``wire`` that is also a prefix of some previously-inserted
+        wire — which is the same quantity the original pairwise linear scan
+        over every earlier wire computed, just without re-scanning each one
+        (O(len(wire)) per request instead of O(requests × len(wire))). The
+        wire is then inserted into the trie (only the unseen suffix past the
+        matched depth needs new nodes) before moving to the next request, so
+        a wire never matches against itself.
         """
         records = sorted(self._wire_records, key=lambda record: record[0])
-        seen_wires: list[tuple[int, ...]] = []
+        trie_root: dict[int, dict] = {}
         result: dict[tuple[str, int], tuple[int, int]] = {}
 
         for _ts_ms, instance_id, request_id, wire in records:
+            node = trie_root
             best_hit = 0
-            for prior in seen_wires:
-                common = 0
-                for a, b in zip(prior, wire, strict=False):
-                    if a != b:
-                        break
-                    common += 1
-                if common > best_hit:
-                    best_hit = common
-                if best_hit == len(wire):
+            for cid in wire:
+                child = node.get(cid)
+                if child is None:
                     break
+                node = child
+                best_hit += 1
+
+            for cid in wire[best_hit:]:
+                node = node.setdefault(cid, {})
 
             hit_tokens = sum(
                 self._identity.anchor_and_length(cid)[1] for cid in wire[:best_hit]
@@ -372,7 +391,6 @@ class ReplaySessionSynthesizer:
             hit_blocks = hit_tokens // _METRIC_BLOCK_TOKENS
             total_blocks = -(-total_tokens // _METRIC_BLOCK_TOKENS)
             result[(instance_id, request_id)] = (hit_blocks, total_blocks)
-            seen_wires.append(wire)
 
         return result
 

@@ -21,9 +21,10 @@ bounds this loader's own peak working set to O(one session) (see plan §6).
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,51 @@ __all__ = ["WekaReplayLoader"]
 _SCHEMA_RE = re.compile(r"^replay-v\d+$")
 
 _SUPPORTED_SCHEMA_VERSIONS = frozenset({"replay-v3", "replay-v4", "replay-v5"})
+
+# Cadence for the mid-load progress line in convert_to_conversations: wall
+# time, not a session count, so it fires at a predictable rate regardless of
+# how heavy individual sessions are (a few huge sessions vs. many small ones).
+_PROGRESS_LOG_INTERVAL_S = 30.0
+
+
+@dataclass(slots=True)
+class _PhaseTimings:
+    """Cumulative wall-time (seconds) spent in each major phase of
+    :meth:`WekaReplayLoader.convert_to_conversations`'s per-session loop,
+    across the whole load.
+
+    Measured once per session (or once per instance/conversation for the
+    phases that run at that granularity) with ``time.monotonic()`` -- never
+    per block or per request -- so the timing overhead itself stays
+    negligible next to the work being measured. Folded into the final
+    corpus summary log line so a slow load can be attributed to a phase
+    instead of guessed at.
+    """
+
+    read_s: float = 0.0
+    """Time spent in ``read_session`` (reading + parsing one session's raw JSONL)."""
+
+    normalize_s: float = 0.0
+    """Time spent in ``normalize_session`` (building the session IR)."""
+
+    plan_s: float = 0.0
+    """Time spent in ``plan_session_tree`` (conversation/branch planning)."""
+
+    synth_s: float = 0.0
+    """Time spent in content synthesis: ``build_instance_turns`` plus the
+    session-wide theoretical cache-hit ``finish()`` call."""
+
+    turn_build_s: float = 0.0
+    """Time spent in ``_build_turn`` across every request of every instance."""
+
+    def total(self) -> float:
+        return (
+            self.read_s
+            + self.normalize_s
+            + self.plan_s
+            + self.synth_s
+            + self.turn_build_s
+        )
 
 
 def _phase_resolves_to_fixed_schedule(phase: Any) -> bool:
@@ -323,161 +369,192 @@ class WekaReplayLoader(BaseFileLoader):
         corpus_tight_loose_disagreement = 0
         corpus_resolution_counts: Counter[str] = Counter()
 
-        for span in spans:
-            # Skip orphan-shaped sessions BEFORE parsing/normalizing them,
-            # not just at plan_session_tree's filtering step: the shared
-            # orphan bucket crams together many unrelated users' header-less
-            # requests with no real structure, so it can violate invariants
-            # normalize_session enforces for genuine sessions (e.g. a
-            # request_id reused across "instances" that's also referenced as
-            # a parent_spawn_request_id, which is a hard, unrecoverable
-            # ambiguity for a real session but just noise here) -- a session
-            # we're always going to drop should never get a chance to crash
-            # the whole load first. session_id is already known from the
-            # scan phase, so this needs no parse at all.
-            if (
-                classify_orphan_shape(span.session_id) != "none"
-                and not self._options.include_orphans
-            ):
-                skip_diag = SessionDiagnostics()
-                skip_diag.orphan_session_dropped += 1
-                corpus_diag.accumulate(skip_diag)
-                continue
-            raw = read_session(self.filename, span)
-            diag = SessionDiagnostics()
-            session_ir = normalize_session(
-                raw,
-                schema_version=header.schema_version,
-                lineno=span.lineno,
-                diag=diag,
-            )
-            plan = plan_session_tree(session_ir, options=tree_options, diag=diag)
-            if plan is None:
-                corpus_diag.accumulate(diag)
-                continue
+        phase_timings = _PhaseTimings()
+        total_spans = len(spans)
+        load_start = time.monotonic()
+        last_progress_log = load_start
 
-            content_builder = self._content_builder_factory.for_session(session_ir)
-            session_conversations: list[Conversation] = []
-            # (Turn, instance_id, request_id) for every turn built this
-            # session, consumed after content_builder.finish() resolves the
-            # session-wide theoretical cache-hit metric.
-            cache_targets: list[tuple[Turn, str, int]] = []
-            # For the think_ms cross-check on SPAWN branches below: a
-            # branch's child_cids are instance_ids (plan §... PlannedConversation
-            # docstring: "cid == instance_id verbatim").
-            instances_by_id = {inst.instance_id: inst for inst in session_ir.instances}
-
-            for conv in plan.conversations:
-                turn_contents = content_builder.build_instance_turns(conv.instance)
-                if len(turn_contents) != len(conv.instance.requests):
-                    raise RuntimeError(
-                        f"weka_replay: internal error: build_instance_turns "
-                        f"returned {len(turn_contents)} turn(s) for instance "
-                        f"'{conv.cid}' with {len(conv.instance.requests)} "
-                        "request(s); these must be 1:1"
-                    )
-
-                turns: list[Turn] = []
-                prev_request: RequestIR | None = None
-                for turn_idx, (request, turn_content) in enumerate(
-                    zip(conv.instance.requests, turn_contents, strict=True)
+        for i, span in enumerate(spans, 1):
+            try:
+                # Skip orphan-shaped sessions BEFORE parsing/normalizing them,
+                # not just at plan_session_tree's filtering step: the shared
+                # orphan bucket crams together many unrelated users' header-less
+                # requests with no real structure, so it can violate invariants
+                # normalize_session enforces for genuine sessions (e.g. a
+                # request_id reused across "instances" that's also referenced as
+                # a parent_spawn_request_id, which is a hard, unrecoverable
+                # ambiguity for a real session but just noise here) -- a session
+                # we're always going to drop should never get a chance to crash
+                # the whole load first. session_id is already known from the
+                # scan phase, so this needs no parse at all.
+                if (
+                    classify_orphan_shape(span.session_id) != "none"
+                    and not self._options.include_orphans
                 ):
-                    turn = self._build_turn(
-                        request=request,
-                        prev_request=prev_request,
-                        turn_content=turn_content,
-                        session_id=session_ir.session_id,
-                        turn_idx=turn_idx,
-                        role=conv.instance.role,
-                        diag=diag,
-                    )
-                    turns.append(turn)
-                    cache_targets.append(
-                        (turn, conv.instance.instance_id, request.request_id)
-                    )
-                    recorded_cache_read_tokens += request.cache_read_tokens
-                    prev_request = request
+                    skip_diag = SessionDiagnostics()
+                    skip_diag.orphan_session_dropped += 1
+                    corpus_diag.accumulate(skip_diag)
+                    continue
 
-                conv_obj = Conversation(
-                    session_id=conv.cid,
-                    context_mode=ConversationContextMode.DELTAS_WITH_RESPONSES,
-                    turns=turns,
-                    is_root=conv.is_root,
-                    agent_depth=conv.agent_depth,
-                    parent_conversation_id=conv.parent_cid,
-                    replay_scope_id=conv.cid,
-                    branches=[],
+                t0 = time.monotonic()
+                raw = read_session(self.filename, span)
+                phase_timings.read_s += time.monotonic() - t0
+
+                diag = SessionDiagnostics()
+
+                t0 = time.monotonic()
+                session_ir = normalize_session(
+                    raw,
+                    schema_version=header.schema_version,
+                    lineno=span.lineno,
+                    diag=diag,
                 )
-                for branch in conv.branches:
-                    conv_obj.branches.append(
-                        ConversationBranchInfo(
-                            branch_id=branch.branch_id,
-                            child_conversation_ids=list(branch.child_cids),
-                            mode=ConversationBranchMode.SPAWN,
-                            is_background=branch.is_background,
-                            start_timestamp_ms=branch.start_timestamp_ms,
+                phase_timings.normalize_s += time.monotonic() - t0
+
+                t0 = time.monotonic()
+                plan = plan_session_tree(session_ir, options=tree_options, diag=diag)
+                phase_timings.plan_s += time.monotonic() - t0
+                if plan is None:
+                    corpus_diag.accumulate(diag)
+                    continue
+
+                content_builder = self._content_builder_factory.for_session(session_ir)
+                session_conversations: list[Conversation] = []
+                # (Turn, instance_id, request_id) for every turn built this
+                # session, consumed after content_builder.finish() resolves the
+                # session-wide theoretical cache-hit metric.
+                cache_targets: list[tuple[Turn, str, int]] = []
+                # For the think_ms cross-check on SPAWN branches below: a
+                # branch's child_cids are instance_ids (plan §... PlannedConversation
+                # docstring: "cid == instance_id verbatim").
+                instances_by_id = {
+                    inst.instance_id: inst for inst in session_ir.instances
+                }
+
+                for conv in plan.conversations:
+                    t0 = time.monotonic()
+                    turn_contents = content_builder.build_instance_turns(conv.instance)
+                    phase_timings.synth_s += time.monotonic() - t0
+                    if len(turn_contents) != len(conv.instance.requests):
+                        raise RuntimeError(
+                            f"weka_replay: internal error: build_instance_turns "
+                            f"returned {len(turn_contents)} turn(s) for instance "
+                            f"'{conv.cid}' with {len(conv.instance.requests)} "
+                            "request(s); these must be 1:1"
                         )
+
+                    turns: list[Turn] = []
+                    prev_request: RequestIR | None = None
+                    t0 = time.monotonic()
+                    for turn_idx, (request, turn_content) in enumerate(
+                        zip(conv.instance.requests, turn_contents, strict=True)
+                    ):
+                        turn = self._build_turn(
+                            request=request,
+                            prev_request=prev_request,
+                            turn_content=turn_content,
+                            session_id=session_ir.session_id,
+                            turn_idx=turn_idx,
+                            role=conv.instance.role,
+                            diag=diag,
+                        )
+                        turns.append(turn)
+                        cache_targets.append(
+                            (turn, conv.instance.instance_id, request.request_id)
+                        )
+                        recorded_cache_read_tokens += request.cache_read_tokens
+                        prev_request = request
+                    phase_timings.turn_build_s += time.monotonic() - t0
+
+                    conv_obj = Conversation(
+                        session_id=conv.cid,
+                        context_mode=ConversationContextMode.DELTAS_WITH_RESPONSES,
+                        turns=turns,
+                        is_root=conv.is_root,
+                        agent_depth=conv.agent_depth,
+                        parent_conversation_id=conv.parent_cid,
+                        replay_scope_id=conv.cid,
+                        branches=[],
                     )
-                    conv_obj.turns[branch.declaring_turn].branch_ids.append(
-                        branch.branch_id
-                    )
-                    if branch.join_turn is not None:
-                        conv_obj.turns[branch.join_turn].prerequisites.append(
-                            TurnPrerequisite(
-                                kind=PrerequisiteKind.SPAWN_JOIN,
+                    for branch in conv.branches:
+                        conv_obj.branches.append(
+                            ConversationBranchInfo(
                                 branch_id=branch.branch_id,
+                                child_conversation_ids=list(branch.child_cids),
+                                mode=ConversationBranchMode.SPAWN,
+                                is_background=branch.is_background,
+                                start_timestamp_ms=branch.start_timestamp_ms,
                             )
                         )
-                    self._check_spawn_think_ms(
-                        branch_start_ms=branch.start_timestamp_ms,
-                        child_cids=branch.child_cids,
-                        instances_by_id=instances_by_id,
-                        diag=diag,
-                    )
+                        conv_obj.turns[branch.declaring_turn].branch_ids.append(
+                            branch.branch_id
+                        )
+                        if branch.join_turn is not None:
+                            conv_obj.turns[branch.join_turn].prerequisites.append(
+                                TurnPrerequisite(
+                                    kind=PrerequisiteKind.SPAWN_JOIN,
+                                    branch_id=branch.branch_id,
+                                )
+                            )
+                        self._check_spawn_think_ms(
+                            branch_start_ms=branch.start_timestamp_ms,
+                            child_cids=branch.child_cids,
+                            instances_by_id=instances_by_id,
+                            diag=diag,
+                        )
 
-                session_conversations.append(conv_obj)
-                depth_histogram[conv.agent_depth] += 1
+                    session_conversations.append(conv_obj)
+                    depth_histogram[conv.agent_depth] += 1
 
-            cache_map = content_builder.finish()
-            for turn, instance_id, request_id in cache_targets:
-                hit_total = cache_map.get((instance_id, request_id))
-                if hit_total is not None:
-                    hit_blocks, total_blocks = hit_total
-                    turn.theoretical_prefix_cache_hit_blocks = hit_blocks
-                    turn.theoretical_prefix_cache_total_blocks = total_blocks
-                    theoretical_hit_tokens += hit_blocks * 64
+                t0 = time.monotonic()
+                cache_map = content_builder.finish()
+                phase_timings.synth_s += time.monotonic() - t0
+                for turn, instance_id, request_id in cache_targets:
+                    hit_total = cache_map.get((instance_id, request_id))
+                    if hit_total is not None:
+                        hit_blocks, total_blocks = hit_total
+                        turn.theoretical_prefix_cache_hit_blocks = hit_blocks
+                        turn.theoretical_prefix_cache_total_blocks = total_blocks
+                        theoretical_hit_tokens += hit_blocks * 64
 
-            synth_diag = content_builder.diagnostics
-            corpus_minted_blocks += synth_diag.minted_blocks
-            corpus_reused_blocks += synth_diag.reused_blocks
-            churn_stats = content_builder.identity_stats
-            corpus_resolution_counts["slot_same_hash"] += (
-                churn_stats.slot_same_hash_count
-            )
-            corpus_resolution_counts["exact_hash"] += churn_stats.exact_hash_count
-            corpus_resolution_counts["seed_hash"] += churn_stats.seed_hash_count
-            corpus_resolution_counts["churn"] += churn_stats.churn_count
-            corpus_resolution_counts["minted"] += churn_stats.minted_count
-            for delta, count in churn_stats.flip_byte_delta_hist.items():
-                corpus_flip_hist[delta] += count
-            corpus_tight_loose_disagreement += (
-                churn_stats.tight_loose_disagreement_count
-            )
-
-            validate_for_orchestrator_v1(
-                DatasetMetadata(
-                    conversations=[c.metadata() for c in session_conversations],
-                    sampling_strategy=self.get_preferred_sampling_strategy(),
+                synth_diag = content_builder.diagnostics
+                corpus_minted_blocks += synth_diag.minted_blocks
+                corpus_reused_blocks += synth_diag.reused_blocks
+                churn_stats = content_builder.identity_stats
+                corpus_resolution_counts["slot_same_hash"] += (
+                    churn_stats.slot_same_hash_count
                 )
-            )
+                corpus_resolution_counts["exact_hash"] += churn_stats.exact_hash_count
+                corpus_resolution_counts["seed_hash"] += churn_stats.seed_hash_count
+                corpus_resolution_counts["churn"] += churn_stats.churn_count
+                corpus_resolution_counts["minted"] += churn_stats.minted_count
+                for delta, count in churn_stats.flip_byte_delta_hist.items():
+                    corpus_flip_hist[delta] += count
+                corpus_tight_loose_disagreement += (
+                    churn_stats.tight_loose_disagreement_count
+                )
 
-            corpus_diag.sessions_kept += 1
-            corpus_diag.accumulate(diag)
-            all_conversations.extend(session_conversations)
-            # Discard this session's intermediate state before the next
-            # iteration (plan §6): session_ir/raw/plan/content_builder/
-            # cache_targets all go out of scope here, holding nothing beyond
-            # the emitted Conversation objects.
+                validate_for_orchestrator_v1(
+                    DatasetMetadata(
+                        conversations=[c.metadata() for c in session_conversations],
+                        sampling_strategy=self.get_preferred_sampling_strategy(),
+                    )
+                )
+
+                corpus_diag.sessions_kept += 1
+                corpus_diag.accumulate(diag)
+                all_conversations.extend(session_conversations)
+                # Discard this session's intermediate state before the next
+                # iteration (plan §6): session_ir/raw/plan/content_builder/
+                # cache_targets all go out of scope here, holding nothing beyond
+                # the emitted Conversation objects.
+            finally:
+                last_progress_log = self._maybe_log_progress(
+                    processed=i,
+                    total=total_spans,
+                    load_start=load_start,
+                    last_log=last_progress_log,
+                )
 
         self._delay_cap_tracker.log_summary(logger_name=__name__)
         self._log_corpus_summary(
@@ -491,6 +568,8 @@ class WekaReplayLoader(BaseFileLoader):
             corpus_resolution_counts=corpus_resolution_counts,
             corpus_flip_hist=corpus_flip_hist,
             corpus_tight_loose_disagreement=corpus_tight_loose_disagreement,
+            phase_timings=phase_timings,
+            total_elapsed_s=time.monotonic() - load_start,
         )
         return all_conversations
 
@@ -675,6 +754,42 @@ class WekaReplayLoader(BaseFileLoader):
             if think_ms_disagrees(computed_ms, first_request.think_ms):
                 diag.think_spawn_disagreement_count += 1
 
+    def _maybe_log_progress(
+        self,
+        *,
+        processed: int,
+        total: int,
+        load_start: float,
+        last_log: float,
+    ) -> float:
+        """Log a mid-load progress line at most once every
+        :data:`_PROGRESS_LOG_INTERVAL_S` of wall time, and return the
+        (possibly updated) timestamp of the last log so the caller can carry
+        it into the next iteration.
+
+        Called from a ``finally`` block around every span of the main
+        per-session loop (skipped, dropped, or fully converted alike) so
+        progress always advances regardless of which exit path that
+        iteration took.
+        """
+        now = time.monotonic()
+        if now - last_log < _PROGRESS_LOG_INTERVAL_S and processed < total:
+            return last_log
+
+        elapsed = now - load_start
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        remaining = total - processed
+        eta_s = remaining / rate if rate > 0 else None
+        eta_str = f"{eta_s:.0f}s" if eta_s is not None else "unknown"
+        self.info(
+            lambda: (
+                f"weka_replay: progress {processed}/{total} session(s) "
+                f"({100.0 * processed / total:.1f}%) in {elapsed:.1f}s "
+                f"({rate:.2f} sessions/s); ETA {eta_str}"
+            )
+        )
+        return now
+
     def _log_corpus_summary(
         self,
         *,
@@ -688,6 +803,8 @@ class WekaReplayLoader(BaseFileLoader):
         corpus_resolution_counts: Counter[str],
         corpus_flip_hist: Counter[int],
         corpus_tight_loose_disagreement: int,
+        phase_timings: _PhaseTimings,
+        total_elapsed_s: float,
     ) -> None:
         self.info(
             f"weka_replay: loaded {corpus_diag.sessions_kept}/"
@@ -712,4 +829,22 @@ class WekaReplayLoader(BaseFileLoader):
             "blocks total; tight/loose churn-gate disagreements="
             f"{corpus_tight_loose_disagreement:,}; top cache_control flip Δbytes "
             f"(value: occurrence_count, including non-matching flips): {top_deltas}"
+        )
+
+        def _pct(phase_s: float) -> float:
+            return 100.0 * phase_s / total_elapsed_s if total_elapsed_s > 0 else 0.0
+
+        self.info(
+            lambda: (
+                f"weka_replay phase timing (total wall time {total_elapsed_s:.1f}s): "
+                f"read={phase_timings.read_s:.1f}s ({_pct(phase_timings.read_s):.1f}%), "
+                f"normalize={phase_timings.normalize_s:.1f}s "
+                f"({_pct(phase_timings.normalize_s):.1f}%), "
+                f"tree={phase_timings.plan_s:.1f}s ({_pct(phase_timings.plan_s):.1f}%), "
+                f"synth={phase_timings.synth_s:.1f}s ({_pct(phase_timings.synth_s):.1f}%), "
+                f"turn_build={phase_timings.turn_build_s:.1f}s "
+                f"({_pct(phase_timings.turn_build_s):.1f}%), "
+                f"unaccounted={max(0.0, total_elapsed_s - phase_timings.total()):.1f}s "
+                f"({_pct(max(0.0, total_elapsed_s - phase_timings.total())):.1f}%)"
+            )
         )
