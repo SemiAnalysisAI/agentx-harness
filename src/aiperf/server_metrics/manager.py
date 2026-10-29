@@ -216,11 +216,15 @@ class ServerMetricsManager(BaselineCollectorMixin, BaseComponentService):
         """Capture a one-shot server-metrics scrape for a phase boundary."""
         if self._server_metrics_disabled or not self._collectors:
             return
-        boundary_phase = (
-            CreditPhase.WARMUP
-            if message.phase_kind == "warmup"
-            else CreditPhase.PROFILING
-        )
+        # Tag the scrape with its own phase. Falling back to PROFILING for an
+        # unset kind put a warmup-start scrape into the profiling series, so
+        # counters that already existed then counted the whole warmup.
+        if message.phase_kind == "warmup":
+            boundary_phase = CreditPhase.WARMUP
+        elif message.phase_kind == "profiling":
+            boundary_phase = CreditPhase.PROFILING
+        else:
+            boundary_phase = message.phase or CreditPhase.PROFILING
         errors: list[str] = []
         for endpoint_url, collector in list(self._collectors.items()):
             try:

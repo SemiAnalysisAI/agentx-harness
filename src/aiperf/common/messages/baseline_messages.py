@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from aiperf.common.enums import BaselineKind, MessageType
+from aiperf.common.enums import BaselineKind, CreditPhase, MessageType
 from aiperf.common.messages.base_messages import Message
 from aiperf.common.types import MessageTypeT, PhaseKind
 
@@ -33,6 +33,10 @@ class PhaseBaselineRequestMessage(Message):
     phase_name: str = Field(..., description="User-facing unique phase name.")
     phase_kind: PhaseKind | None = Field(
         default=None, description="Semantic phase kind: warmup or profiling."
+    )
+    phase: CreditPhase | None = Field(
+        default=None,
+        description="Credit phase of the boundary; used when phase_kind is unset.",
     )
     kind: BaselineKind = Field(
         ..., description="START before credits are issued; END after returns drain."

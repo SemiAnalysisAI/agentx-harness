@@ -643,6 +643,9 @@ def _build_agentic_warmup_config(phase: PhaseConfig) -> CreditPhaseConfig | None
         total_expected_requests = concurrency
     return CreditPhaseConfig(
         phase=CreditPhase.WARMUP,
+        # Synthesized phases have no PhaseConfig.kind; consumers that key on
+        # phase_kind (server-metrics phase-boundary baselines) need it set.
+        phase_kind="warmup",
         timing_mode=TimingMode.AGENTIC_REPLAY,
         # Duration mode is strategy-terminated by its timer. Count mode uses
         # the generic request-count stop condition as a global backstop while
