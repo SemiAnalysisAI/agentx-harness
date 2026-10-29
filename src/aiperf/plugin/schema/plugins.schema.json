@@ -756,6 +756,32 @@
               "description": "HuggingFace dataset subset/config name. Only needed for datasets with multiple configs.",
               "title": "Hf Subset"
             },
+            "hf_filename": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "File inside the HuggingFace dataset repo to download as-is (e.g. 'replay.jsonl'). Only used by loaders that fetch a single file with hf_hub_download instead of parsing the repo with `datasets`.",
+              "title": "Hf Filename"
+            },
+            "hf_revision": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "HuggingFace repo revision (commit sha, tag or branch) to pin the download to, for reproducible benchmarks. Defaults to the repo's main branch.",
+              "title": "Hf Revision"
+            },
             "is_trace": {
               "default": false,
               "description": "Whether this loader handles trace-format datasets. Trace public datasets reuse hash_ids-based prompt generation, require a tokenizer, and prefer sequential sampling. Mirrors the field of the same name on CustomDatasetLoaderMetadata so trace loaders can live in either pipeline.",

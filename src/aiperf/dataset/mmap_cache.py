@@ -78,6 +78,23 @@ _logger = AIPerfLogger(__name__)
 # Version 5 fixed the Conversation.metadata() projection of per-turn
 # theoretical prefix-cache block counts for realtime infinite-cache hit rate.
 MANIFEST_VERSION = (
+    # v28: weka_replay content-identity resolution changed twice since v27:
+    # (a) churn-matching no longer requires the request's resolved-id prefix
+    # to be fully intact (removed a gate that was silently zeroing out real
+    # cache-control-churn matches across the whole real corpus); (b) each
+    # request's system_blocks[0] is now dropped when under 200 bytes (the
+    # capture's own per-request billing/preamble header, mirroring wekai's
+    # effectiveSystemBlocks). Both change which blocks mint vs. reuse for the
+    # SAME input file and settings, so a cached weka_replay entry built
+    # before this fix decodes different synthesized text/block counts than a
+    # fresh load would.
+    # v27: cache key now includes the five AIPERF_DATASET_WEKA_REPLAY_* knobs
+    # (SESSION_MODE / INCLUDE_ORPHANS / INCLUDE_EPHEMERAL / INCLUDE_ROLES /
+    # SAMPLING_PASSTHROUGH) and "weka_replay" joins TRACE_VERBATIM_DATASET_TYPES.
+    # These gate _weka_replay_tree.plan_session_tree's filtering/mode decisions
+    # and the synthesized request's sampling passthrough, both baked into the
+    # decoded mmap, so a run differing only in one of these must not reuse
+    # another run's cached weka_replay entry.
     # v26: weka inter-turn delays are now always end-to-start
     # (t_k - (t_{k-1} + api_{k-1}), floored at 0) instead of start-to-start.
     # The use_end_to_start_delays flag was removed, so Turn.delay decodes to
@@ -174,7 +191,7 @@ MANIFEST_VERSION = (
     # v10: merge of the flattened-agent-splitting lineage and the
     # tool-shaping lineage (boundary-cut overhang strip; shaping decided at
     # first emission so reset re-emits reproduce the first-sent shape).
-    26
+    28
 )
 MANIFEST_FILENAME = "manifest.json"
 INPUTS_JSON_FILENAME = "inputs.json"
@@ -200,6 +217,7 @@ TRACE_VERBATIM_DATASET_TYPES = frozenset(
         "raw_payload",
         "inputs_json",
         "weka_trace",
+        "weka_replay",
     }
 )
 
@@ -211,8 +229,8 @@ def is_trace_or_verbatim_dataset(
     """Whether a dataset is a trace / verbatim / weka type.
 
     True for the custom-dataset types in ``TRACE_VERBATIM_DATASET_TYPES`` and for
-    the HF-hosted weka public datasets (``weka_hf`` and the
-    ``semianalysis_cc_traces_weka*`` family). These are the datasets that use the
+    the HF-hosted weka public datasets (``weka_hf``, the
+    ``semianalysis_cc_traces_weka*`` family and the ``weka_replay*`` family). These are the datasets that use the
     mmap cache and skip inputs.json; everything else is treated as a cheap
     non-trace dataset that is never cached and always emits inputs.json.
     """
@@ -223,7 +241,9 @@ def is_trace_or_verbatim_dataset(
         return True
     if public_dataset is not None:
         name = str(public_dataset)
-        if name == "weka_hf" or name.startswith("semianalysis_cc_traces_weka"):
+        if name == "weka_hf" or name.startswith(
+            ("semianalysis_cc_traces_weka", "weka_replay")
+        ):
             return True
     return False
 
@@ -831,6 +851,19 @@ def _settings_payload_from_run(run: BenchmarkRun) -> dict[str, object]:
         "weka_seam_max_gap_seconds": Environment.DATASET.WEKA_SEAM_MAX_GAP_SECONDS,
         "weka_seam_min_overlap_ratio": (
             Environment.DATASET.WEKA_SEAM_MIN_OVERLAP_RATIO
+        ),
+        # weka_replay session-tree planning/filtering knobs (_weka_replay_tree.py
+        # via _weka_replay_options.resolve_options) and the sampling-passthrough
+        # allow-list baked into each synthesized request's extra_body -- all
+        # change the decoded mmap content for a given input file.
+        "weka_replay_session_mode": Environment.DATASET.WEKA_REPLAY_SESSION_MODE,
+        "weka_replay_include_orphans": Environment.DATASET.WEKA_REPLAY_INCLUDE_ORPHANS,
+        "weka_replay_include_ephemeral": (
+            Environment.DATASET.WEKA_REPLAY_INCLUDE_EPHEMERAL
+        ),
+        "weka_replay_include_roles": Environment.DATASET.WEKA_REPLAY_INCLUDE_ROLES,
+        "weka_replay_sampling_passthrough": (
+            Environment.DATASET.WEKA_REPLAY_SAMPLING_PASSTHROUGH
         ),
         # Full synthesis dump: max_isl/max_osl caps AND the speedup_ratio /
         # *_multiplier transforms, all of which rewrite the decoded trace bytes.

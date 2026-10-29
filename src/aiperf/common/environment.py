@@ -540,6 +540,48 @@ class _DatasetSettings(BaseSettings):
         "applies when WEKA_SPLIT_FLATTENED_AGENTS is True.",
     )
 
+    WEKA_REPLAY_SESSION_MODE: str = Field(
+        default="tree",
+        description="weka_replay session-tree planning mode: 'tree' builds a "
+        "single rooted tree -- the session's primary main instance, with "
+        "every OTHER non-causal stream (co-sessions, helpers) attached to it "
+        "as a background SPAWN branch; 'independent' instead makes every "
+        "non-causal stream its own top-level root conversation (no "
+        "co-session anchoring). Either way, a verified CAUSAL sub-agent "
+        "(linked by fan_out_group) still attaches to its real spawning "
+        "parent as a SPAWN branch -- this setting only changes how the "
+        "session's NON-causal streams relate to each other, never real "
+        "spawn linkage. See TreeFilterOptions.session_mode in "
+        "_weka_replay_tree.py.",
+    )
+    WEKA_REPLAY_INCLUDE_ORPHANS: bool = Field(
+        default=False,
+        description="weka_replay: include sessions classified as orphan (no "
+        "resolvable session_id -- see _weka_replay_ir.py's orphan_shape). "
+        "Default False drops them. See TreeFilterOptions.include_orphans.",
+    )
+    WEKA_REPLAY_INCLUDE_EPHEMERAL: bool = Field(
+        default=False,
+        description="weka_replay: include instances classified as ReplayRole."
+        "EPHEMERAL (no system block recorded). Default False drops them, and "
+        "any instance causally descended from a dropped ephemeral instance "
+        "cascades out too. See TreeFilterOptions.include_ephemeral.",
+    )
+    WEKA_REPLAY_INCLUDE_ROLES: str = Field(
+        default="",
+        description="weka_replay: comma-separated allow-list of ReplayRole "
+        "values (e.g. 'main,sub-agent') an instance's role must match to be "
+        "retained; empty string (default) allows every role. See "
+        "TreeFilterOptions.include_roles.",
+    )
+    WEKA_REPLAY_SAMPLING_PASSTHROUGH: str = Field(
+        default="temperature,top_p",
+        description="weka_replay: comma-separated list of recorded sampling "
+        "parameter names (from SamplingIR) carried into each synthesized "
+        "request's extra_body verbatim. Parameters not in this list are dropped "
+        "rather than replayed.",
+    )
+
 
 class _DagSettings(BaseSettings):
     """Settings for DAG benchmark mode (`dag_jsonl` input type)."""

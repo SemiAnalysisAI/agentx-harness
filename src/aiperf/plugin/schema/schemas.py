@@ -410,6 +410,21 @@ class PublicDatasetLoaderMetadata(BaseModel):
         default=None,
         description="HuggingFace dataset subset/config name. Only needed for datasets with multiple configs.",
     )
+    hf_filename: str | None = Field(
+        default=None,
+        description=(
+            "File inside the HuggingFace dataset repo to download as-is "
+            "(e.g. 'replay.jsonl'). Only used by loaders that fetch a single "
+            "file with hf_hub_download instead of parsing the repo with `datasets`."
+        ),
+    )
+    hf_revision: str | None = Field(
+        default=None,
+        description=(
+            "HuggingFace repo revision (commit sha, tag or branch) to pin the "
+            "download to, for reproducible benchmarks. Defaults to the repo's main branch."
+        ),
+    )
     is_trace: bool = Field(
         default=False,
         description=(

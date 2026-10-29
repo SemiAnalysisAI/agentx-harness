@@ -17,6 +17,8 @@ Generation uses window slicing from pre-built token pools, same as PromptGenerat
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from aiperf.common import random_generator as rng
 from aiperf.common.exceptions import (
     ConfigurationError,
@@ -747,6 +749,13 @@ class CodingContentGenerator(BaseGenerator):
         )
         if shared_system_length is not None:
             self._generate_shared_system_prompt()
+
+    @property
+    def tokenized_corpus(self) -> Sequence[int]:
+        """Read-only view of the pre-tokenized corpus. Exposed for loaders
+        that synthesize their own content outside this generator's own
+        generate() method (e.g. weka_replay)."""
+        return self._tokenized_corpus
 
     def generate(
         self,

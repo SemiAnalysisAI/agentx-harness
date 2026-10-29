@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,28 @@ def trace_jsonl(tmp_path: Path) -> Path:
     p = tmp_path / "trace.jsonl"
     p.touch()
     return p
+
+
+@pytest.fixture
+def weka_replay_format() -> Generator[None, None, None]:
+    """Ensure ``weka_replay`` exists on the dynamic format/custom-dataset enums.
+
+    ``weka_replay`` is now registered for real via ``plugins.yaml`` (see
+    ``_weka_replay_*.py`` / ``weka_replay.py``), so ``DatasetFormat.WEKA_REPLAY``
+    / ``CustomDatasetType.WEKA_REPLAY`` already exist as static members in the
+    generated ``enums.pyi`` in the normal case. This fixture only falls back
+    to a temporary runtime registration when running against a checkout where
+    the real plugin registration hasn't happened yet (e.g. mid-bisect), so the
+    gate tests below stay meaningful either way.
+    """
+    registered_here = "WEKA_REPLAY" not in DatasetFormat.__members__
+    if registered_here:
+        DatasetFormat.register("WEKA_REPLAY", "weka_replay")
+        CustomDatasetType.register("WEKA_REPLAY", "weka_replay")
+    yield
+    if registered_here:
+        DatasetFormat.deregister("WEKA_REPLAY")
+        CustomDatasetType.deregister("WEKA_REPLAY")
 
 
 class TestMaxContextLengthRouting:
@@ -106,6 +129,48 @@ class TestMaxContextLengthConverterGuard:
             model_names=["m"],
             prompt_input_tokens_mean=128,
             max_context_length=128000,
+        )
+        with pytest.raises(ValueError, match="only applies to Weka"):
+            build_dataset(cli)
+
+
+class TestMaxContextLengthWekaReplayGate:
+    """weka_replay is a Weka-flavored FILE format (session-tree replay, see
+    _weka_replay_*.py) and must pass the same --max-context-length gate as
+    weka_trace, while unrelated formats keep being rejected."""
+
+    def test_accepts_weka_replay_custom_dataset_type(
+        self, trace_jsonl: Path, weka_replay_format: None
+    ) -> None:
+        cli = CLIConfig(
+            model_names=["m"],
+            input_file=str(trace_jsonl),
+            custom_dataset_type=CustomDatasetType.WEKA_REPLAY,
+            max_context_length=1000,
+        )
+        out = build_dataset(cli)
+        assert out["max_context_length"] == 1000
+
+    def test_file_weka_replay_model_validator_accepts(
+        self, trace_jsonl: Path, weka_replay_format: None
+    ) -> None:
+        ds = FileDataset(
+            type="file",
+            name="m",
+            path=trace_jsonl,
+            format=DatasetFormat.WEKA_REPLAY,
+            max_context_length=1000,
+        )
+        assert ds.max_context_length == 1000
+
+    def test_single_turn_still_rejected_alongside_weka_replay_registration(
+        self, trace_jsonl: Path, weka_replay_format: None
+    ) -> None:
+        cli = CLIConfig(
+            model_names=["m"],
+            input_file=str(trace_jsonl),
+            custom_dataset_type=CustomDatasetType.SINGLE_TURN,
+            max_context_length=1000,
         )
         with pytest.raises(ValueError, match="only applies to Weka"):
             build_dataset(cli)

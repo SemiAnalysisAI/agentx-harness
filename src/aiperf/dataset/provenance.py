@@ -43,6 +43,10 @@ def public_dataset_provenance(cfg: BenchmarkConfig) -> dict[str, object] | None:
         )
     if hf_subset is not None:
         provenance["hf_subset"] = hf_subset
+    if loader_metadata.hf_filename is not None:
+        provenance["hf_filename"] = loader_metadata.hf_filename
+    if loader_metadata.hf_revision is not None:
+        provenance["hf_revision"] = loader_metadata.hf_revision
     if dataset.entries_explicit:
         provenance["num_dataset_entries"] = dataset.entries
     return provenance

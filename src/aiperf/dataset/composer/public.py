@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from aiperf.common.enums import ConversationContextMode
 from aiperf.common.models import Conversation
 from aiperf.common.tokenizer import Tokenizer
 from aiperf.config.dataset import PublicDataset
@@ -29,6 +30,18 @@ class PublicDatasetComposer(BaseDatasetComposer):
         if not isinstance(dataset, PublicDataset):
             raise ValueError("PublicDatasetComposer requires a public dataset.")
         self._public_dataset = dataset
+
+    def get_default_context_mode(self) -> ConversationContextMode | None:
+        """Defer to the loader's dataset-level default; ``None`` if it defines none.
+
+        Resolves the loader class itself because DatasetManager reads this
+        before ``create_dataset_async`` runs.
+        """
+        loader_class = plugins.get_class(
+            PluginType.PUBLIC_DATASET_LOADER, self._public_dataset.dataset
+        )
+        getter = getattr(loader_class, "get_default_context_mode", None)
+        return getter() if getter is not None else None
 
     def create_dataset(self) -> list[Conversation]:
         raise NotImplementedError("Use create_dataset_async() for public datasets")
@@ -96,6 +109,16 @@ class PublicDatasetComposer(BaseDatasetComposer):
             subset = cli_subset if cli_subset is not None else loader_metadata.hf_subset
             if subset is not None:
                 kwargs["hf_subset"] = subset
+            kwargs.update(
+                {
+                    k: v
+                    for k, v in (
+                        ("hf_filename", loader_metadata.hf_filename),
+                        ("hf_revision", loader_metadata.hf_revision),
+                    )
+                    if v is not None
+                }
+            )
 
         optional_fields = {
             "prompt_column": loader_metadata.prompt_column,

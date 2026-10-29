@@ -4,7 +4,9 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pytest import param
 
+from aiperf.common.enums import ConversationContextMode
 from aiperf.common.models import Conversation, Text, Turn
 from aiperf.config.flags.cli_config import CLIConfig
 from aiperf.dataset.composer.public import PublicDatasetComposer
@@ -216,3 +218,52 @@ class TestCreateDatasetAsync:
             result = await composer.create_dataset_async()
 
         assert len(result) == 1
+
+
+def _public_composer(public_dataset: PublicDatasetType) -> PublicDatasetComposer:
+    config = CLIConfig(model_names=["test-model"], public_dataset=public_dataset)
+    return PublicDatasetComposer(run=make_run(config), tokenizer=None)
+
+
+class TestHFFileMetadataForwarding:
+    def test_hf_filename_and_revision_forwarded_for_replay_entry(self):
+        from aiperf.dataset.loader.weka_replay_hf import WekaReplayHFLoader
+
+        composer = _public_composer(PublicDatasetType("weka_replay_40d_102026"))
+        with patch.object(composer, "_inject_trace_kwargs"):
+            kwargs = composer._build_loader_kwargs(
+                PublicDatasetType("weka_replay_40d_102026"), WekaReplayHFLoader
+            )
+
+        assert kwargs["hf_dataset_name"] == "wekaio/replay-40d-oct14-337a03810637"
+        assert kwargs["hf_filename"] == "replay-40d-oct14-337a03810637.jsonl"
+        assert kwargs["hf_revision"] == "5afaa89882fc2c24a3dcb8bcdcd0485770c5021d"
+
+    def test_hf_filename_and_revision_absent_for_existing_entries(self, aimo_config):
+        composer = PublicDatasetComposer(run=make_run(aimo_config), tokenizer=None)
+        kwargs = composer._build_loader_kwargs(
+            PublicDatasetType.AIMO, HFInstructionResponseDatasetLoader
+        )
+
+        assert "hf_filename" not in kwargs
+        assert "hf_revision" not in kwargs
+
+
+class TestGetDefaultContextMode:
+    def test_replay_entry_defaults_to_deltas_with_responses(self):
+        composer = _public_composer(PublicDatasetType("weka_replay_40d_102026"))
+        assert (
+            composer.get_default_context_mode()
+            == ConversationContextMode.DELTAS_WITH_RESPONSES
+        )
+
+    @pytest.mark.parametrize(
+        "alias",
+        [
+            param("semianalysis_cc_traces_weka_062126_256k", id="weka-trace-hf"),
+            param("aimo", id="instruction-response"),
+        ],
+    )  # fmt: skip
+    def test_existing_public_entries_have_no_context_mode(self, alias: str):
+        composer = _public_composer(PublicDatasetType(alias))
+        assert composer.get_default_context_mode() is None

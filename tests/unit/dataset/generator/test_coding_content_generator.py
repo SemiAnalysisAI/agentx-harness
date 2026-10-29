@@ -39,6 +39,9 @@ class TestCodingContentGeneratorInit:
     def test_tokenized_corpus_aliases_tool_pool(self, generator):
         assert generator._tokenized_corpus is generator._tool_pool
 
+    def test_tokenized_corpus_property_returns_private_attr(self, generator):
+        assert generator.tokenized_corpus is generator._tokenized_corpus
+
     def test_hash_id_corpus_rng_exists(self, generator):
         assert generator._hash_id_corpus_rng is not None
 

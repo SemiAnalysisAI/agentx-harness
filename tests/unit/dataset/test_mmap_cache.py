@@ -248,6 +248,50 @@ class TestComputeCacheKey:
         assert k1 is not None and k2 is not None
         assert k1 != k2, "random_seed must distinguish the cache key"
 
+    @pytest.mark.parametrize(
+        ("attr", "off_value", "on_value"),
+        [
+            ("WEKA_REPLAY_SESSION_MODE", "tree", "independent"),
+            ("WEKA_REPLAY_INCLUDE_ORPHANS", False, True),
+            ("WEKA_REPLAY_INCLUDE_EPHEMERAL", False, True),
+            ("WEKA_REPLAY_INCLUDE_ROLES", "", "main,sub-agent"),
+            ("WEKA_REPLAY_SAMPLING_PASSTHROUGH", "temperature,top_p", "temperature"),
+        ],
+    )  # fmt: skip
+    def test_key_changes_with_weka_replay_env_knobs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        attr: str,
+        off_value: object,
+        on_value: object,
+    ) -> None:
+        # Each AIPERF_DATASET_WEKA_REPLAY_* knob gates _weka_replay_tree's
+        # filtering/mode decisions or the sampling passthrough baked into the
+        # synthesized request -- both change decoded mmap content, so two runs
+        # differing only in one of these knobs must NOT share a cache entry.
+        from aiperf.common.environment import Environment
+        from aiperf.plugin.enums import CustomDatasetType
+
+        trace = _write_input_file(
+            tmp_path,
+            b'{"session_id": "s1", "timestamp": 0, "input_length": 8, '
+            b'"output_length": 4}\n',
+        )
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                input_file=str(trace),
+                custom_dataset_type=CustomDatasetType.MOONCAKE_TRACE,
+            )
+        )
+
+        monkeypatch.setattr(Environment.DATASET, attr, off_value)
+        off = mmap_cache.compute_cache_key_from_run(run)
+        monkeypatch.setattr(Environment.DATASET, attr, on_value)
+        on = mmap_cache.compute_cache_key_from_run(run)
+        assert off is not None and on is not None and off != on
+
     def test_settings_payload_includes_seed_corpus_osl(self, tmp_path: Path) -> None:
         # Regression guard for the wrong-cache-hit findings: random_seed,
         # prompts.corpus, and the per-record OSL fallback must enter the key.
@@ -496,7 +540,7 @@ class TestLookupAndPopulate:
         raw["version"] = 22
         manifest_path.write_bytes(orjson.dumps(raw))
 
-        assert mmap_cache.MANIFEST_VERSION == 26
+        assert mmap_cache.MANIFEST_VERSION == 28
         assert mmap_cache.lookup("pre-overlap-frontier", compressed=False) is None
 
     def test_lookup_compressed_mismatch_returns_none(self, tmp_path: Path) -> None:
@@ -710,6 +754,7 @@ class TestTraceVerbatimGate:
             "sagemaker_data_capture",
             "raw_payload",
             "inputs_json",
+            "weka_replay",
         ],
     )
     def test_predicate_true_for_trace_custom_types(self, custom_type: str) -> None:
@@ -724,6 +769,17 @@ class TestTraceVerbatimGate:
 
     def test_predicate_false_for_synthetic(self) -> None:
         assert mmap_cache.is_trace_or_verbatim_dataset(None, None) is False
+
+    @pytest.mark.parametrize(
+        "public_dataset",
+        [
+            "weka_hf",
+            "semianalysis_cc_traces_weka_062126_256k",
+            "weka_replay_40d_102026",
+        ],
+    )
+    def test_predicate_true_for_weka_public_datasets(self, public_dataset: str) -> None:
+        assert mmap_cache.is_trace_or_verbatim_dataset(None, public_dataset) is True
 
     def test_predicate_false_for_public_datasets(self) -> None:
         assert (
@@ -1071,6 +1127,58 @@ class TestSettingsPayloadFromRun:
         assert source is not None
         assert source["hf_dataset_name"] == "Lin-Chen/MMStar"
         assert "hf_split" in source
+
+    def test_public_dataset_source_includes_hf_file_and_revision_when_set(self) -> None:
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType("weka_replay_40d_102026"),
+            )
+        )
+        source = mmap_cache._public_dataset_source_from_run(run)
+        assert source is not None
+        assert source["hf_filename"] == "replay-40d-oct14-337a03810637.jsonl"
+        assert source["hf_revision"] == "5afaa89882fc2c24a3dcb8bcdcd0485770c5021d"
+
+    def test_public_dataset_source_omits_hf_file_and_revision_when_unset(self) -> None:
+        """Existing entries keep their exact source dict, so their cache keys are unchanged."""
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType.MMSTAR,
+            )
+        )
+        source = mmap_cache._public_dataset_source_from_run(run)
+        assert source is not None
+        assert "hf_filename" not in source
+        assert "hf_revision" not in source
+
+    def test_replay_public_dataset_key_changes_with_hf_revision(self) -> None:
+        from aiperf.plugin import plugins
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType("weka_replay_40d_102026"),
+            )
+        )
+        pinned = plugins.get_public_dataset_loader_metadata("weka_replay_40d_102026")
+        other = pinned.model_copy(update={"hf_revision": "0" * 40})
+
+        key_pinned = mmap_cache.compute_cache_key_from_run(run)
+        with patch(
+            "aiperf.dataset.mmap_cache.plugins.get_public_dataset_loader_metadata",
+            return_value=other,
+        ):
+            key_other = mmap_cache.compute_cache_key_from_run(run)
+
+        assert key_pinned is not None and key_other is not None
+        assert key_pinned != key_other
 
     def test_public_dataset_source_none_for_file_dataset(self, tmp_path: Path) -> None:
         from aiperf.plugin.enums import CustomDatasetType
