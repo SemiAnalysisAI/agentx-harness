@@ -72,6 +72,11 @@ This document describes datasets that AIPerf can use to generate stimulus. Addit
       <td style="text-align: center;">✅</td>
       <td>Raw <code>wekai</code> router replay-v3/v4/v5 session captures, preserving the real multi-level sub-agent tree <a href="tutorials/weka-replay.md"><code>--input-file replay.jsonl --custom-dataset-type weka_replay</code></a></td>
     </tr>
+    <tr>
+      <td><strong>Weka Replay (public)</strong></td>
+      <td style="text-align: center;">✅</td>
+      <td>40-day replay-v5 capture (~8.8 GB, downloaded on first use) from <a href="https://huggingface.co/datasets/wekaio/replay-40d-oct14-337a03810637"><code>--public-dataset weka_replay_40d_102026</code></a>, replayed by the <a href="tutorials/weka-replay.md#public-dataset"><code>weka_replay</code></a> loader</td>
+    </tr>
   </tbody>
 </table>
 

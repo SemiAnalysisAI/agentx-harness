@@ -54,6 +54,33 @@ Two things to always do:
 
 A tokenizer and prompt corpus are required, same as any other trace loader (the default prompt corpus is `coding`) — pass `--tokenizer`/`--prompt-corpus` if your `--model` doesn't resolve a default one.
 
+## Public dataset
+
+The 40-day replay-v5 capture published at [`wekaio/replay-40d-oct14-337a03810637`](https://huggingface.co/datasets/wekaio/replay-40d-oct14-337a03810637) (3,190 sessions, 17,349 instances, 370,658 requests; public, no auth) is registered as a public dataset, so no `--input-file` or `--custom-dataset-type` is needed:
+
+```bash
+aiperf profile \
+    --url localhost:8000 \
+    --model Qwen/Qwen3-0.6B \
+    --endpoint-type chat \
+    --streaming \
+    --public-dataset weka_replay_40d_102026 \
+    --concurrency 8 \
+    --num-dataset-entries 200
+```
+
+The file is fetched with `huggingface_hub.hf_hub_download`, pinned to a fixed repo revision for reproducibility, and then replayed by the same loader as `--custom-dataset-type weka_replay`; every flag and env knob in this tutorial applies unchanged. The same count-flag advice applies too: pass `--num-dataset-entries` unless you want a full-corpus parse.
+
+- **First run downloads about 8.8 GB.** The download is resumable and lands in the standard HuggingFace cache (`~/.cache/huggingface/hub`); later runs reuse it. Set `HF_HOME` to put the cache on a volume with enough free disk space.
+- **Offline machines:** pre-populate the cache, then run with `HF_HUB_OFFLINE=1` so no network call is attempted.
+- **Pre-download** (for example on a login node before a batch job):
+
+  ```bash
+  hf download wekaio/replay-40d-oct14-337a03810637 replay-40d-oct14-337a03810637.jsonl --repo-type dataset
+  ```
+
+- **Replaying a newly published corpus:** download it with `hf download` and run it locally with `--input-file <file> --custom-dataset-type weka_replay`, or add a metadata-only entry to `src/aiperf/plugin/plugins.yaml` under `public_dataset_loader` that reuses `aiperf.dataset.loader.weka_replay_hf:WekaReplayHFLoader` with the new `hf_dataset_name`, `hf_filename` and `hf_revision`, then run `make generate-all-plugin-files generate-all-docs`.
+
 ## What gets dropped by default
 
 Three categories are dropped unless you opt in or they're structurally unavoidable:

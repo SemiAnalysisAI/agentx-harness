@@ -770,6 +770,17 @@ class TestTraceVerbatimGate:
     def test_predicate_false_for_synthetic(self) -> None:
         assert mmap_cache.is_trace_or_verbatim_dataset(None, None) is False
 
+    @pytest.mark.parametrize(
+        "public_dataset",
+        [
+            "weka_hf",
+            "semianalysis_cc_traces_weka_062126_256k",
+            "weka_replay_40d_102026",
+        ],
+    )
+    def test_predicate_true_for_weka_public_datasets(self, public_dataset: str) -> None:
+        assert mmap_cache.is_trace_or_verbatim_dataset(None, public_dataset) is True
+
     def test_predicate_false_for_public_datasets(self) -> None:
         assert (
             mmap_cache.is_trace_or_verbatim_dataset(None, "openai_humaneval") is False
@@ -1116,6 +1127,58 @@ class TestSettingsPayloadFromRun:
         assert source is not None
         assert source["hf_dataset_name"] == "Lin-Chen/MMStar"
         assert "hf_split" in source
+
+    def test_public_dataset_source_includes_hf_file_and_revision_when_set(self) -> None:
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType("weka_replay_40d_102026"),
+            )
+        )
+        source = mmap_cache._public_dataset_source_from_run(run)
+        assert source is not None
+        assert source["hf_filename"] == "replay-40d-oct14-337a03810637.jsonl"
+        assert source["hf_revision"] == "5afaa89882fc2c24a3dcb8bcdcd0485770c5021d"
+
+    def test_public_dataset_source_omits_hf_file_and_revision_when_unset(self) -> None:
+        """Existing entries keep their exact source dict, so their cache keys are unchanged."""
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType.MMSTAR,
+            )
+        )
+        source = mmap_cache._public_dataset_source_from_run(run)
+        assert source is not None
+        assert "hf_filename" not in source
+        assert "hf_revision" not in source
+
+    def test_replay_public_dataset_key_changes_with_hf_revision(self) -> None:
+        from aiperf.plugin import plugins
+        from aiperf.plugin.enums import PublicDatasetType
+
+        run = make_run_from_cli(
+            CLIConfig(
+                model_names=["test-model"],
+                public_dataset=PublicDatasetType("weka_replay_40d_102026"),
+            )
+        )
+        pinned = plugins.get_public_dataset_loader_metadata("weka_replay_40d_102026")
+        other = pinned.model_copy(update={"hf_revision": "0" * 40})
+
+        key_pinned = mmap_cache.compute_cache_key_from_run(run)
+        with patch(
+            "aiperf.dataset.mmap_cache.plugins.get_public_dataset_loader_metadata",
+            return_value=other,
+        ):
+            key_other = mmap_cache.compute_cache_key_from_run(run)
+
+        assert key_pinned is not None and key_other is not None
+        assert key_pinned != key_other
 
     def test_public_dataset_source_none_for_file_dataset(self, tmp_path: Path) -> None:
         from aiperf.plugin.enums import CustomDatasetType

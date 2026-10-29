@@ -2475,6 +2475,26 @@ public_dataset_loader:
       default_block_size: 64
       default_prompt_corpus: coding
 
+  weka_replay_40d_102026:
+    class: aiperf.dataset.loader.weka_replay_hf:WekaReplayHFLoader
+    description: |
+      WEKA router replay capture (replay-v5) of 40 days of agentic coding
+      traffic, hosted on HuggingFace as wekaio/replay-40d-oct14-337a03810637
+      (3,190 sessions, 17,349 instances, 370,658 requests, public, no auth).
+      Downloaded on first use (~8.8 GB, pinned to a fixed repo revision for
+      reproducibility) into the HuggingFace cache (honors HF_HOME and
+      HF_HUB_OFFLINE), then replayed through the same loader as
+      --custom-dataset-type weka_replay: recorded sub-agent tree, absolute
+      timestamps, server-reported token/cache counts and sampling parameters.
+      Usage: --public-dataset weka_replay_40d_102026
+    metadata:
+      hf_dataset_name: wekaio/replay-40d-oct14-337a03810637
+      hf_filename: replay-40d-oct14-337a03810637.jsonl
+      hf_revision: 5afaa89882fc2c24a3dcb8bcdcd0485770c5021d
+      is_trace: true
+      default_block_size: 64
+      default_prompt_corpus: coding
+
   weka_hf:
     class: aiperf.dataset.loader.semianalysis_cc_traces_weka:SemiAnalysisCCTracesWekaLoader
     description: |
