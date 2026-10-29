@@ -9,7 +9,7 @@ import pytest
 from pytest import param
 
 from aiperf.common.enums import ConversationBranchMode, CreditPhase
-from aiperf.credit.messages import FirstToken
+from aiperf.credit.messages import CreditReturn, FirstToken
 from aiperf.credit.sticky_router import StickyCreditRouter, _StickyEntry
 from aiperf.credit.structs import Credit
 from tests.unit.timing.conftest import make_credit
@@ -1170,7 +1170,6 @@ def two_worker_router(benchmark_run) -> StickyCreditRouter:
 
 @pytest.fixture
 def send(two_worker_router: StickyCreditRouter) -> SendFn:
-    """Send one credit and return the worker it was routed to."""
     ids = itertools.count()
 
     async def _send(
@@ -1407,11 +1406,16 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_spawn_child_without_parent_entry_pins_own_id(
         self, two_worker_router, send
     ) -> None:
-        """No parent-keyed entry is minted; the child's own entry ends with it."""
+        """No parent-keyed entry is minted; the child's own entry ends with it.
+
+        This is the rootless replay lane: ``parent_correlation_id`` names a
+        root that never sends a request, so the parent entry never exists.
+        """
         kid_worker = await send("kid", 0, 2, parent="root")
         assert "root" not in two_worker_router._sticky_sessions
         assert two_worker_router._sticky_sessions["kid"].worker_id == kid_worker
         assert await send("kid", 1, 2, parent="root") == kid_worker
+        assert "kid" not in two_worker_router._sticky_sessions
         assert _total_active(two_worker_router) == 0
 
     async def test_fork_child_does_not_create_parent_entry_when_absent(
@@ -1556,7 +1560,10 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_spawn_child_parent_resumes_elsewhere_keeps_worker(
         self, two_worker_router, send
     ) -> None:
-        """A SPAWN child keeps its own worker after the gated parent resumes elsewhere."""
+        """Join-gated root: the child's first turn dispatches before the root has
+        an entry, so the child must pin under its own id and not follow the
+        root once it starts on another worker. Every worker a child visits keeps
+        a decoded UserSession copy until process exit."""
         kid_worker = await send("kid", 0, 4, parent="root")
         root_worker = await send("root", 5, 9)  # gated parent resumes mid-child
         assert root_worker != kid_worker
@@ -1567,10 +1574,14 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_spawn_child_outlives_parent_keeps_parent_worker(
         self, two_worker_router, send
     ) -> None:
-        """A SPAWN child that outlives its parent stays on the parent's worker."""
+        """Finished root: ``has_forks`` counts FORK branches only, so the root's
+        final turn pops its entry while SPAWN children are still running. The
+        child must keep routing via its own entry instead of going least-loaded
+        on every remaining turn."""
         parent_worker = await send("root", 0, 2)
         assert await send("kid", 0, 5, parent="root") == parent_worker
         await send("root", 1, 2)
+        assert "root" not in two_worker_router._sticky_sessions
         for turn in range(1, 5):
             assert await send("kid", turn, 5, parent="root") == parent_worker
         assert _total_active(two_worker_router) == 0
@@ -1578,16 +1589,23 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_spawn_child_worker_unregisters_repins_once(
         self, two_worker_router, send
     ) -> None:
-        """A pinned SPAWN child moves once when its worker leaves, then stays."""
-        two_worker_router._register_worker("worker-C")
+        """Unregistering a worker drops the entries it owned. The child must take
+        one least-loaded hop and mint a fresh entry there, not route
+        least-loaded on every remaining turn. The final turn must then clear the
+        session from the new worker's counters, or least-loaded selection keeps
+        seeing a phantom session there."""
+        router = two_worker_router
+        router._register_worker("worker-C")
         kid_worker = await send("kid", 0, 4, parent="root")
-        two_worker_router._unregister_worker(kid_worker)
-        assert "kid" not in two_worker_router._sticky_sessions
+        router._unregister_worker(kid_worker)
+        assert "kid" not in router._sticky_sessions
         new_worker = await send("kid", 1, 4, parent="root")
         assert new_worker != kid_worker
+        assert router._workers[new_worker].active_sessions == 1
         assert await send("kid", 2, 4, parent="root") == new_worker
         await send("kid", 3, 4, parent="root")
-        assert _total_active(two_worker_router) == 0
+        assert all(w.active_sessions == 0 for w in router._workers.values())
+        assert all(not w.active_session_ids for w in router._workers.values())
 
     async def test_send_credit_single_turn_spawn_child_with_forks_hosts_fork_children(
         self, two_worker_router, send
@@ -1598,19 +1616,22 @@ class TestStickyCreditRouterDAGChildren:
         production yet, so there the entry is kept until run end.
         """
         kid_worker = await send("kid", 0, 1, parent="root", has_forks=True)
-        two_worker_router.register_child_routing("kid")
+        two_worker_router.register_child_routing("kid", "gk")
         fork_worker = await send(
             "gk", 0, 2, parent="kid", mode=ConversationBranchMode.FORK
         )
         assert fork_worker == kid_worker
         two_worker_router.release_child_routing("kid")
+        assert "kid" not in two_worker_router._sticky_sessions
+        assert "gk" not in two_worker_router._sticky_sessions
         assert _total_active(two_worker_router) == 0
 
     async def test_send_credit_nested_spawn_child_colocates_with_spawn_parent(
         self, two_worker_router, send
     ) -> None:
-        """A SPAWN grandchild starts on its SPAWN parent's worker and stays there
-        after that parent finishes."""
+        """A SPAWN child's own entry is what its SPAWN children follow on their
+        first turn, so nested subagents co-locate like a root and its children,
+        and the grandchild keeps that worker after the middle entry is popped."""
         kid_worker = await send("kid", 0, 2, parent="root")
         assert await send("gkid", 0, 2, parent="kid") == kid_worker
         await send("kid", 1, 2, parent="root")
@@ -1620,7 +1641,10 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_single_turn_spawn_child_with_live_parent_leaves_parent_entry(
         self, two_worker_router, send
     ) -> None:
-        """A SPAWN child's final turn must never release its parent's entry."""
+        """Final-turn release now also runs for SPAWN children, but a one-turn
+        child routes via the parent's key and owns no entry. Releasing the
+        routed entry instead of the child's own would unpin a still-running
+        root and drop its active_sessions slot."""
         await send("root", 0, 3)
         await send("kid", 0, 1, parent="root")
         entry = two_worker_router._sticky_sessions["root"]
@@ -1631,8 +1655,9 @@ class TestStickyCreditRouterDAGChildren:
     async def test_send_credit_pre_session_spawn_child_counts_one_session(
         self, two_worker_router, send
     ) -> None:
-        """A pre-session SPAWN child (no parent id) is routed as a root and
-        counts as exactly one session."""
+        """Pre-session SPAWN children carry no parent id, so they take the root
+        path. Guards against the SPAWN-child branch also minting an entry and
+        counting the session twice in active_sessions."""
         spawn = ConversationBranchMode.SPAWN
         await send("pre", 0, 3, mode=spawn)
         assert list(two_worker_router._sticky_sessions) == ["pre"]
@@ -1804,3 +1829,85 @@ class TestStickyRoutingAtDagDepth:
         assert "child-1" not in router._sticky_sessions
         assert router._workers["worker-1"].active_sessions == 0
         assert router._workers["worker-1"].active_session_ids == set()
+
+
+class TestStickyCreditRouterEndedOnTruncation:
+    """A conversation ended early on truncation never sends its final turn, so
+    the return itself must release the sticky entry."""
+
+    async def _send_first_turn(self, router: StickyCreditRouter) -> Credit:
+        credit = make_credit(id=1, conv_id="s", turn=0, corr_id="corr-t", num_turns=3)
+        await router.send_credit(credit)
+        return credit
+
+    async def test_handle_router_message_ended_on_truncation_releases_sticky(
+        self, benchmark_run
+    ) -> None:
+        router = StickyCreditRouter(run=benchmark_run, service_id="test-router")
+        router._router_client.send_to = AsyncMock()
+        router._register_worker("worker-A")
+        credit = await self._send_first_turn(router)
+        assert router._workers["worker-A"].active_sessions == 1
+
+        await router._handle_router_message(
+            "worker-A", CreditReturn(credit=credit, ended_on_truncation=True)
+        )
+
+        assert "corr-t" not in router._sticky_sessions
+        assert router._workers["worker-A"].active_sessions == 0
+        assert "corr-t" not in router._workers["worker-A"].active_session_ids
+
+    async def test_handle_router_message_plain_return_keeps_sticky(
+        self, benchmark_run
+    ) -> None:
+        router = StickyCreditRouter(run=benchmark_run, service_id="test-router")
+        router._router_client.send_to = AsyncMock()
+        router._register_worker("worker-A")
+        credit = await self._send_first_turn(router)
+
+        await router._handle_router_message("worker-A", CreditReturn(credit=credit))
+
+        assert router._sticky_sessions["corr-t"].worker_id == "worker-A"
+        assert router._workers["worker-A"].active_sessions == 1
+
+    async def test_handle_router_message_cancelled_return_keeps_sticky(
+        self, benchmark_run
+    ) -> None:
+        router = StickyCreditRouter(run=benchmark_run, service_id="test-router")
+        router._router_client.send_to = AsyncMock()
+        router._register_worker("worker-A")
+        credit = await self._send_first_turn(router)
+
+        await router._handle_router_message(
+            "worker-A",
+            CreditReturn(credit=credit, cancelled=True, ended_on_truncation=True),
+        )
+
+        assert "corr-t" in router._sticky_sessions
+
+    async def test_handle_router_message_ended_without_sticky_entry_is_noop(
+        self, benchmark_run
+    ) -> None:
+        router = StickyCreditRouter(run=benchmark_run, service_id="test-router")
+        router._register_worker("worker-A")
+        credit = make_credit(id=1, conv_id="s", turn=0, corr_id="corr-t", num_turns=3)
+
+        await router._handle_router_message(
+            "worker-A", CreditReturn(credit=credit, ended_on_truncation=True)
+        )
+
+        assert router._sticky_sessions == {}
+        assert router._workers["worker-A"].active_sessions == 0
+
+    async def test_release_sticky_for_early_end_owner_worker_gone_pops_entry(
+        self, benchmark_run
+    ) -> None:
+        router = StickyCreditRouter(run=benchmark_run, service_id="test-router")
+        router._sticky_sessions["corr-t"] = _StickyEntry(
+            worker_id="worker-gone", root_key="corr-t"
+        )
+        credit = make_credit(id=1, conv_id="s", turn=0, corr_id="corr-t", num_turns=3)
+
+        router._release_sticky_for_early_end(credit)
+
+        assert "corr-t" not in router._sticky_sessions
