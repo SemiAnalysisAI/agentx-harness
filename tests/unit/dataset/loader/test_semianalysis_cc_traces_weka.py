@@ -6,6 +6,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from datasets import Dataset
+from pydantic import ValidationError
 
 from aiperf.common.enums import PromptCorpus
 from aiperf.common.exceptions import DatasetLoaderError
@@ -303,8 +305,6 @@ class TestArrowUnionPadding:
         return row
 
     def test_arrow_roundtrip_preserves_valid_trace(self) -> None:
-        from datasets import Dataset
-
         raw = self.trace()
         padded = Dataset.from_list([raw])[0]
         assert "agent_id" in padded["requests"][0]
@@ -313,8 +313,6 @@ class TestArrowUnionPadding:
         assert "agent_id" in padded["requests"][0]  # Input stays unchanged.
 
     def test_non_null_extras_and_required_null_still_fail(self) -> None:
-        from pydantic import ValidationError
-
         raw = self.trace()
         raw["requests"][0]["agent_id"] = "unexpected"
         with pytest.raises(ValidationError):
