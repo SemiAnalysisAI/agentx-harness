@@ -36,6 +36,7 @@ from aiperf_mock_server.models import (
     ImageGenerationRequest,
     RankingRequest,
     RequestT,
+    ResponsesRequest,
     SolidoRAGRequest,
     TGIGenerateRequest,
 )
@@ -370,6 +371,12 @@ class RequestCtx:
     latency_sim: LatencySimulator
     """Latency simulator for TTFT and ITL timing."""
 
+    continuous_usage: bool = False
+    """Emit cumulative usage on every streamed chunk (continuous_usage_stats)."""
+
+    first_chunk_tokens: int = 1
+    """Number of output tokens to bundle into the first streamed content chunk."""
+
     @property
     def tokens(self) -> list[str]:
         return self.tokenized.tokens
@@ -423,6 +430,8 @@ def make_ctx(
             isl=tokenized.prompt_token_count,
             osl=len(tokenized.tokens),
         ),
+        continuous_usage=getattr(request, "continuous_usage_stats", False),
+        first_chunk_tokens=max(1, getattr(request, "mock_first_chunk_tokens", 1)),
     )
 
 
@@ -471,6 +480,8 @@ def _create_request_id(request: RequestT) -> str:
             return f"img-{uuid.uuid4()}"
         case SolidoRAGRequest():
             return f"rag-{uuid.uuid4()}"
+        case ResponsesRequest():
+            return f"resp-{uuid.uuid4()}"
         case _:
             raise ValueError(f"Invalid request type: {type(request)}")
 
@@ -490,68 +501,207 @@ def _sse(data: dict[str, Any]) -> bytes:
     return _SSE_DATA_PREFIX + orjson.dumps(data) + _SSE_NEWLINES
 
 
+def _bundle_first_chunk(tokens: list[str], first_chunk_tokens: int) -> list[list[str]]:
+    """Group output tokens into streamed chunks, bundling the first
+    ``first_chunk_tokens`` tokens into the first chunk; the rest stream one per
+    chunk. ``first_chunk_tokens=1`` reproduces one-token-per-chunk streaming."""
+    if first_chunk_tokens <= 1 or len(tokens) <= 1:
+        return [[t] for t in tokens]
+    n = min(first_chunk_tokens, len(tokens))
+    return [tokens[:n], *([t] for t in tokens[n:])]
+
+
+def _partial_usage(ctx: "RequestCtx", completion_tokens: int) -> dict[str, Any]:
+    """Cumulative per-chunk usage in OpenAI shape (continuous_usage_stats)."""
+    prompt = ctx.usage.get("prompt_tokens", 0)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt + completion_tokens,
+    }
+
+
+def build_spec_decode_payload(ctx: "RequestCtx") -> dict[str, Any] | None:
+    """Synthesise a self-consistent per-request spec-decode acceptance payload.
+
+    Derived from the response's own ``completion_tokens`` so the acceptance
+    numbers reconcile with the usage the mock reports beside them -- the same
+    reconciliation a live run performs against a real engine.
+
+    The three identities AIPerf enforces hold **by construction**, which is the
+    point: an end-to-end test should prove the plumbing carries a valid record,
+    not that the mock happened to guess consistent numbers.
+
+    ``num_accepted`` is spread as evenly as possible across the steps with no
+    RNG, so a run is reproducible. The resulting distribution is deliberately
+    degenerate (two adjacent buckets) -- modelling realistic acceptance
+    statistics is out of scope; the zero buckets below ``base`` still exercise
+    the adapters' sparse-map inflation.
+    """
+    if not server_config.spec_decode_enabled:
+        return None
+
+    # None means "no fixed per-step bound" on the wire, but generation still
+    # needs a concrete draft length to work from.
+    num_spec_tokens = server_config.spec_decode_num_spec_tokens
+    k = num_spec_tokens if num_spec_tokens is not None else 3
+    rate = server_config.spec_decode_acceptance_rate
+
+    completion_tokens = int(ctx.usage.get("completion_tokens") or 0)
+    if completion_tokens <= 0:
+        return None
+
+    # The mock attributes every completion token to a verify step: one
+    # always-accepted bonus token per step plus whatever drafts it accepted, so
+    # ``num_spec_steps + num_accepted == completion_tokens``. That is a modelling
+    # choice, not a physical identity -- on a real engine prefill and iterations
+    # that drafted nothing also emit tokens. Derive the accepted count from the
+    # token count instead of rounding it independently: independent rounding
+    # disagreed with the usage reported beside it for ``completion_tokens <= 2``,
+    # emitting acceptance that implied more tokens than the response contained.
+    #
+    # The floor on steps is what keeps accepted <= drafted. A step contributes at
+    # most k + 1 tokens, so fewer than ceil(completion_tokens / (k + 1)) steps
+    # could not have produced the tokens being claimed.
+    minimum_steps = math.ceil(completion_tokens / (k + 1))
+    num_spec_steps = max(1, minimum_steps, round(completion_tokens / (1 + rate * k)))
+    num_draft_tokens = k * num_spec_steps
+    num_accepted = completion_tokens - num_spec_steps
+
+    # base <= k always, since num_accepted <= num_draft_tokens = k * steps; and
+    # base == k forces rem == 0, so base + 1 never runs off the histogram.
+    base, rem = divmod(num_accepted, num_spec_steps)
+    histogram = [0] * (k + 1)
+    histogram[base] += num_spec_steps - rem
+    if rem:
+        histogram[base + 1] += rem
+
+    if server_config.spec_decode_flavor == "trtllm":
+        return {
+            "acceptance_rate": num_accepted / num_draft_tokens,
+            "total_accepted_draft_tokens": num_accepted,
+            "total_draft_tokens": num_draft_tokens,
+            "num_spec_steps": num_spec_steps,
+            "acceptance_histogram": histogram,
+            "num_spec_tokens": num_spec_tokens,
+        }
+    return {
+        # Recomputed from the final integers rather than the targets, so
+        # rounding cannot make the emitted floats disagree with the counts.
+        "mean_acceptance_length": 1 + num_accepted / num_spec_steps,
+        "draft_acceptance_rate": num_accepted / num_draft_tokens,
+        "acceptance_histogram": histogram,
+        "num_spec_steps": num_spec_steps,
+        "num_accepted_draft_tokens": num_accepted,
+        "num_draft_tokens": num_draft_tokens,
+        "num_spec_tokens": num_spec_tokens,
+    }
+
+
+def attach_spec_decode(
+    response: dict[str, Any], payload: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Attach the payload where the configured engine flavour puts it.
+
+    vLLM nests it at the response root under ``metrics``; TensorRT-LLM attaches
+    it to the choice. No key is added at all when disabled, so responses stay
+    byte-identical for every test that does not ask for this.
+    """
+    if payload is None:
+        return response
+    if server_config.spec_decode_flavor == "trtllm":
+        choices = response.get("choices")
+        if isinstance(choices, list) and len(choices) == 1:
+            choices[0]["speculative_decoding"] = payload
+    else:
+        response["metrics"] = {"speculative_decoding": payload}
+    return response
+
+
 async def stream_chat_completion(
     ctx: RequestCtx, endpoint: str, include_usage: bool
 ) -> AsyncGenerator[bytes, None]:
     """Stream chat completion tokens as SSE chunks."""
     has_reasoning = bool(ctx.reasoning_content_tokens)
+    num_reasoning = len(ctx.reasoning_content_tokens)
 
     try:
         # Stream reasoning tokens first (if any)
-        for token in ctx.reasoning_content_tokens:
+        completion_so_far = 0
+        for ri, token in enumerate(ctx.reasoning_content_tokens):
             await ctx.latency_sim.wait_for_next_token()
             record_streamed_token(endpoint, ctx.model)
-            yield _sse(
-                {
-                    "id": ctx.request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": ctx.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "reasoning_content": token},
-                        }
-                    ],
-                }
-            )
+            completion_so_far += 1
+            chunk: dict[str, Any] = {
+                "id": ctx.request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": ctx.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "reasoning_content": token},
+                    }
+                ],
+            }
+            if ctx.continuous_usage:
+                chunk["usage"] = _partial_usage(ctx, completion_so_far)
+            if (
+                not ctx.tokens
+                and ri == num_reasoning - 1
+                and server_config.spec_decode_flavor == "trtllm"
+            ):
+                # Reasoning used the whole budget, so no content chunk follows:
+                # this is the last chunk with a choice, and the payload must
+                # ride it or it is never sent.
+                attach_spec_decode(chunk, build_spec_decode_payload(ctx))
+            yield _sse(chunk)
 
-        # Stream output tokens
-        num_tokens = len(ctx.tokens)
-        for i, token in enumerate(ctx.tokens):
-            await ctx.latency_sim.wait_for_next_token()
-            record_streamed_token(endpoint, ctx.model)
+        # Stream output tokens, bundling the first chunk when requested.
+        groups = _bundle_first_chunk(ctx.tokens, ctx.first_chunk_tokens)
+        num_groups = len(groups)
+        for gi, group in enumerate(groups):
+            for _ in group:
+                await ctx.latency_sim.wait_for_next_token()
+                record_streamed_token(endpoint, ctx.model)
+            completion_so_far += len(group)
 
-            delta: dict[str, Any] = {"content": token}
-            if i == 0 and not has_reasoning:
+            delta: dict[str, Any] = {"content": "".join(group)}
+            if gi == 0 and not has_reasoning:
                 delta["role"] = "assistant"
 
             choice: dict[str, Any] = {"index": 0, "delta": delta}
-            if i == num_tokens - 1:
+            if gi == num_groups - 1:
                 choice["finish_reason"] = ctx.finish_reason
 
-            yield _sse(
-                {
-                    "id": ctx.request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": ctx.model,
-                    "choices": [choice],
-                }
-            )
+            chunk = {
+                "id": ctx.request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": ctx.model,
+                "choices": [choice],
+            }
+            if ctx.continuous_usage:
+                chunk["usage"] = _partial_usage(ctx, completion_so_far)
+            if gi == num_groups - 1 and server_config.spec_decode_flavor == "trtllm":
+                # TRT-LLM attaches acceptance to the choice bearing
+                # finish_reason, not to a trailing usage chunk.
+                attach_spec_decode(chunk, build_spec_decode_payload(ctx))
+            yield _sse(chunk)
 
         # Final usage chunk (if requested)
         if include_usage:
-            yield _sse(
-                {
-                    "id": ctx.request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": ctx.model,
-                    "choices": [],
-                    "usage": ctx.usage,
-                }
-            )
+            final_chunk = {
+                "id": ctx.request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": ctx.model,
+                "choices": [],
+                "usage": ctx.usage,
+            }
+            if server_config.spec_decode_flavor == "vllm":
+                attach_spec_decode(final_chunk, build_spec_decode_payload(ctx))
+            yield _sse(final_chunk)
 
         ctx.latency_sim.mark_finished()
         yield _SSE_DONE
@@ -574,27 +724,31 @@ async def stream_text_completion(
             if i == num_tokens - 1:
                 choice["finish_reason"] = ctx.finish_reason
 
-            yield _sse(
-                {
-                    "id": ctx.request_id,
-                    "object": "text_completion",
-                    "created": int(time.time()),
-                    "model": ctx.model,
-                    "choices": [choice],
-                }
-            )
+            chunk = {
+                "id": ctx.request_id,
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": ctx.model,
+                "choices": [choice],
+            }
+            if i == num_tokens - 1 and server_config.spec_decode_flavor == "trtllm":
+                # TRT-LLM attaches acceptance to the choice bearing
+                # finish_reason, not to a trailing usage chunk.
+                attach_spec_decode(chunk, build_spec_decode_payload(ctx))
+            yield _sse(chunk)
 
         if include_usage:
-            yield _sse(
-                {
-                    "id": ctx.request_id,
-                    "object": "text_completion",
-                    "created": int(time.time()),
-                    "model": ctx.model,
-                    "choices": [],
-                    "usage": ctx.usage,
-                }
-            )
+            final_chunk = {
+                "id": ctx.request_id,
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": ctx.model,
+                "choices": [],
+                "usage": ctx.usage,
+            }
+            if server_config.spec_decode_flavor == "vllm":
+                attach_spec_decode(final_chunk, build_spec_decode_payload(ctx))
+            yield _sse(final_chunk)
 
         ctx.latency_sim.mark_finished()
         yield _SSE_DONE

@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import orjson
 
+from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.enums import ExportLevel
 from aiperf.common.hooks import on_init
 from aiperf.common.mixins import CommunicationMixin
@@ -25,6 +27,7 @@ from aiperf.common.models.record_models import (
     TokenCounts,
     ToolCallResponseData,
     find_last_non_empty_usage,
+    first_content_chunk_completion_tokens,
 )
 from aiperf.common.scenario import is_context_overflow_response
 from aiperf.common.tokenizer import Tokenizer
@@ -34,6 +37,30 @@ from aiperf.records.payload_retention import resolve_disable_tokenization
 
 if TYPE_CHECKING:
     from aiperf.config.resolution.plan import BenchmarkRun
+
+
+# ``_extract_spec_decode_acceptance`` is a staticmethod, so it cannot use the
+# instance logger CommunicationMixin provides.
+_logger = AIPerfLogger(__name__)
+
+
+def _warn_once(warned: set[str] | None, key: str, message: Callable[[], str]) -> None:
+    """Warn on a detection problem's first occurrence in a run, debug after.
+
+    Ambiguity and a raising adapter come from the installed adapters, not from
+    any one response, so they recur on every record. ``warned`` is the parser's
+    per-run memory of what it has already reported; ``None`` warns every time.
+    """
+    if warned is None:
+        _logger.warning(message)
+        return
+    if key in warned:
+        _logger.debug(message)
+        return
+    warned.add(key)
+    _logger.warning(
+        lambda: f"{message()} (further occurrences this run are logged at debug)"
+    )
 
 
 # TODO: Should we create non-tokenizer based parsers?
@@ -48,6 +75,9 @@ class InferenceResultParser(CommunicationMixin):
             run=run,
         )
         self.tokenizers: dict[str, Tokenizer] = {}
+        # Spec-decode detection problems already warned about this run; see
+        # _warn_once.
+        self._spec_decode_warned: set[str] = set()
         self.tokenizer_lock: asyncio.Lock = asyncio.Lock()
         self.model_endpoint: ModelEndpointInfo = ModelEndpointInfo.from_run(run)
         EndpointClass = plugins.get_class(
@@ -315,17 +345,44 @@ class InferenceResultParser(CommunicationMixin):
         else:
             token_counts = TokenCounts()
 
+        spec_decode_acceptance = self._extract_spec_decode_acceptance(
+            resp,
+            self._spec_decode_warned,
+            num_choices=inputs.num_choices if inputs is not None else 1,
+        )
+        # A record exists only for a request that speculated. vLLM sends a
+        # payload even when no verify step ran (max_tokens: 1, EOS first, an
+        # NGram drafter that never matched) while TensorRT-LLM sends none;
+        # counting it would add AL 1.0 / rate 0% to the per-request means. The
+        # flag keeps the request countable, so "never speculated" stays
+        # distinguishable from "spec decode off".
+        spec_decode_zero_step = (
+            spec_decode_acceptance is not None
+            and spec_decode_acceptance.num_spec_steps == 0
+        )
+        if spec_decode_zero_step:
+            engine = spec_decode_acceptance.engine
+            self.debug(
+                lambda: f"Dropping zero-step {engine} spec-decode record: "
+                "the request never ran a verify step"
+            )
+            spec_decode_acceptance = None
+
         return ParsedResponseRecord(
             request=request_record,
             responses=resp,
             token_counts=token_counts,
             media_counts=media_counts or MediaCounts(),
-            spec_decode_acceptance=self._extract_spec_decode_acceptance(resp),
+            spec_decode_acceptance=spec_decode_acceptance,
+            spec_decode_zero_step=spec_decode_zero_step,
         )
 
     @staticmethod
     def _extract_spec_decode_acceptance(
         responses: list[ParsedResponse],
+        warned: set[str] | None = None,
+        *,
+        num_choices: int = 1,
     ) -> SpecDecodeAcceptanceRecord | None:
         """Build the engine-neutral acceptance record via adapter auto-detection.
 
@@ -335,24 +392,76 @@ class InferenceResultParser(CommunicationMixin):
         priority order and uses the first whose ``can_adapt`` recognizes the
         payload -- mirroring custom-dataset-loader auto-detection.
 
-        Suppresses the record when more than one response carried stats (an
-        ``n > 1`` streaming request, where each sequence's stats ride its own
-        finish chunk): the per-request record can't attribute request-level
-        ``completion_tokens`` to a single sequence, so a mixed record is worse
-        than none. ``n > 1`` non-streaming is suppressed upstream in
-        ``BaseEndpoint.extract_spec_decode_stats``.
+        Returns zero-step records as adapted; ``process_valid_record`` drops
+        them engine-neutrally, so no adapter has to repeat that rule.
+
+        Suppresses the record for any ``n > 1`` request: the per-request record
+        can't attribute request-level ``completion_tokens`` to a single
+        sequence, so a mixed record is worse than none. ``num_choices`` is the
+        request's own ``n`` and is the primary guard -- a sibling that never
+        drafted carries no payload, so counting payloads alone would let an
+        ``n = 2`` stream through with one. More than one response carrying
+        stats is still refused as a backstop for callers without the request.
 
         Counts payloads by truthiness (not ``is not None``) to match the
-        adapter's ``_find_spec_decode_payload``: an empty ``{}`` is treated as
+        adapter's ``find_spec_decode_payload``: an empty ``{}`` is treated as
         absent at both sites, so it never spuriously trips the n > 1 guard.
+
+        Collects every match rather than returning on the first, so a payload
+        two adapters both claim is a reported error and a dropped record instead
+        of whichever adapter ``iter_all`` happened to reach first. That order is
+        ``plugins.yaml`` declaration order -- ``priority`` only resolves
+        conflicts between plugins registering the same name -- so first-match
+        would silently make YAML line order decide which engine a record is
+        attributed to.
         """
+        if num_choices > 1:
+            return None
         with_stats = [r for r in responses if r.spec_decode_stats]
         if len(with_stats) != 1:
             return None
-        for _entry, AdapterClass in plugins.iter_all(PluginType.SPEC_DECODE_ADAPTER):
-            if AdapterClass.can_adapt(responses):
-                return AdapterClass.adapt(responses)
-        return None
+        matches = []
+        for entry, AdapterClass in plugins.iter_all(PluginType.SPEC_DECODE_ADAPTER):
+            try:
+                if AdapterClass.can_adapt(responses):
+                    matches.append(AdapterClass)
+            except Exception as e:  # noqa: BLE001 - one bad plugin must not fail the record
+                # ``can_adapt`` is a third-party plugin callback: the protocol
+                # asks for it to be cheap and side-effect free but cannot stop
+                # an implementation from raising. Isolating each call keeps one
+                # bad adapter from failing the whole record and from hiding
+                # every adapter registered after it.
+                error = e
+                _warn_once(
+                    warned,
+                    f"raised:{entry.name}",
+                    lambda name=entry.name,
+                    error=error: f"Spec-decode adapter {name!r} raised during "
+                    f"detection; skipping it: {error!r}",
+                )
+        if len(matches) > 1:
+            # Always a bug in AIPerf's own signatures, not in the payload: two
+            # adapters cannot both be right about which engine produced it.
+            claimants = sorted(a.__name__ for a in matches)
+            _warn_once(
+                warned,
+                f"ambiguous:{','.join(claimants)}",
+                lambda: f"Ambiguous spec-decode payload claimed by {claimants}; "
+                "dropping record",
+            )
+            return None
+        if not matches:
+            # A payload is present -- the guard above returned otherwise -- yet
+            # no adapter recognized it. Either an engine changed its wire format
+            # or this run targets an engine AIPerf has no adapter for. Debug
+            # rather than warning: on an unsupported engine it would fire for
+            # every record in the run.
+            _logger.debug(
+                lambda: "Spec-decode payload present but claimed by no adapter: "
+                f"{with_stats[0].spec_decode_stats!r}"
+            )
+            return None
+        return matches[0].adapt(responses)
 
     async def compute_input_token_count(
         self,
@@ -515,10 +624,21 @@ class InferenceResultParser(CommunicationMixin):
                 usage.completion_tokens, reasoning_token_count
             )
 
+        # Only read the first content chunk's count when the user opted into
+        # per-chunk usage. Otherwise a server that volunteers usage on a
+        # content-bearing chunk would change (or delete) inter-token latency with
+        # no flag set -- the opt-in contract the docs describe must be enforced
+        # here, not just at payload-injection time.
+        first_chunk_tokens = (
+            first_content_chunk_completion_tokens(responses)
+            if self.run.cfg.endpoint.per_chunk_usage
+            else None
+        )
         token_counts = TokenCounts(
             input=input_token_count,
             reasoning=reasoning_token_count,
             output=output_token_count,
+            first_content_chunk_tokens=first_chunk_tokens,
         )
 
         # Warn if server provided no usage information

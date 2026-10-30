@@ -12,6 +12,7 @@ Structure:
     Environment.COMPRESSION.*    - Compression settings for streaming file transfers
     Environment.DATASET.*        - Dataset management
     Environment.DEV.*            - Development and debugging settings
+    Environment.ENDPOINT.*       - Endpoint wire-format settings
     Environment.GPU.*            - GPU telemetry collection
     Environment.HTTP.*           - HTTP client socket and connection settings
     Environment.LOGGING.*        - Logging configuration
@@ -305,6 +306,24 @@ class _DatasetSettings(BaseSettings):
         default=300.0,
         description="Timeout in seconds for dataset configuration operations",
     )
+    CATCH_UP_REQUEST_TIMEOUT: float = Field(
+        ge=0.1,
+        le=100000.0,
+        default=10.0,
+        description="Timeout in seconds for the one-shot DatasetConfigStatusRequest "
+        "a RecordProcessor/RecordsManager sends to DatasetManager when it hasn't yet "
+        "received DatasetConfiguredNotification. Recovers a subscriber that finished "
+        "subscribing after DatasetManager already published the one-shot notification, "
+        "instead of blocking for the full CONFIGURATION_TIMEOUT.",
+    )
+    BASETEN_SESSION_COLUMN: Literal["provided_session_id", "poor_man_session_id"] = (
+        Field(
+            default="provided_session_id",
+            description="Session column used by the Baseten trace loader when both "
+            "supported columns exist. Set to poor_man_session_id for legacy traces. "
+            "If the selected column is absent, the loader uses the available column.",
+        )
+    )
     MMAP_BASE_PATH: Path | None = Field(
         default=None,
         description="Base path for memory-mapped dataset files. If None, uses system temp directory. "
@@ -325,6 +344,16 @@ class _DatasetSettings(BaseSettings):
         "~/.cache/aiperf/dataset_mmap. Each cache entry lives under a `dir/key` subpath and contains "
         "dataset.dat, index.dat, manifest.json, and (when produced) inputs.json. "
         "No automatic eviction is implemented yet -- delete the directory to reclaim disk.",
+    )
+    MMAP_PREFAULT: bool = Field(
+        default=True,
+        description="If True, each memory-mapped dataset client walks every page of the "
+        "data file at open time (after madvise(MADV_WILLNEED)) to force-populate the OS "
+        "page cache. Reads afterwards are served warm, so no request pays a major page "
+        "fault mid-benchmark -- which would otherwise land in the measured latency. "
+        "Workers share the kernel page cache, so the disk read happens once regardless of "
+        "worker count. Costs a one-time startup pass proportional to dataset size; set to "
+        "False to trade predictable tail latency for faster startup on very large datasets.",
     )
     PREFORMAT_PAYLOADS: bool = Field(
         default=False,
@@ -364,6 +393,33 @@ class _DatasetSettings(BaseSettings):
         "entries on a `FileDataset`. When total inline records exceed this "
         "value, the config loader logs a warning suggesting the user move the "
         "dataset to a JSONL file. No hard cap.",
+    )
+
+    TRACELAB_SUBAGENT_JOIN: bool = Field(
+        default=True,
+        description="When True (default), TraceLabTraceDatasetLoader recovers "
+        "subagent parent/child links by timing containment and nests each "
+        "recovered child as a subagent entry inside its parent trace. Set to "
+        "False to emit every recorded session as an independent flat trace, "
+        "which is the shape the corpus literally records.",
+    )
+    TRACELAB_CODEX_SUBAGENT_JOIN: bool = Field(
+        default=True,
+        description="When True (default), the TraceLab subagent join also "
+        "runs over codex sessions. Codex uses an async spawn/wait/close agent "
+        "lifecycle whose handles are stripped from the released corpus, so "
+        "only a coarse session-level window is available there and a session "
+        "fanning out several agents collapses them into one window. Set to "
+        "False to keep only the precise blocking-tool-call join.",
+    )
+    TRACELAB_MIN_SPAWN_MS: int = Field(
+        ge=0,
+        default=10000,
+        description="Minimum wall latency, in milliseconds, for a spawning "
+        "tool call to be treated as a subagent round-trip by the TraceLab "
+        "join. Short calls are overwhelmingly no-op or error returns, and "
+        "admitting them widens the containment window enough to start "
+        "capturing unrelated concurrent sessions.",
     )
 
     WEKA_PARALLEL_WORKERS: int = Field(
@@ -538,6 +594,30 @@ class _DatasetSettings(BaseSettings):
         "shot sidecar never becomes a worker-group member. Set to 0 to disable "
         "worker-group tagging (parallel workers keep the generic ::fa: tag). Only "
         "applies when WEKA_SPLIT_FLATTENED_AGENTS is True.",
+    )
+
+
+class _EndpointSettings(BaseSettings):
+    """Endpoint wire-format configuration.
+
+    Controls how AIPerf serializes message content when building request
+    payloads. The main knob is FORCE_CONTENT_PARTS, which overrides the
+    single-text fast path that emits a plain string for simple turns.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="AIPERF_ENDPOINT_",
+    )
+
+    FORCE_CONTENT_PARTS: bool = Field(
+        default=False,
+        description="When True, always emit the multi-part content array "
+        '(e.g. [{"type": "text", "text": "..."}]) for synthetic turns, '
+        "even when there is only a single text with no media. By default "
+        "(False) single-text turns emit a plain string to stay compatible "
+        "with servers that reject list-of-parts content for non-multimodal "
+        "inputs (e.g. OpenAI Dynamo). Enable when the target server requires "
+        "the structured content-parts shape unconditionally.",
     )
 
 
@@ -776,6 +856,10 @@ class _HTTPSettings(BaseSettings):
         "affinity. It is ADDITIVE (both headers are sent); --session-header only "
         "RENAMES the single correlation header.",
     )
+    X_SESSION_AFFINITY_FROM_CORRELATION_ID: bool = Field(
+        default=True,
+        description="Also send X-Session-Affinity with the stable X-Correlation-ID value.",
+    )
     X_SMG_ROUTING_KEY_FROM_CORRELATION_ID: bool = Field(
         default=False,
         description="Also send X-SMG-Routing-Key with the stable X-Correlation-ID value. "
@@ -981,6 +1065,36 @@ class _RecordSettings(BaseSettings):
         "set False explicitly for that case.",
     )
 
+    PROGRESS_STALL_TIMEOUT: float = Field(
+        ge=0.0,
+        le=86400.0,
+        default=600.0,
+        description="Seconds during which a profiling phase has requests in "
+        "flight and none of them complete, after which the run fails instead "
+        "of waiting indefinitely. A phase completes only once the credit "
+        "phase reports its final count, so a credit that is never returned "
+        "leaves that condition unevaluable and the run waits forever with no "
+        "output. Per-request timeouts do not cover this: they default to 6 "
+        "hours and never apply to a request that was not dispatched. Note "
+        "that a single legitimately long request will fail the run if it "
+        "exceeds this timeout while nothing else completes, so raise this "
+        "value for workloads whose individual requests run longer. Each "
+        "profiling phase is judged on its own counters, so an overlapping "
+        "`seamless` phase that keeps completing work does not mask a stall in "
+        "another. Set to 0 to disable and restore the previous unbounded "
+        "wait.",
+    )
+
+    PROGRESS_STALL_CHECK_INTERVAL: float = Field(
+        ge=1.0,
+        le=600.0,
+        default=30.0,
+        description="Seconds between stall checks. Each check with no "
+        "completions also logs how many requests are still in flight and "
+        "which phase they belong to, so a stalled run is diagnosable from the "
+        "log rather than silent.",
+    )
+
 
 class _SearchPlannerSettings(BaseSettings):
     """Adaptive-search planner tunables.
@@ -1166,6 +1280,24 @@ class _TimingSettings(BaseSettings):
         le=10.0,
         default=0.1,
         description="Update interval in seconds for continuous rate ramping (default 0.1s = 100ms)",
+    )
+    HIGH_RES_TIMER: bool = Field(
+        default=True,
+        description="Use high-resolution rate-loop pacing instead of event-loop timers, which "
+        "quantize sub-millisecond sleeps to ~1ms granularity. Restores exact rate delivery and "
+        "arrival-distribution fidelity at high request rates. Uses a Linux timerfd (kernel "
+        "hrtimer, ~50us wakeup precision) when available, and a dedicated sleep thread on other "
+        "platforms (~100us POSIX, ~0.5ms Windows). Set to false to force event-loop timer pacing.",
+    )
+    MAX_CATCHUP_SECONDS: float = Field(
+        ge=0.0,
+        le=10.0,
+        default=0.01,
+        description="Maximum schedule backlog in seconds the rate loop is allowed to catch up on "
+        "before re-anchoring to the current time. Event-loop timers oversleep sub-millisecond "
+        "waits (~1ms granularity under uvloop/libuv); without a catch-up window every oversleep "
+        "permanently forfeits schedule and high request rates silently under-deliver. Bounded so "
+        "a genuine multi-second stall still re-anchors instead of firing a burst storm.",
     )
 
 
@@ -1757,6 +1889,10 @@ class _Environment(BaseSettings):
     DAG: _DagSettings = Field(
         default_factory=_DagSettings,
         description="DAG benchmark mode settings (dag_jsonl input type)",
+    )
+    ENDPOINT: _EndpointSettings = Field(
+        default_factory=_EndpointSettings,
+        description="Endpoint wire-format settings (content serialization, etc.)",
     )
     DEV: _DeveloperSettings = Field(
         default_factory=_DeveloperSettings,

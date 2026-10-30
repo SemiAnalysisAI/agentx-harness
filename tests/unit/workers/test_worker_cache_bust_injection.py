@@ -251,6 +251,134 @@ def test_system_prefix_uses_existing_raw_system_role_when_no_conversation_system
     assert msgs[1]["content"] == "hi"
 
 
+def _make_raw_system_session(
+    raw_system: list[dict],
+    *,
+    system_message: str | None = None,
+    raw_messages: list[dict] | None = None,
+) -> UserSession:
+    """Session whose dispatch turn carries a vendor-shaped ``raw_system``."""
+    turn = Turn(raw_system=raw_system, raw_messages=raw_messages)
+    conversation = Conversation(
+        session_id="conv_test", turns=[turn], system_message=system_message
+    )
+    return UserSession(
+        x_correlation_id="xcorr_test",
+        num_turns=1,
+        conversation=conversation,
+        turn_list=[turn],
+    )
+
+
+@pytest.mark.parametrize(
+    "target,marker,expected",
+    [
+        param(
+            CacheBustTarget.SYSTEM_PREFIX,
+            _PREFIX_MARKER,
+            [
+                {"type": "text", "text": _PREFIX_MARKER.strip()},
+                {"type": "text", "text": "sys"},
+            ],
+            id="prefix",
+        ),
+        param(
+            CacheBustTarget.SYSTEM_SUFFIX,
+            _SUFFIX_MARKER,
+            [
+                {"type": "text", "text": "sys"},
+                {"type": "text", "text": _SUFFIX_MARKER.strip()},
+            ],
+            id="suffix",
+        ),
+    ],
+)  # fmt: skip
+def test_system_target_injects_into_raw_system_blocks(target, marker, expected):
+    """``raw_system`` is what MessagesEndpoint ships, so the marker lands there."""
+    session = _make_raw_system_session([{"type": "text", "text": "sys"}])
+    credit = _make_credit(target=target, marker=marker, turn_index=0)
+
+    _apply_cache_bust(session, credit, system_message=None)
+
+    assert session.turn_list[-1].raw_system == expected
+
+
+def test_raw_system_outranks_conversation_system_message():
+    """``raw_system`` wins over ``system_message`` on the wire, so marking the
+    string instead would ship unchanged system bytes."""
+    session = _make_raw_system_session(
+        [{"type": "text", "text": "sys"}], system_message="ignored-on-wire"
+    )
+    credit = _make_credit(
+        target=CacheBustTarget.SYSTEM_PREFIX, marker=_PREFIX_MARKER, turn_index=0
+    )
+
+    out = _apply_cache_bust(session, credit, system_message="ignored-on-wire")
+
+    assert out == "ignored-on-wire"
+    assert session.turn_list[-1].raw_system[0] == {
+        "type": "text",
+        "text": _PREFIX_MARKER.strip(),
+    }
+
+
+def test_raw_system_outranks_system_role_raw_messages():
+    session = _make_raw_system_session(
+        [{"type": "text", "text": "sys"}],
+        raw_messages=[
+            {"role": "system", "content": "sys-msg"},
+            {"role": "user", "content": "hi"},
+        ],
+    )
+    credit = _make_credit(
+        target=CacheBustTarget.SYSTEM_PREFIX, marker=_PREFIX_MARKER, turn_index=0
+    )
+
+    _apply_cache_bust(session, credit, system_message=None)
+
+    assert session.turn_list[-1].raw_system[0]["text"] == _PREFIX_MARKER.strip()
+    msgs = session.turn_list[-1].raw_messages
+    assert msgs[0]["content"] == "sys-msg"
+    assert msgs[1]["content"] == "hi"
+
+
+def test_raw_system_injection_is_idempotent_across_credits():
+    """The turn object is shared across a session's credits; re-injecting the
+    constant per-session marker must not stack it."""
+    session = _make_raw_system_session([{"type": "text", "text": "sys"}])
+    credit = _make_credit(
+        target=CacheBustTarget.SYSTEM_PREFIX, marker=_PREFIX_MARKER, turn_index=0
+    )
+
+    _apply_cache_bust(session, credit, system_message=None)
+    _apply_cache_bust(session, credit, system_message=None)
+
+    assert session.turn_list[-1].raw_system == [
+        {"type": "text", "text": _PREFIX_MARKER.strip()},
+        {"type": "text", "text": "sys"},
+    ]
+
+
+def test_raw_system_injection_preserves_cache_control_blocks():
+    """The marker becomes its own block, so an authored ``cache_control``
+    breakpoint stays attached to the bytes it was written against."""
+    blocks = [
+        {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}},
+    ]
+    session = _make_raw_system_session(blocks)
+    credit = _make_credit(
+        target=CacheBustTarget.SYSTEM_PREFIX, marker=_PREFIX_MARKER, turn_index=0
+    )
+
+    _apply_cache_bust(session, credit, system_message=None)
+
+    assert session.turn_list[-1].raw_system[1] == {
+        "type": "text",
+        "text": "sys",
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
 def test_system_prefix_fallback_marks_first_user_on_turn_index_gt_zero():
     """SYSTEM_PREFIX with no system anywhere falls back to the first user turn and injects every credit (seeded-resume fix)."""
     raw = [{"role": "user", "content": "hi"}]
@@ -1575,3 +1703,123 @@ def test_seeded_resume_with_buried_reset_suffix():
     )
     assert session.turn_list[1].raw_messages[0]["content"] == "u1" + _SUFFIX_MARKER
     assert session.turn_list[0].raw_messages[0]["content"] == "u0"
+
+
+# WARMUP_ISOLATION_* target routing.
+# During WARMUP the CreditIssuer sets cache_bust_marker=WARMUP_ISOLATION_MARKER.
+# During PROFILING it sets cache_bust_marker=None, so _apply_cache_bust returns
+# early (the `not marker` gate) before any routing.
+
+
+def test_apply_cache_bust_warmup_isolation_system_injects_into_system_message():
+    """WARMUP_ISOLATION_SYSTEM with a conversation system_message must prefix the string."""
+    from aiperf.timing.strategies.cache_bust import WARMUP_ISOLATION_MARKER
+
+    raw = [{"role": "user", "content": "hi"}]
+    session = _make_session(raw)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+        marker=WARMUP_ISOLATION_MARKER,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message="You are helpful.")
+
+    assert out == WARMUP_ISOLATION_MARKER + "You are helpful."
+    # Raw user turn must NOT be touched.
+    assert session.turn_list[-1].raw_messages[0]["content"] == "hi"
+
+
+def test_apply_cache_bust_warmup_isolation_system_falls_back_to_raw_system_role():
+    """WARMUP_ISOLATION_SYSTEM with no conversation system_message injects into the raw system-role message."""
+    from aiperf.timing.strategies.cache_bust import WARMUP_ISOLATION_MARKER
+
+    raw = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]
+    session = _make_session(raw)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+        marker=WARMUP_ISOLATION_MARKER,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message=None)
+
+    assert out is None
+    assert (
+        session.turn_list[-1].raw_messages[0]["content"]
+        == WARMUP_ISOLATION_MARKER + "rules"
+    )
+    assert session.turn_list[-1].raw_messages[1]["content"] == "hi"
+
+
+def test_apply_cache_bust_warmup_isolation_system_falls_back_to_first_user_when_no_system():
+    """WARMUP_ISOLATION_SYSTEM with no system anywhere falls back to the first user turn."""
+    from aiperf.timing.strategies.cache_bust import WARMUP_ISOLATION_MARKER
+
+    raw = [{"role": "user", "content": "hi"}]
+    session = _make_session(raw)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+        marker=WARMUP_ISOLATION_MARKER,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message=None)
+
+    assert out is None
+    assert (
+        session.turn_list[-1].raw_messages[0]["content"]
+        == WARMUP_ISOLATION_MARKER + "hi"
+    )
+
+
+def test_apply_cache_bust_warmup_isolation_first_turn_injects_into_first_user_turn():
+    """WARMUP_ISOLATION_FIRST_TURN must prefix the first user turn, ignoring any system_message."""
+    from aiperf.timing.strategies.cache_bust import WARMUP_ISOLATION_MARKER
+
+    raw = [{"role": "user", "content": "Hello"}]
+    session = _make_session(raw)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_FIRST_TURN,
+        marker=WARMUP_ISOLATION_MARKER,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message="sys")
+
+    # System message returned unchanged.
+    assert out == "sys"
+    assert (
+        session.turn_list[-1].raw_messages[0]["content"]
+        == WARMUP_ISOLATION_MARKER + "Hello"
+    )
+
+
+def test_apply_cache_bust_warmup_isolation_first_turn_with_synthetic_turn():
+    """WARMUP_ISOLATION_FIRST_TURN on a synthetic Turn (raw_messages=None) mutates Text.contents[0]."""
+    from aiperf.timing.strategies.cache_bust import WARMUP_ISOLATION_MARKER
+
+    turn = Turn(raw_messages=None, texts=[Text(contents=["Hello"])])
+    session = _make_synthetic_session(turn)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_FIRST_TURN,
+        marker=WARMUP_ISOLATION_MARKER,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message=None)
+
+    assert out is None
+    assert (
+        session.turn_list[-1].texts[0].contents[0] == WARMUP_ISOLATION_MARKER + "Hello"
+    )
+
+
+def test_apply_cache_bust_warmup_isolation_profiling_no_marker_is_noop():
+    """When marker is None (PROFILING phase) the early-exit gate fires and no injection occurs."""
+    raw = [{"role": "user", "content": "hi"}]
+    session = _make_session(raw)
+    credit = _make_credit(
+        target=CacheBustTarget.WARMUP_ISOLATION_FIRST_TURN,
+        marker=None,
+    )
+
+    out = _apply_cache_bust(session, credit, system_message="sys")
+
+    assert out == "sys"
+    assert session.turn_list[-1].raw_messages[0]["content"] == "hi"

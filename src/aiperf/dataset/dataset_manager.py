@@ -35,6 +35,8 @@ from aiperf.common.messages import (
     ConversationResponseMessage,
     ConversationTurnRequestMessage,
     ConversationTurnResponseMessage,
+    DatasetConfigStatusRequest,
+    DatasetConfigStatusResponse,
     DatasetConfigurationFailedNotification,
     DatasetConfiguredNotification,
     ProfileConfigureCommand,
@@ -54,7 +56,7 @@ from aiperf.config.artifacts import OutputDefaults
 from aiperf.config.dataset import FileDataset, PublicDataset
 from aiperf.dataset import mmap_cache
 from aiperf.dataset.memory_map_utils import turn_from_payload_turn
-from aiperf.dataset.utils import encode_image
+from aiperf.dataset.utils import encode_image, normalize_image_format
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import (
     ComposerType,
@@ -133,6 +135,16 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         # writes under the same key the lookup would have used.
         self._cache_key_for_run: str | None = None
         self._cache_hit_used: bool = False
+        # Last DatasetConfiguredNotification published this run, if any.
+        # DatasetConfiguredNotification is a one-shot PUB/SUB broadcast with
+        # no replay; a subscriber that finishes subscribing after it was
+        # published never receives it. Cached here so DATASET_CONFIG_STATUS_REQUEST
+        # (sent by a RecordProcessor/RecordsManager that hasn't seen the
+        # notification yet) can hand back the already-published config
+        # instead of the requester blocking until CONFIGURATION_TIMEOUT.
+        self._last_dataset_configured_notification: (
+            DatasetConfiguredNotification | None
+        ) = None
 
     def _is_kubernetes_run(self) -> bool:
         """Return whether the optional KUBERNETES service-run plugin is active."""
@@ -270,11 +282,14 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         per-turn payloads are verbatim or synthesized at runtime and would be
         huge (and for weka, meaningless) in inputs.json. Uses the loader's
         DETECTED type so auto-detected traces (e.g. a bare BurstGPT CSV) are
-        skipped too. Same predicate the mmap cache uses
-        (``mmap_cache.is_trace_or_verbatim_dataset``), but the cache gate keys
-        off the pre-load CONFIG type: an explicitly-typed trace is both cached
-        and skipped, while an auto-detected trace is skipped-but-uncached (a
-        re-tokenize perf miss, never a correctness issue).
+        skipped too. Most formats share the mmap cache predicate
+        (``mmap_cache.is_trace_or_verbatim_dataset``), but Baseten is a
+        deliberate skip-only special case: its large recorded prompts make
+        ``inputs.json`` prohibitively expensive, while it remains outside the
+        mmap cache. The cache gate keys off the pre-load CONFIG type, so other
+        explicitly-typed traces are cached and skipped while auto-detected
+        traces are skipped-but-uncached (a re-tokenize perf miss, never a
+        correctness issue).
         """
         default_dataset = self.run.cfg.get_default_dataset()
         public_dataset = (
@@ -282,8 +297,11 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
             if isinstance(default_dataset, PublicDataset)
             else None
         )
-        return mmap_cache.is_trace_or_verbatim_dataset(
-            self._detected_dataset_type, public_dataset
+        return (
+            self._detected_dataset_type == CustomDatasetType.BASETEN_TRACE
+            or mmap_cache.is_trace_or_verbatim_dataset(
+                self._detected_dataset_type, public_dataset
+            )
         )
 
     def _lookup_under_lock(self) -> mmap_cache.CacheHit | None:
@@ -391,6 +409,7 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
 
                 def _decode_and_encode() -> str:
                     img = PILImage.open(BytesIO(data))
+                    normalize_image_format(img)
                     if img.format is None:
                         raise RuntimeError(
                             f"Failed to determine image format for URL '{url}'"
@@ -850,13 +869,13 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
             f"unique conversations: {len(self.dataset_metadata.conversations)}, "
             f"unique turn count: {self.dataset_metadata.total_turn_count}"
         )
-        await self.publish(
-            DatasetConfiguredNotification(
-                service_id=self.service_id,
-                metadata=self.dataset_metadata,
-                client_metadata=client_metadata,
-            )
+        notification = DatasetConfiguredNotification(
+            service_id=self.service_id,
+            metadata=self.dataset_metadata,
+            client_metadata=client_metadata,
         )
+        self._last_dataset_configured_notification = notification
+        await self.publish(notification)
 
     def _populate_cache_after_run(self) -> None:
         """Write the just-finalized run's mmap files into the cache."""
@@ -992,12 +1011,29 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         # Note: dataset_configured event is set in _configure_dataset_client_and_free_memory()
         # after the dataset client is initialized, to avoid a race condition where fallback
         # requests arrive before the client is ready.
-        await self.publish(
-            DatasetConfiguredNotification(
-                service_id=self.service_id,
-                metadata=self.dataset_metadata,
-                client_metadata=client_metadata,
-            )
+        notification = DatasetConfiguredNotification(
+            service_id=self.service_id,
+            metadata=self.dataset_metadata,
+            client_metadata=client_metadata,
+        )
+        self._last_dataset_configured_notification = notification
+        await self.publish(notification)
+
+    @on_request(MessageType.DATASET_CONFIG_STATUS_REQUEST)
+    async def _handle_dataset_config_status_request(
+        self, message: DatasetConfigStatusRequest
+    ) -> DatasetConfigStatusResponse:
+        """Late-join catch-up: hand back the already-published
+        DatasetConfiguredNotification, if any, to a requester that hasn't
+        received the one-shot PUB/SUB broadcast.
+        """
+        self.debug(
+            lambda: f"Handling dataset config status request from {message.service_id}"
+        )
+        return DatasetConfigStatusResponse(
+            service_id=self.service_id,
+            request_id=message.request_id,
+            notification=self._last_dataset_configured_notification,
         )
 
     @on_request(MessageType.CONVERSATION_REQUEST)

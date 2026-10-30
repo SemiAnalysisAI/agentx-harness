@@ -32,6 +32,7 @@ This document provides a comprehensive reference of all metrics available in AIP
     - [Total Output Sequence Length](#total-output-sequence-length)
     - [Total Input Sequence Length](#total-input-sequence-length)
     - [E2E Output Token Throughput](#e2e-output-token-throughput)
+    - [E2E Normalized Interactivity](#e2e-normalized-interactivity)
     - [Output Token Throughput](#output-token-throughput)
     - [Total Token Throughput](#total-token-throughput)
   - [Image Metrics](#image-metrics)
@@ -54,6 +55,7 @@ This document provides a comprehensive reference of all metrics available in AIP
     - [Overall Draft Acceptance Rate](#overall-draft-acceptance-rate)
     - [Accepted per Verified](#accepted-per-verified)
     - [Spec Decode Steps](#spec-decode-steps)
+    - [Zero-Step Requests](#zero-step-requests)
     - [Accepted / Draft Token Counts](#accepted--draft-token-counts)
     - [Pooled Acceptance Histogram](#pooled-acceptance-histogram)
   - [Usage Field Metrics](#usage-field-metrics)
@@ -331,6 +333,7 @@ Measures the average time between consecutive tokens during generation, excludin
 
 **Formula:**
 ```python
+# Default (all runs): assume one token in the first chunk.
 # Calculate in nanoseconds, then convert to seconds
 inter_token_latency_ns = (request_latency_ns - time_to_first_token_ns) / (output_sequence_length - 1)
 
@@ -342,7 +345,9 @@ inter_token_latency_ms = inter_token_latency_ns / 1e6
 ```
 
 **Notes:**
-- Requires an output sequence length of at least 2 tokens and valid `time_to_first_token`, `request_latency`, and `output_sequence_length` metrics.
+- By default the divisor is `output_sequence_length - 1`, which is exact for servers that stream one token per chunk. This is the formula every run uses unless `--per-chunk-usage` is enabled.
+- **Opt-in first-chunk correction (`--per-chunk-usage`).** The decode window (`request_latency - time_to_first_token`) covers only the tokens that arrive *after* the first content chunk. When a server bundles several tokens into the first streamed chunk (for example TRT-LLM's `stream-interval`), assuming a single token over-counts the decode tokens and inflates Output Token Throughput Per User (`1 / ITL`). Passing `--per-chunk-usage` (which also requires `--use-server-token-count`, a `chat` endpoint, and `--streaming`) makes the server report cumulative per-chunk usage via `stream_options.continuous_usage_stats`; the divisor then becomes `output_sequence_length - tokens_in_first_content_chunk`, where that count is the server-reported cumulative `completion_tokens` (reasoning included, matching OSL which is `output + reasoning = completion`) through the first content chunk. Requires a server that honors `continuous_usage_stats` (e.g. vLLM, TRT-LLM); otherwise the divisor stays `output_sequence_length - 1`.
+- Requires an output sequence length of at least 2, plus valid `time_to_first_token`, `request_latency`, and `output_sequence_length` metrics. If the first-chunk count is inconsistent with OSL (>= OSL), the divisor degrades to `output_sequence_length - 1` and a one-time warning is logged rather than dropping the metric.
 - ITL is generated-token-normalized decode duration. It is not the total wall-clock decode duration.
 - Compare runs at equivalent output lengths, or inspect Decode Duration and Output Sequence Length alongside ITL.
 - Streaming chunks can contain multiple tokens. ITL uses token count, while ICL uses chunk arrival timestamps.
@@ -581,6 +586,34 @@ e2e_output_token_throughput = output_sequence_length / request_latency_seconds
 - Available for non-streaming responses (unlike Output Token Throughput Per User which requires streaming).
 - Flags: `PRODUCES_TOKENS_ONLY | LARGER_IS_BETTER`
 - Depends on Output Sequence Length and Request Latency metrics.
+- Its `p10`/`p25` percentiles are numerically the same order statistic as [E2E Normalized Interactivity](#e2e-normalized-interactivity)'s `p90`/`p75` — see that metric for when to prefer the named InferenceX scalar.
+
+---
+
+### E2E Normalized Interactivity
+
+**Type:** [Derived Metric](#derived-metrics) (injected post-aggregation)
+
+> [!NOTE]
+> Emitted as two named percentile scalars, `e2e_normalized_interactivity_p90` and `e2e_normalized_interactivity_p75`, in tokens/sec/user. Reproduces the x-axis InferenceX renders for AgentX Pareto curves, so `aiperf profile` yields the point directly with no post-processing. Available for both streaming and non-streaming responses.
+
+The rate at which a user receives output tokens **including** the prefill wait (TTFT). Unlike [Output Token Throughput Per User](#output-token-throughput-per-user) (`1 / ITL`, decode-only), it charges the whole end-to-end latency, so a large TTFT relative to the tokens produced pulls it down — prefill-delaying cannot inflate it.
+
+**Formula:**
+```python
+# per-request ratio, in seconds per output token
+ratio = request_latency_seconds / output_sequence_length
+# invert AFTER taking the percentile (slow-tail convention)
+e2e_normalized_interactivity_p90 = 1.0 / percentile(ratio, 90)
+e2e_normalized_interactivity_p75 = 1.0 / percentile(ratio, 75)
+```
+
+**Notes:**
+- The percentile is taken over the seconds-per-token ratio and then inverted (`1 / p(x)`, **not** `p(1 / x)`). A higher percentile names a slower, more pessimistic tail, so `p90` is the effective token rate of the 90th-percentile worst request. This differs from `p90` of the per-request rate, which would report the fast tail.
+- **Relationship to [E2E Output Token Throughput](#e2e-output-token-throughput).** Because `x -> 1/x` is monotone, `1 / p90(latency/OSL)` is the same order statistic as `p10(OSL/latency)` *over the same requests*. The two differ only in the space the linear interpolation happens in: on a 300-request run they agree to roughly `1e-9` relative, widening to about `1e-3` for small (n < 100) heavy-tailed samples. Note this metric additionally requires `TTFT > 0` and `ISL > 0`, whereas `E2EOutputTokenThroughputMetric` drops a record only when `request_latency` is zero, so the two populations can diverge on a run with zero-length inputs. They are kept as a distinct named family because they pin InferenceX's exact convention (invert *after* the percentile). Prefer this metric when you need the exact AgentX Pareto x-axis; the throughput percentiles are equivalent otherwise.
+- Request-weighted: every request with positive, finite `request_latency`, `output_sequence_length`, and (when present) `time_to_first_token` and `input_sequence_length` contributes one sample, matching InferenceX's filter. The filter can shrink the sample; `count` is not exported for this derived scalar, so a `debug` log reports how many requests were dropped.
+- Percentile uses numpy-linear interpolation, matching InferenceX's `quantile`, so values line up exactly for identical inputs.
+- Reported once per run (not per `--slice-duration` timeslice), matching InferenceX's run-level definition.
 
 ---
 
@@ -729,7 +762,7 @@ video_peak_memory = response.data.peak_memory_mb
 Per-request input audio duration in seconds. Hidden from the console summary; available in JSON / CSV record exports for characterizing dataset shape and verifying RTFx calculations.
 
 **Notes:**
-- Only computed when the request carries `audio_duration_seconds` (e.g., ASR datasets such as LibriSpeech).
+- Only computed when the request carries `audio_duration_seconds` (e.g., ASR datasets such as LibriSpeech, or a `--custom-dataset-type single_turn` entry with an explicit `audio_duration_seconds` field).
 - Aggregate stats (avg, p50, p99) are computed automatically.
 
 ### Inverse Real-Time Factor (RTFx)
@@ -796,7 +829,9 @@ total_reasoning_tokens = sum(r.reasoning_token_count for r in records if r.valid
 > each record. They are fully engine-agnostic: any engine whose adapter fills the
 > record lights them up unchanged, and none of them branch on the engine. When
 > spec decode is off (or a request had no verify steps) the record is absent and
-> every metric here drops out cleanly -- nothing is shown or exported.
+> every metric here drops out cleanly -- nothing is shown or exported. The one
+> exception is [Zero-Step Requests](#zero-step-requests), which counts the
+> requests that reported stats but never ran a verify step.
 
 <!-- -->
 
@@ -888,6 +923,24 @@ spec_decode_accepted_per_verified = (num_accepted_draft_tokens + num_spec_steps)
 **Type:** [Record Metric](#record-metrics) · **Unit:** count
 
 Per-request number of speculative verification steps (`num_spec_steps`). Equals the sum of the request's acceptance-histogram counts. The run-level `total_spec_decode_steps` is its sum across requests.
+
+---
+
+### Zero-Step Requests
+
+**Type:** [Aggregate Metric](#aggregate-metrics) · **Unit:** requests
+
+The number of requests whose engine reported spec-decode stats but that ran no verify step (`num_spec_steps == 0`), e.g. `max_tokens: 1`, EOS as the first token, or an NGram drafter that never matched. These requests have no acceptance record, so none of the per-request metrics above include them; this count says how many were excluded.
+
+**Formula:**
+```python
+spec_decode_zero_step_requests = sum(1 for r in records if r.spec_decode_zero_step)
+```
+
+**Notes:**
+- Absent when no request was zero-step. A Spec Decode section showing only this row means speculation never fired, as opposed to spec decode being off, which shows no section at all.
+- Only vLLM reports zero-step requests; TensorRT-LLM omits the payload for them, so they are indistinguishable from spec decode being off.
+- Aggregate only (`NO_INDIVIDUAL_RECORDS`): not written to the per-record JSONL.
 
 ---
 
@@ -2179,7 +2232,9 @@ http_req_chunks_received = trace.response_chunks_count
 > [!NOTE]
 > Each vendor's metrics render in their own console section — `GPU Power Efficiency (NVIDIA)` (`console_group = MetricConsoleGroup.GPU_POWER_EFFICIENCY_NVIDIA`) and `GPU Power Efficiency (AMD)` (`MetricConsoleGroup.GPU_POWER_EFFICIENCY_AMD`) — separate from the main metrics table. A section is omitted entirely when no GPU of that vendor reported.
 
-**Energy source.** Per-vendor total GPU energy is taken from the vendor's energy counter delta when available (`source = dcgm_counter` for NVIDIA; `source = power_integration` fallback for amdsmi when only the power gauge is exposed), and the time-averaged fleet power is derived from it as `total_gpu_energy / profiling_duration_s`. If neither signal is present the family is skipped for that vendor.
+**Energy source.** Per-vendor total GPU energy is taken from that vendor's energy counter delta when available (`source = dcgm_counter`), and the time-averaged fleet power is derived from it as `total_gpu_energy / profiling_duration_s`. When only the power gauge is exposed, energy is integrated from it instead (`source = power_integration`, energy = fleet power * duration). If neither signal is present the family is skipped for that vendor.
+
+The `power_integration` fallback is vendor-agnostic: `EnergyEfficiencyAnalyzer._resolve_energy` selects on whether the energy counter reported, not on which vendor asked. It therefore covers AMD GPUs exposing only the power gauge and NVIDIA GPUs without the NVML total-energy counter alike, so a pre-Volta card still reports power efficiency metrics, integrated from power rather than counted, provided no GPU on that platform reported the counter. The choice is fleet-wide, not per GPU: in a mixed-generation fleet one reporting GPU sends the whole platform down the counter branch, and the GPUs without a counter then contribute power but no energy, so `total_gpu_energy` is short by their share while still labelled `dcgm_counter`.
 
 The family is skipped entirely when GPU telemetry is not collected. Each tag is independently omitted when its underlying signal is unavailable (e.g. `nvidia_energy_per_user` only appears for concurrency runs; `nvidia_goodput_per_watt` only when goodput SLOs are configured). NVIDIA tags: `nvidia_energy_delay_product`, `nvidia_performance_per_watt`, `nvidia_output_tps_per_watt`, `nvidia_goodput_per_watt`, `nvidia_average_gpu_power`, `nvidia_total_gpu_energy`, `nvidia_total_gpu_power`, `nvidia_energy_per_total_token`, `nvidia_energy_per_output_token`, `nvidia_energy_per_request`, `nvidia_output_tokens_per_joule`, `nvidia_energy_per_user`. AMD tags follow the same pattern with the `amd_` prefix.
 

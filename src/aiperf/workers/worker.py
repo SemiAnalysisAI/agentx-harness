@@ -9,13 +9,12 @@ from typing import TYPE_CHECKING, Any
 
 from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.base_component_service import BaseComponentService
-from aiperf.common.constants import BYTES_PER_MIB, WARMUP_SYSTEM_MESSAGE_PREFIX
+from aiperf.common.constants import BYTES_PER_MIB
 from aiperf.common.enums import (
     CacheBustTarget,
     CommAddress,
     CommandType,
     ConversationBranchMode,
-    CreditPhase,
     MemoryMapFormat,
     MessageType,
 )
@@ -146,7 +145,10 @@ def _apply_cache_bust_to_system_message(
     """
     if not marker or target == CacheBustTarget.NONE or system_message is None:
         return system_message
-    if target == CacheBustTarget.SYSTEM_PREFIX:
+    if target in (
+        CacheBustTarget.SYSTEM_PREFIX,
+        CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+    ):
         return marker + system_message
     if target == CacheBustTarget.SYSTEM_SUFFIX:
         return system_message + marker
@@ -248,6 +250,45 @@ def _inject_marker_into_first_user_turn(
                 f"of type {type(content).__name__}; marker dropped"
             )
             return
+
+
+def _find_effective_raw_system(turn_list: list[Turn]) -> list[dict] | None:
+    """Return the ``raw_system`` block list the endpoint will actually send.
+
+    Mirrors ``base_endpoint._latest_turn_attr``: walks ``turn_list`` from the
+    end and returns the first non-None ``raw_system``. Only ``MessagesEndpoint``
+    reads this field, and there it OUTRANKS both the conversation-level
+    ``system_message`` string and any system-role ``raw_messages`` entry — so a
+    ``SYSTEM_*`` marker written to either of those would be silently dropped
+    from the wire whenever a turn carries ``raw_system``.
+    """
+    for turn in reversed(turn_list):
+        if turn.raw_system is not None:
+            return turn.raw_system
+    return None
+
+
+def _inject_marker_into_raw_system(
+    raw_system: list[dict], marker: str, *, is_prefix: bool
+) -> None:
+    """Insert the marker as a text block at the edge of a ``raw_system`` list.
+
+    ``raw_system`` is a list of vendor content blocks (not role/content
+    messages), so the marker becomes its own ``{"type": "text", ...}`` block
+    rather than being spliced into an existing block's text — that leaves any
+    neighbouring block's ``cache_control`` breakpoint attached to the same
+    bytes it was authored against. Idempotent via
+    :func:`_content_has_marker_at_edge`.
+    """
+    if not marker:
+        return
+    if _content_has_marker_at_edge(raw_system, marker, is_prefix=is_prefix):
+        return
+    marker_block = {"type": "text", "text": marker.strip()}
+    if is_prefix:
+        raw_system.insert(0, marker_block)
+    else:
+        raw_system.append(marker_block)
 
 
 def _find_first_system_message(turn_list: list[Turn]) -> list[dict] | None:
@@ -393,12 +434,19 @@ def _apply_cache_bust(
     is_prefix = target in (
         CacheBustTarget.SYSTEM_PREFIX,
         CacheBustTarget.FIRST_TURN_PREFIX,
+        CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+        CacheBustTarget.WARMUP_ISOLATION_FIRST_TURN,
     )
     prefix_turns = _effective_prefix_turns(session)
 
-    if target in (CacheBustTarget.SYSTEM_PREFIX, CacheBustTarget.SYSTEM_SUFFIX):
+    if target in (
+        CacheBustTarget.SYSTEM_PREFIX,
+        CacheBustTarget.SYSTEM_SUFFIX,
+        CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+    ):
         return _apply_system_target_cache_bust(
             prefix_turns,
+            all_turns=session.turn_list,
             system_message=system_message,
             marker=marker,
             target=target,
@@ -416,28 +464,39 @@ def _apply_cache_bust(
 def _apply_system_target_cache_bust(
     prefix_turns: list[Turn],
     *,
+    all_turns: list[Turn],
     system_message: str | None,
     marker: str,
     target: CacheBustTarget,
     is_prefix: bool,
 ) -> str | None:
-    """Inject a ``SYSTEM_PREFIX`` / ``SYSTEM_SUFFIX`` marker for one credit.
+    """Inject a ``SYSTEM_PREFIX`` / ``SYSTEM_SUFFIX`` / ``WARMUP_ISOLATION_SYSTEM`` marker for one credit.
 
     ``prefix_turns`` is the effective wire prefix slice (see
-    :func:`_effective_prefix_turns`). Three sub-paths:
-      1. Conversation-level ``system_message`` present: marker applied every
+    :func:`_effective_prefix_turns`). Four sub-paths, ordered to match how the
+    endpoint resolves the system field on the wire — marking a lower-precedence
+    carrier would leave the bytes that actually ship unchanged:
+      1. ``raw_system`` present on any turn: it outranks both ``system_message``
+         and system-role ``raw_messages`` in ``MessagesEndpoint``, so the marker
+         goes there. Resolved over ``all_turns`` (not the prefix slice) because
+         ``_latest_turn_attr`` ignores ``reset_context``.
+      2. Conversation-level ``system_message`` present: marker applied every
          turn (string mutation re-applied per credit). Unaffected by
          ``reset_context`` — the ``system_message`` rides on ``RequestInfo`` and
          is re-emitted every turn independent of ``build_messages``' reset.
-      2. ``raw_messages`` first dict has ``role=="system"``: marker injected
+      3. ``raw_messages`` first dict has ``role=="system"``: marker injected
          into the first system message of the prefix slice.
-      3. No system in the slice -> first-user-turn fallback: marker injected
+      4. No system anywhere -> first-user-turn fallback: marker injected
          into the first user turn every credit (idempotent), matching
          ``FIRST_TURN_*`` semantics so a seeded mid-trajectory resume still
          marks the prefix.
 
     Returns the (possibly modified) ``system_message``.
     """
+    raw_system_blocks = _find_effective_raw_system(all_turns)
+    if raw_system_blocks is not None:
+        _inject_marker_into_raw_system(raw_system_blocks, marker, is_prefix=is_prefix)
+        return system_message
     if system_message is not None:
         return _apply_cache_bust_to_system_message(system_message, marker, target)
     raw_system = _find_first_system_message(prefix_turns)
@@ -1031,13 +1090,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         system_message = _apply_cache_bust(
             session,
             credit,
-            self._system_message_for_phase(
-                system_message=session.conversation.system_message,
-                phase=credit.phase,
-                cache_bust_target=credit.cache_bust_target
-                if credit.cache_bust_marker is not None
-                else None,
-            ),
+            session.conversation.system_message,
         )
         self._maybe_warn_cache_bust_silent_drop(session, credit)
 
@@ -1097,12 +1150,15 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             payload_bytes=payload_turn.payload_bytes,
             # Scalars only — payload_bytes carries the wire body; enrichment
             # reads max_tokens / timestamp off this turn for OSL-mismatch and
-            # schedule-lag metrics.
+            # schedule-lag metrics, source_kind for per-row attribution, and
+            # audio_duration_seconds for the audio-duration and RTFx metrics.
             turns=[
                 Turn(
                     role="user",
                     max_tokens=payload_turn.max_tokens,
                     timestamp=payload_turn.timestamp,
+                    source_kind=payload_turn.source_kind,
+                    audio_duration_seconds=payload_turn.audio_duration_seconds,
                 )
             ],
         )
@@ -1157,6 +1213,23 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         )
         if assistant_turn is not None:
             session.store_response(assistant_turn)
+        # Response-ID chaining is only coherent for the mode that captures live
+        # responses and accumulates genuine deltas (DELTAS_WITHOUT_RESPONSES).
+        # In the *_WITH_RESPONSES modes ``turns[-1]`` already carries the full
+        # authored history, so chaining would double the context on the wire.
+        # A failed turn may still emit a ``response.created`` id for a partial or
+        # aborted response; chaining onto it would corrupt the server context, so
+        # keep the last good id (from a prior successful turn) instead.
+        if (
+            not record.has_error
+            and session.should_store_response()
+            and (
+                extract_response_id := getattr(
+                    self.inference_client.endpoint, "extract_response_id", None
+                )
+            )
+        ):
+            session.store_response_id(extract_response_id(record))
         self._populate_response_metrics(credit_context, record, parsed_responses)
 
     def _populate_response_metrics(
@@ -1338,36 +1411,6 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         else:
             self.session_manager.evict(x_correlation_id)
 
-    @staticmethod
-    def _system_message_for_phase(
-        *,
-        system_message: str | None,
-        phase: CreditPhase,
-        cache_bust_target: CacheBustTarget | None,
-    ) -> str | None:
-        """Prefix warmup system messages so warmup cannot reuse profiling's
-        prefix cache — unless cache-bust already owns prefix isolation.
-
-        Cache-bust is deliberately warmup-coherent: ``build_cache_bust_marker``
-        keeps the phase out of its digest and the marker ledger survives the
-        WARMUP -> PROFILING boundary, so a trajectory's warmup turn ``k_i`` and
-        its first profiling turn ``k_i+1`` share one marker and warmup PRIMES
-        the cache profiling then hits. Injecting this prefix in front of that
-        shared marker diverges the two prefixes at token 0, so warmup primes an
-        entry profiling never touches — the round-trip is spent for nothing.
-
-        Any non-NONE target already guarantees warmup cannot collide with
-        another trajectory's prefix (the marker digests per trajectory tree), so
-        standing down here costs no isolation.
-        """
-        if phase != CreditPhase.WARMUP:
-            return system_message
-        if cache_bust_target not in (None, CacheBustTarget.NONE):
-            return system_message
-        if not system_message:
-            return WARMUP_SYSTEM_MESSAGE_PREFIX
-        return f"{WARMUP_SYSTEM_MESSAGE_PREFIX}\n{system_message}"
-
     def _maybe_warn_cache_bust_silent_drop(
         self,
         session: UserSession,
@@ -1485,6 +1528,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             source_inner_idx=source_turn.source_inner_idx if source_turn else None,
             source_kind=source_turn.source_kind if source_turn else None,
             turns=turns,
+            previous_response_id=session.previous_response_id if session else None,
             drop_perf_ns=credit_context.drop_perf_ns,
             credit_issued_ns=credit.issued_at_ns,
             system_message=system_message,

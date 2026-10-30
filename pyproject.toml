@@ -11,7 +11,7 @@ allow-direct-references = true
 
 [project]
 name = "aiperf"
-version = "0.12.0"
+version = "0.13.0"
 description = "AIPerf is a package for performance testing of AI models"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -43,7 +43,7 @@ dependencies = [
   "optuna>=3.6",
   "orjson~=3.11.7",
   "pandas~=2.3.3",
-  "pillow~=12.2.0",
+  "pillow~=12.3.0",
   "plotly~=6.4.0",
   "dash~=3.1.0",
   "dash-bootstrap-components~=2.0.0",
@@ -170,7 +170,13 @@ required-environments = [
 # Base settings for ruff
 line-length = 88
 indent-width = 4
-exclude = ["__pycache__", "build", "dist", ".venv", "venv", "notebooks/TCO_calculator.ipynb"]
+exclude = ["__pycache__", "build", "dist", ".venv", "venv", "notebooks/TCO_calculator.ipynb",
+           # Verbatim third-party sources; see src/aiperf/dataset/loader/vendor/README.md.
+           # Linting them would pressure us to edit files whose value is being unmodified.
+           "src/aiperf/dataset/loader/vendor"]
+# Honor `exclude` even when a path is passed explicitly (pre-commit passes
+# changed files by name), so formatting cannot rewrite vendored sources.
+force-exclude = true
 
 [tool.ruff.lint]
 select = [
@@ -216,6 +222,15 @@ max-complexity = 10
 "json.loads".msg = "Use orjson.loads instead."
 "json.dump".msg = "Use orjson.dumps instead (no stdlib-style file writing — serialize then write bytes)."
 "json.load".msg = "Use orjson.loads on file bytes instead."
+
+[tool.coverage.run]
+omit = [
+    # Verbatim third-party sources: see src/aiperf/dataset/loader/vendor/README.md.
+    # Measuring coverage of an unmodified upstream file is meaningless -- AIPerf
+    # exercises a narrow entry point into it, and the number would only ever
+    # invite edits to a file whose value is being byte-identical to upstream.
+    "src/aiperf/dataset/loader/vendor/*",
+]
 
 [tool.pytest.ini_options]
 # Basic pytest configuration
@@ -266,4 +281,5 @@ filterwarnings = [
 
 [tool.codespell]
 skip = "*.pyc,*build*,tests/unit/transports/test_aiohttp_sse.py,tests/integration/assets/canary_reference_inputs.json,src/aiperf/server_metrics/units.py,src/aiperf/api/static/dashboard.html,src/aiperf/config/schema/aiperf-config.schema.json"
-ignore-words-list = "timeslice,timeslices,optiona,disjointness,concurency,strat,clen"
+# "unparseable" is an accepted English variant, as upstream allows.
+ignore-words-list = "timeslice,timeslices,optiona,disjointness,concurency,strat,clen,anull,unparseable"

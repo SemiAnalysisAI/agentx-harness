@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 from aiperf.common.enums import MediaType
+from aiperf.common.environment import Environment
 from aiperf.common.mixins import AIPerfLoggerMixin
 from aiperf.common.models import (
     BaseResponseData,
@@ -85,6 +86,14 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         record._parsed_responses_cache = parsed_responses
         return parsed_responses
 
+    def extract_response_id(self, record: RequestRecord) -> str | None:
+        """Extract server-generated response ID for stateful session chaining.
+
+        Default returns None (stateless). Subclasses implementing stateful protocols
+        (e.g. ResponsesEndpoint) override this.
+        """
+        return None
+
     def process_responses(
         self,
         record: RequestRecord,
@@ -106,30 +115,48 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
 
     @staticmethod
     def extract_spec_decode_stats(json_obj: dict[str, Any]) -> dict[str, Any] | None:
-        """Capture the raw ``choices[0]`` speculative-decoding payload, if any.
+        """Capture the raw speculative-decoding payload, wherever the engine put it.
 
-        vLLM attaches ``speculative_decoding_stats`` per choice (the finish-reason
-        chunk in streaming). Captured verbatim and uninterpreted so a
-        ``SpecDecodeAdapterProtocol`` owns the engine-specific interpretation
-        downstream; None when absent.
+        Two placements are recognized, because the engines genuinely differ:
+
+        - **Response root** ``metrics.speculative_decoding`` (vLLM), on the body
+          non-streaming or on the trailing usage chunk (empty ``choices``)
+          streaming, when the server runs with
+          ``--per-request-spec-decode-metrics``.
+        - **Per choice** ``choices[0].speculative_decoding`` (TensorRT-LLM), on
+          the body non-streaming or on the terminal chunk's choice (the one
+          carrying ``finish_reason``) streaming, when the server sets
+          ``per_request_spec_decode_stats``.
+
+        Root wins when both somehow appear. Captured verbatim and uninterpreted
+        so a ``SpecDecodeAdapterProtocol`` owns the engine-specific
+        interpretation downstream; None when absent.
 
         A response with more than one choice is an ``n > 1`` non-streaming
-        request; its record is suppressed (None) because a single per-request
-        record can't attribute request-level usage to one sequence -- reporting
-        one choice's acceptance alongside all choices' token count would be a
-        mixed, misleading record. (``n > 1`` streaming is suppressed in the
-        parser, where each sequence's stats arrive on separate chunks.)
+        request; its per-choice payload is suppressed because a single
+        per-request record cannot attribute request-level usage to one sequence
+        -- reporting one choice's acceptance alongside all choices' token count
+        would be a mixed, misleading record. (``n > 1`` streaming is suppressed
+        in the parser from the request's own ``n``, since each sequence's stats
+        arrive on separate chunks and a sequence that never drafted sends none.)
+        The root placement needs no such guard: vLLM populates it only for
+        single-sequence requests, leaving it ``null`` otherwise.
         """
+        metrics = json_obj.get("metrics")
+        if isinstance(metrics, dict):
+            stats = metrics.get("speculative_decoding")
+            if isinstance(stats, dict):
+                return stats
+
         choices = json_obj.get("choices")
         if (
             not isinstance(choices, list)
-            or not choices
+            or len(choices) != 1
             or not isinstance(choices[0], dict)
         ):
             return None
-        if len(choices) > 1:
-            return None
-        return choices[0].get("speculative_decoding_stats")
+        stats = choices[0].get("speculative_decoding")
+        return stats if isinstance(stats, dict) else None
 
     def build_assistant_turn(self, record: RequestRecord) -> Turn | None:
         """Build a Turn representing the assistant response for context replay.
@@ -316,7 +343,8 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         part type names (e.g. ``text`` -> ``input_text`` for Responses API).
         """
         if (
-            len(turn.texts) == 1
+            not Environment.ENDPOINT.FORCE_CONTENT_PARTS
+            and len(turn.texts) == 1
             and len(turn.texts[0].contents) == 1
             and not turn.images
             and not turn.audios
@@ -435,18 +463,27 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         """Make a TextResponseData object from a string or return None if the text is empty."""
         return TextResponseData(text=text) if text else None
 
-    def auto_detect_and_extract(self, json_obj: dict) -> BaseResponseData | None:
+    def auto_detect_and_extract(self, json_obj: Any) -> BaseResponseData | None:
         """Optional utility: Auto-detect response type and extract relevant data.
 
         Tries to extract data in this order: embeddings, rankings, text.
         Endpoints can use this as a fallback or for flexible response handling.
 
+        A JSON body is not necessarily an object: a top-level array (e.g. a
+        reranker returning ``[{"index": 0, "score": 0.98}, ...]``) is valid
+        JSON and reaches this method as a ``list``. Such values are routed
+        through ``convert_to_response_data`` instead of the ``dict``-only
+        probes below, which would raise ``AttributeError``.
+
         Args:
-            json_obj: JSON response object
+            json_obj: JSON response body
 
         Returns:
             Typed response data object or None if not found
         """
+        if not isinstance(json_obj, dict):
+            return self.convert_to_response_data(json_obj)
+
         if data := self.try_extract_embeddings(json_obj):
             return data
 

@@ -803,13 +803,12 @@ class WekaTraceLoader(HashIdsPromptSynthesisMixin, BaseFileLoader):
         )
         # Only synthetic datasets carry prompts.block_size; FileDataset (the
         # weka home) has none, so the user override is None and the precedence
-        # collapses to trace-declared > 64.
+        # collapses to trace-declared > 64. ``default_block_size`` (plugin
+        # metadata) is not an override: every weka trace declares its own.
         prompts = getattr(dataset, "prompts", None)
         user_block_size = getattr(prompts, "block_size", None) if prompts else None
         if user_block_size is not None:
             self._user_block_size_override: int | None = user_block_size
-        elif default_block_size is not None:
-            self._user_block_size_override = default_block_size
         else:
             self._user_block_size_override = None
         # ``self._block_size`` is preserved for callbacks (``_decode_block_tokens``
@@ -990,7 +989,6 @@ class WekaTraceLoader(HashIdsPromptSynthesisMixin, BaseFileLoader):
         max_context_length: int | None,
     ) -> dict[str, list[WekaTrace]]:
         """Filter by peak context, then keep the first N eligible traces."""
-        from aiperf.common.exceptions import DatasetLoaderError
         from aiperf.dataset.loader.selection import (
             filter_then_cap,
             log_selection_summary,
@@ -1018,11 +1016,13 @@ class WekaTraceLoader(HashIdsPromptSynthesisMixin, BaseFileLoader):
             max_context_length=max_context_length,
         )
         if not kept_pairs:
-            raise DatasetLoaderError(
-                f"All traces rejected by filter-then-cap "
-                f"(scanned {stats.scanned}, "
-                f"--max-context-length={max_context_length}, "
-                f"--num-dataset-entries={num_dataset_entries})."
+            from aiperf.dataset.loader.selection import raise_on_empty_selection
+
+            raise_on_empty_selection(
+                stats,
+                source="weka_trace",
+                num_dataset_entries=num_dataset_entries,
+                max_context_length=max_context_length,
             )
         return {trace_id: wekas for trace_id, wekas in kept_pairs}
 

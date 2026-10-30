@@ -237,6 +237,14 @@ class PhaseRunner(TaskManagerMixin):
         cap = getattr(dataset, "trace_idle_gap_cap_seconds", None)
         return float(cap) if isinstance(cap, int | float) else None
 
+    def _resolve_cache_bust_target(self) -> CacheBustTarget:
+        """Return the active cache-bust target, or NONE when no run is attached."""
+        return (
+            self._run.cfg.get_cache_bust_target()
+            if self._run is not None
+            else CacheBustTarget.NONE
+        )
+
     def _build_credit_issuer(
         self, url_selection_strategy: URLSelectionStrategyProtocol | None
     ) -> CreditIssuer:
@@ -262,6 +270,7 @@ class PhaseRunner(TaskManagerMixin):
                 or self._cache_warmup_enabled
             ),
             replay_barrier=self._replay_barrier,
+            cache_bust_target=self._resolve_cache_bust_target(),
         )
 
     def _maybe_construct_branch_orchestrator(
@@ -293,11 +302,7 @@ class PhaseRunner(TaskManagerMixin):
             return
         sticky_router = getattr(self._credit_router, "sticky_router", None)
         benchmark_id = self._run.benchmark_id if self._run is not None else "unknown"
-        cache_bust_target = (
-            self._run.cfg.get_cache_bust_target()
-            if self._run is not None
-            else CacheBustTarget.NONE
-        )
+        cache_bust_target = self._resolve_cache_bust_target()
         self._branch_orchestrator = BranchOrchestrator(
             conversation_source=conversation_source,
             credit_issuer=self._credit_issuer,
@@ -549,11 +554,13 @@ class PhaseRunner(TaskManagerMixin):
             return
         released = self._session_tree_registry.release_all(self._phase_key)
         self.info(
-            lambda: f"Session-tree slots for phase {self._config.phase}: "
-            f"peak_open={self._session_tree_registry.peak_open} "
-            f"(target concurrency {self._config.concurrency}); "
-            f"released {released} still-open at teardown; "
-            f"late_events={self._session_tree_registry.late_events}"
+            lambda: (
+                f"Session-tree slots for phase {self._config.phase}: "
+                f"peak_open={self._session_tree_registry.peak_open} "
+                f"(target concurrency {self._config.concurrency}); "
+                f"released {released} still-open at teardown; "
+                f"late_events={self._session_tree_registry.late_events}"
+            )
         )
 
     async def _run_strategy(
@@ -1015,6 +1022,7 @@ class PhaseRunner(TaskManagerMixin):
             self.error(
                 f"Error waiting for phase {self._config.phase} to send all credits: {e!r}"
             )
+            raise
         finally:
             preserve_branch_handoff = self._preserve_replay_gate_until_finalize(
                 strategy
@@ -1193,7 +1201,10 @@ class PhaseRunner(TaskManagerMixin):
             timeout: The timeout in seconds.
                 If None, the event will be waited for indefinitely.
                 If timeout is <= 0, returns immediately with timeout.
-            task_to_cancel: The optional task to cancel when the timeout occurs.
+            task_to_cancel: The optional task to cancel when the timeout occurs. When
+                timeout is None, this task is also raced against the event: if it
+                finishes first with an exception, that exception is raised instead
+                of waiting forever (see ``_wait_for_event_or_task_exception``).
             set_event_on_timeout: If True, the event will also be set when the timeout occurs.
 
         Returns:
@@ -1201,7 +1212,12 @@ class PhaseRunner(TaskManagerMixin):
         """
         if timeout is None:
             self.debug(lambda: f"Waiting for event '{name}' indefinitely")
-            await event.wait()
+            if task_to_cancel is None:
+                await event.wait()
+            else:
+                await self._wait_for_event_or_task_exception(
+                    event, task_to_cancel, name
+                )
             return False
 
         def _on_timeout() -> bool:
@@ -1228,6 +1244,36 @@ class PhaseRunner(TaskManagerMixin):
         except Exception as e:
             self.error(f"Error waiting for event '{name}' with timeout: {e!r}")
             raise
+
+    async def _wait_for_event_or_task_exception(
+        self, event: asyncio.Event, task: asyncio.Task, name: str
+    ) -> None:
+        """Wait for ``event``, but fail fast if ``task`` finishes first with an
+        exception, instead of waiting on it forever.
+
+        An indefinite wait (timeout=None, request-count phases) has no bound to
+        fall back on, and ``execute_async`` runs ``task`` fire-and-forget: its
+        done-callback only discards it from the task set, so an exception it
+        raises is otherwise never retrieved and the wait hangs forever (#1041).
+        """
+        event_task = asyncio.ensure_future(event.wait())
+        try:
+            await asyncio.wait({event_task, task}, return_when=asyncio.FIRST_COMPLETED)
+            # A failure wins over a same-tick event completion; FIRST_COMPLETED
+            # only guarantees one of the two is done, so task.done() is checked
+            # explicitly rather than assumed from event_task's state.
+            if (
+                task.done()
+                and not task.cancelled()
+                and (exc := task.exception()) is not None
+            ):
+                raise exc
+            if event_task.done():
+                return
+            await event_task
+        finally:
+            if not event_task.done():
+                event_task.cancel()
 
     async def _progress_report_loop(self) -> None:
         """Publish phase progress stats at regular intervals.

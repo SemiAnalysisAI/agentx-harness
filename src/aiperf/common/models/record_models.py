@@ -212,8 +212,11 @@ class MetricRecordMetadata(AIPerfBaseModel):
     source_kind: str | None = Field(
         default=None,
         description=(
-            "Loader-specific source classification for this request, when "
-            "provided by the dataset loader."
+            "Loader-specific label for the request's origin, when provided by "
+            "the dataset loader: the Weka reconstruction kind (weka_main, "
+            "weka_flat) or the SPEED-Bench row's benchmark category (coding, "
+            "math, low_entropy). Lets a consumer group records by their source "
+            "without re-reading the input dataset."
         ),
     )
     credit_issued_ns: int | None = Field(
@@ -450,7 +453,7 @@ class ProfileResults(AIPerfBaseModel):
     """The results of a profile run."""
 
     records: list[MetricResult] | None = Field(
-        ..., description="The records of the profile results"
+        default=None, description="The records of the profile results"
     )
     warmup_records: list[MetricResult] | None = Field(
         default=None,
@@ -918,8 +921,11 @@ class RecordContext(AIPerfBaseModel):
     source_kind: str | None = Field(
         default=None,
         description=(
-            "Loader-specific source classification for this request, when "
-            "provided by the dataset loader."
+            "Loader-specific label for the request's origin, when provided by "
+            "the dataset loader: the Weka reconstruction kind (weka_main, "
+            "weka_flat) or the SPEED-Bench row's benchmark category (coding, "
+            "math, low_entropy). Lets a consumer group records by their source "
+            "without re-reading the input dataset."
         ),
     )
     x_request_id: str = Field(
@@ -1073,6 +1079,11 @@ class RequestInfo(RecordContext):
         ge=0,
         description="Index of the URL to use when multiple --url values are configured. "
         "None means use the default (first) URL. Used for round-robin load balancing.",
+    )
+    previous_response_id: str | None = Field(
+        default=None,
+        description="Response ID from the previous turn (e.g. 'resp_<hash>') "
+        "used for stateful chaining in the Responses API.",
     )
 
 
@@ -1437,6 +1448,29 @@ def find_last_non_empty_usage(responses: list[ParsedResponse]) -> Usage | None:
     return None
 
 
+def first_content_chunk_completion_tokens(
+    responses: list[ParsedResponse],
+) -> int | None:
+    """Return the cumulative ``completion_tokens`` reported on the first content
+    chunk (the chunk whose arrival defines TTFT).
+
+    Requires per-chunk (``continuous_usage_stats``) usage: it walks forward to the
+    first response carrying content (``data`` is not None) and reads its usage's
+    ``completion_tokens``. This is deliberately the raw completion count
+    (reasoning included), matching ``OutputSequenceLengthMetric`` -- OSL is
+    ``output + reasoning`` = ``completion_tokens`` -- so inter-token latency
+    subtracts operands in the same unit. Because per-chunk usage is cumulative,
+    that value is the number of tokens delivered through the first content chunk.
+    Returns ``None`` when no content chunk carries usage (e.g. the server only
+    reports the final total), so callers fall back to assuming one token in the
+    first chunk.
+    """
+    for response in responses:
+        if response.data and response.usage:
+            return response.usage.completion_tokens
+    return None
+
+
 @dataclass(slots=True)
 class ParsedResponse:
     """Parsed response from a inference client."""
@@ -1477,8 +1511,8 @@ class ParsedResponse:
     """Additional metadata from the response useful for analysis (rate limits, content filters, etc.)."""
 
     spec_decode_stats: dict[str, Any] | None = None
-    """Raw per-choice speculative-decoding payload captured from the wire (e.g.
-    vLLM's ``choices[].speculative_decoding_stats``), or None when absent. Left
+    """Raw speculative-decoding payload captured from the response root (e.g.
+    vLLM's ``metrics.speculative_decoding``), or None when absent. Left
     uninterpreted here; a ``SpecDecodeAdapterProtocol`` converts it into the
     engine-neutral ``SpecDecodeAcceptanceRecord`` at record-assembly time."""
 
@@ -1501,6 +1535,16 @@ class TokenCounts:
 
     reasoning: int | None = None
     """The number of reasoning tokens. None if token count could not be calculated or the model does not support reasoning."""
+
+    first_content_chunk_tokens: int | None = None
+    """The number of tokens delivered in the first content chunk -- the chunk whose
+    arrival defines TTFT -- taken from the server's per-chunk usage (cumulative
+    ``completion_tokens`` at that chunk). Inter-token latency subtracts this from the
+    decode-token count rather than assuming exactly one token arrived first, which
+    corrects the TPS/user inflation a server produces when it bundles multiple tokens
+    into the first streamed chunk (e.g. TRT-LLM ``stream-interval``). ``None`` unless
+    ``--per-chunk-usage`` is set and the server reports per-chunk usage; inter-token
+    latency then falls back to assuming one token in the first chunk."""
 
 
 @dataclass(slots=True)
@@ -1547,9 +1591,16 @@ class ParsedResponseRecord:
     """Engine-neutral per-request speculative-decoding acceptance record, filled
     by a ``SpecDecodeAdapterProtocol`` when the response carried spec-decode
     stats. ``None`` when: spec decode is off or the request had no verify steps
-    (no payload); the request produced multiple sequences (``n > 1``, which is
-    suppressed); no registered adapter recognized the payload; or the payload
-    was malformed and the adapter rejected it."""
+    (no payload, or a zero-step payload the parser drops); the request produced
+    multiple sequences (``n > 1``, which is suppressed); no registered adapter
+    recognized the payload; or the payload was malformed and the adapter
+    rejected it."""
+
+    spec_decode_zero_step: bool = False
+    """True when the engine reported spec-decode stats for this request but it
+    ran no verify step (``num_spec_steps == 0``). Its record is dropped, so
+    ``spec_decode_acceptance`` is None; this flag lets the run count such
+    requests separately from runs where spec decode is off."""
 
     @cached_property
     def final_usage(self) -> Usage | None:

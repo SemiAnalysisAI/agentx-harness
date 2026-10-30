@@ -62,7 +62,7 @@ Run an AIPerf service in a single process.
 
 ### [`speed-bench-report`](#aiperf-speed-bench-report)
 
-Assemble per-category SPEED-Bench aiperf results into a matrix report.
+Assemble SPEED-Bench aiperf results into a matrix report.
 
 ### [`synthesize`](#aiperf-synthesize)
 
@@ -348,7 +348,7 @@ Set a custom API endpoint path (e.g., `/v1/custom`, `/my-api/chat`). By default,
 #### `--endpoint-type` `<str>`
 
 The API endpoint type to benchmark. Determines request/response format and supported features. Common types: `chat` (multi-modal conversations), `embeddings` (vector generation), `completions` (text completion). See enum documentation for all supported endpoint types.
-<br/>_Choices: [`chat`, `cohere_rankings`, `completions`, `responses`, `messages`, `chat_embeddings`, `embeddings`, `hf_tei_rankings`, `huggingface_generate`, `image_generation`, `image_edit`, `video_generation`, `image_retrieval`, `nim_embeddings`, `nim_rankings`, `solido_rag`, `raw`, `template`]_
+<br/>_Choices: [`audio_transcription`, `chat`, `cohere_rankings`, `completions`, `responses`, `messages`, `chat_embeddings`, `embeddings`, `hf_tei_rankings`, `huggingface_generate`, `image_generation`, `image_edit`, `video_generation`, `image_retrieval`, `nim_embeddings`, `nim_rankings`, `solido_rag`, `raw`, `template`]_
 <br/>_Default: `chat`_
 
 #### `--streaming`
@@ -408,6 +408,11 @@ Use the legacy 'max_tokens' field instead of 'max_completion_tokens' in request 
 #### `--use-server-token-count`
 
 Use server-reported token counts from API usage fields instead of client-side tokenization. When enabled, tokenizers are still loaded (needed for dataset generation) but tokenizer.encode() is not called for computing metrics. Token count fields will be None if the server does not provide usage information. For OpenAI-compatible streaming endpoints (chat/completions), stream_options.include_usage is automatically configured when this flag is enabled.
+<br/>_Flag (no value required)_
+
+#### `--per-chunk-usage`
+
+Request per-chunk token usage on streaming responses by setting stream_options.continuous_usage_stats, so the server reports cumulative usage on every chunk instead of only the final one. This lets inter-token latency subtract the first content chunk's real token count (fixing TPS/user inflation when a server bundles multiple tokens into the first streamed chunk). Requires a server that supports continuous_usage_stats (e.g. vLLM, TRT-LLM); strict OpenAI rejects it. Requires --use-server-token-count.
 <br/>_Flag (no value required)_
 
 #### `--connection-reuse-strategy` `<str>`
@@ -485,7 +490,7 @@ Path to file or directory containing benchmark dataset. Required when using `--c
 #### `--public-dataset` `<str>`
 
 Pre-configured public dataset to download and use for benchmarking (e.g., `sharegpt`). AIPerf automatically downloads and parses these datasets. Mutually exclusive with `--custom-dataset-type`. Run `aiperf plugins public_dataset_loader` to list available datasets. Use `--hf-subset` to override the HuggingFace subset/config for HF-backed datasets.
-<br/>_Choices: [`exgentic_v2`, `exgentic`, `sharegpt`, `aimo`, `mmstar`, `mmvu`, `vision_arena`, `llava_onevision`, `aimo_aime`, `aimo_numina_cot`, `aimo_numina_1_5`, `spec_bench`, `spec_al_gsm8k`, `spec_al_math500`, `spec_al_humaneval`, `spec_al_mbpp`, `spec_al_mtbench`, `instruct_coder`, `blazedit_5k`, `blazedit_10k`, `librispeech`, `voxpopuli`, `gigaspeech`, `ami`, `spgispeech`, `semianalysis_cc_traces_weka`, `semianalysis_cc_traces_weka_no_subagents`, `semianalysis_cc_traces_weka_with_subagents`, `semianalysis_cc_traces_weka_with_subagents_256k`, `semianalysis_cc_traces_weka_with_subagents_060226`, `semianalysis_cc_traces_weka_with_subagents_060226_256k`, `semianalysis_cc_traces_weka_with_subagents_060526`, `semianalysis_cc_traces_weka_with_subagents_060526_256k`, `semianalysis_cc_traces_weka_with_subagents_060826`, `semianalysis_cc_traces_weka_with_subagents_060826_256k`, `semianalysis_cc_traces_weka_061326`, `semianalysis_cc_traces_weka_061326_256k`, `semianalysis_cc_traces_weka_061526`, `semianalysis_cc_traces_weka_061526_256k`, `semianalysis_cc_traces_weka_062126`, `semianalysis_cc_traces_weka_062126_256k`, `weka_hf`]_
+<br/>_Choices: [`exgentic_v2`, `exgentic`, `sharegpt`, `aimo`, `mmstar`, `mmvu`, `vision_arena`, `llava_onevision`, `aimo_aime`, `aimo_numina_cot`, `aimo_numina_1_5`, `spec_bench`, `spec_al_gsm8k`, `spec_al_math500`, `spec_al_humaneval`, `spec_al_mbpp`, `spec_al_mtbench`, `instruct_coder`, `blazedit_5k`, `blazedit_10k`, `librispeech`, `voxpopuli`, `gigaspeech`, `ami`, `spgispeech`, `semianalysis_cc_traces_weka`, `semianalysis_cc_traces_weka_no_subagents`, `semianalysis_cc_traces_weka_with_subagents`, `semianalysis_cc_traces_weka_with_subagents_256k`, `semianalysis_cc_traces_weka_with_subagents_060226`, `semianalysis_cc_traces_weka_with_subagents_060226_256k`, `semianalysis_cc_traces_weka_with_subagents_060526`, `semianalysis_cc_traces_weka_with_subagents_060526_256k`, `semianalysis_cc_traces_weka_with_subagents_060826`, `semianalysis_cc_traces_weka_with_subagents_060826_256k`, `semianalysis_cc_traces_weka_061326`, `semianalysis_cc_traces_weka_061326_256k`, `semianalysis_cc_traces_weka_061526`, `semianalysis_cc_traces_weka_061526_256k`, `semianalysis_cc_traces_weka_062126`, `semianalysis_cc_traces_weka_062126_256k`, `weka_hf`, `speed_bench_qualitative`, `speed_bench_coding`, `speed_bench_humanities`, `speed_bench_math`, `speed_bench_multilingual`, `speed_bench_qa`, `speed_bench_rag`, `speed_bench_reasoning`, `speed_bench_roleplay`, `speed_bench_stem`, `speed_bench_summarization`, `speed_bench_writing`, `speed_bench_throughput_1k`, `speed_bench_throughput_1k_low_entropy`, `speed_bench_throughput_1k_mixed`, `speed_bench_throughput_1k_high_entropy`, `speed_bench_throughput_2k`, `speed_bench_throughput_2k_low_entropy`, `speed_bench_throughput_2k_mixed`, `speed_bench_throughput_2k_high_entropy`, `speed_bench_throughput_8k`, `speed_bench_throughput_8k_low_entropy`, `speed_bench_throughput_8k_mixed`, `speed_bench_throughput_8k_high_entropy`, `speed_bench_throughput_16k`, `speed_bench_throughput_16k_low_entropy`, `speed_bench_throughput_16k_mixed`, `speed_bench_throughput_16k_high_entropy`, `speed_bench_throughput_32k`, `speed_bench_throughput_32k_low_entropy`, `speed_bench_throughput_32k_mixed`, `speed_bench_throughput_32k_high_entropy`, `h_cua_perf`]_
 
 #### `--hf-subset` `<str>`
 
@@ -501,8 +506,8 @@ Dataset-specific filter in key=value form. Repeat for multiple filters. Only sup
 
 #### `--custom-dataset-type` `<str>`
 
-Format specification for custom dataset provided via `--input-file`. Determines parsing logic and expected file structure. Options: `single_turn` (JSONL with single exchanges), `multi_turn` (JSONL with conversation history), `mooncake_trace`/`bailian_trace`/`baseten_trace` (timestamped trace files), `random_pool` (directory of reusable prompts; when using `random_pool`, `--conversation-num` defaults to 100 if not specified; batch sizes > 1 sample each modality independently from a flat pool and do not preserve per-entry associations - use `single_turn` if paired modalities must stay together). Requires `--input-file`. Mutually exclusive with `--public-dataset`.
-<br/>_Choices: [`burst_gpt_trace`, `bailian_trace`, `baseten_trace`, `mooncake_trace`, `raw_payload`, `inputs_json`, `dag_jsonl`, `sagemaker_data_capture`, `multi_turn`, `random_pool`, `single_turn`, `speed_bench_qualitative`, `speed_bench_coding`, `speed_bench_humanities`, `speed_bench_math`, `speed_bench_multilingual`, `speed_bench_qa`, `speed_bench_rag`, `speed_bench_reasoning`, `speed_bench_roleplay`, `speed_bench_stem`, `speed_bench_summarization`, `speed_bench_writing`, `speed_bench_throughput_1k`, `speed_bench_throughput_2k`, `speed_bench_throughput_8k`, `speed_bench_throughput_16k`, `speed_bench_throughput_32k`, `speed_bench_throughput_1k_low_entropy`, `speed_bench_throughput_1k_mixed`, `speed_bench_throughput_1k_high_entropy`, `speed_bench_throughput_2k_low_entropy`, `speed_bench_throughput_2k_mixed`, `speed_bench_throughput_2k_high_entropy`, `speed_bench_throughput_8k_low_entropy`, `speed_bench_throughput_8k_mixed`, `speed_bench_throughput_8k_high_entropy`, `speed_bench_throughput_16k_low_entropy`, `speed_bench_throughput_16k_mixed`, `speed_bench_throughput_16k_high_entropy`, `speed_bench_throughput_32k_low_entropy`, `speed_bench_throughput_32k_mixed`, `speed_bench_throughput_32k_high_entropy`, `weka_trace`]_
+Format specification for custom dataset provided via `--input-file`. Determines parsing logic and expected file structure. Options: `single_turn` (JSONL with single exchanges), `multi_turn` (JSONL with conversation history), `tracelab` (TraceLab agentic-coding corpus, JSONL or gzipped JSONL), `mooncake_trace`/`bailian_trace`/`baseten_trace` (timestamped trace files), `random_pool` (directory of reusable prompts; when using `random_pool`, `--conversation-num` defaults to 100 if not specified; batch sizes > 1 sample each modality independently from a flat pool and do not preserve per-entry associations - use `single_turn` if paired modalities must stay together). Requires `--input-file`. Mutually exclusive with `--public-dataset`.
+<br/>_Choices: [`burst_gpt_trace`, `bailian_trace`, `baseten_trace`, `mooncake_trace`, `h_cua_perf`, `raw_payload`, `inputs_json`, `dag_jsonl`, `sagemaker_data_capture`, `multi_turn`, `random_pool`, `single_turn`, `speed_bench_qualitative`, `speed_bench_throughput_1k`, `speed_bench_throughput_2k`, `speed_bench_throughput_8k`, `speed_bench_throughput_16k`, `speed_bench_throughput_32k`, `tracelab`, `weka_trace`]_
 
 #### `--ignore-trace-delays`
 
@@ -540,7 +545,7 @@ Fraction of trace sessions to keep for replay, sampled whole-session to preserve
 
 #### `-f`, `--config` `<str>`
 
-Path to a YAML configuration file. CLI flags override values from the config file.
+Path to a YAML configuration file. CLI flags override values from the config file. A flag that cannot be applied on top of a config file is rejected by name rather than ignored, so a run never silently differs from what was asked for.
 
 ### Fixed Schedule
 
@@ -668,16 +673,25 @@ Source corpus for synthetic prompt text generation. 'sonnet' uses Shakespeare so
 |-------|:-------:|-------------|
 | `sonnet` |  | Shakespeare sonnets (default). Classic prose for filler text. |
 | `coding` |  | Realistic coding content: code, bash output, JSON, error tracebacks, git diffs. |
+| `random` |  | Random tokens drawn from the full tokenizer vocabulary minus special tokens. Matches vLLM bench's RandomDataset token-generation strategy. |
 
 ### Cache Bust
 
 #### `--cache-bust` `<str>`
 
-Where (and how) to inject a per-conversation cache-bust marker. Prefix variants prepend at token 0 (most aggressive); suffix variants append after existing content. 'none' disables the feature (default).
-<br/>_Choices: [`none`, `system_prefix`, `system_suffix`, `first_turn_prefix`, `first_turn_suffix`]_
+Where (and how) to inject a cache-bust marker. Two families: (1) RID targets (system_prefix, system_suffix, first_turn_prefix, first_turn_suffix) — inject a per-trajectory unique SHA-256 digest marker that is identical across warmup and profiling, so warmup KV-cache work transfers to profiling while preventing cross-trajectory cache sharing. Prefix variants prepend at token 0; suffix variants append after existing content. (2) Warmup-isolation targets (warmup_isolation_system, warmup_isolation_first_turn) — inject a constant '[warmup]' marker only during the WARMUP phase; profiling sees no marker (fully cold start or system-pre-warmed). Incompatible with agentic_replay timing mode. 'none' disables the feature (default). See [cache-bust.md](reference/cache-bust.md) for detailed semantics, trade-offs, and examples.
+<br/>_Choices: [`none`, `system_prefix`, `system_suffix`, `first_turn_prefix`, `first_turn_suffix`, `warmup_isolation_system`, `warmup_isolation_first_turn`]_
 <br/>_Default: `none`_
 
 ### Prefix Prompt
+
+#### `--system-prompt` `<str>`
+
+Verbatim system prompt text, identical across every conversation. Sent as a system-role message ahead of all turns. Works with both synthetic and file/public datasets; when the dataset already carries its own system message, this text is prepended to it. Tokens are additive: `--isl` continues to size the generated user prompt only. Mutually exclusive with `--system-prompt-file`, `--shared-system-prompt-length`, and `--num-prefix-prompts`/`--prefix-prompt-length`.
+
+#### `--system-prompt-file` `<str>`
+
+Path to a UTF-8 text file holding the verbatim system prompt. Preferred over `--system-prompt` for real production prompts, which are long enough that shell quoting mangles them. Read once at startup, so a missing or unreadable file fails immediately rather than mid-run. Mutually exclusive with `--system-prompt`, `--shared-system-prompt-length`, and `--num-prefix-prompts`/`--prefix-prompt-length`.
 
 #### `--prompt-prefix-pool-size`, `--prefix-prompt-pool-size`, `--num-prefix-prompts` `<int>`
 
@@ -721,6 +735,21 @@ Token block size for hash-based prompt synthesis when dataset entries carry `has
 #### `--seq-dist`, `--sequence-distribution` `<str>`
 
 Distribution of (ISL, OSL) pairs with probabilities for mixed workload simulation. Format: `ISL,OSL:prob;ISL,OSL:prob` (semicolons separate pairs, probabilities are percentages 0-100 that must sum to 100). Supports optional stddev: `ISL|stddev,OSL|stddev:prob`. Examples: `128,64:25;512,128:50;1024,256:25` or with variance: `256|10,128|5:40;512|20,256|10:60`. Also supports bracket `[(256,128):40,(512,256):60]` and JSON formats.
+
+#### `--random-range-ratio` `<str>`
+
+Sample ISL and OSL uniformly from a ratio-defined integer window around the configured means. The window is computed from `--random-corpus-style` (defaults to `vllm`): vllm style → `[floor(mean*(1-r)), ceil(mean*(1+r))]` (symmetric); sglang style → `[max(1, int(mean*r)), mean]` (lower-bounded). Accepts a single float applied to both ISL and OSL. The JSON object form `{"input": 0.3, "output": 0.5}` for independent values is accepted only under vllm style; sglang style applies one ratio to both and requires a plain float. Requires both `--isl` and `--osl` to be set explicitly — there is no default mean for either. Mutually exclusive with `--seq-dist`. Under vllm style with a tokenizer configured, the ISL mean is automatically reduced by `tokenizer.num_special_tokens_to_add(pair=False)` so `--isl` represents total server-side input tokens, matching `vllm bench serve` semantics; sglang style applies no such adjustment.
+
+#### `--random-corpus-style` `<str>`
+
+Benchmark style for RANDOM corpus generation. Controls range ratio formula, token pool composition, and other per-tool behaviors. `vllm` (default) mirrors `vllm bench serve`: symmetric range window, non-special token pool (special tokens excluded). `sglang` mirrors `sglang.benchmark.serving` run with `--dataset-name random-ids`: lower-bounded range window, full `range(vocab_size)` token pool (no exclusion). Applies in two independent places: token-pool selection whenever `--prompt-corpus random` is set (including with no `--random-range-ratio`, where the pool is the only thing the style selects), and the range-window formula, special-token accounting and RNG algorithm whenever `--random-range-ratio` is set — the latter regardless of corpus.
+
+**Choices:**
+
+| | | |
+|-------|:-------:|-------------|
+| `vllm` | _default_ | vllm bench serve semantics: symmetric window ``[floor(mean*(1-r)), ceil(mean*(1+r))]``. r=0 is fixed at mean; larger r widens the window on both sides. r must be in [0, 1). Special tokens excluded from the sampling pool. BOS subtracted from ISL mean. |
+| `sglang` |  | sglang ``benchmark.serving`` semantics under ``--dataset-name random-ids``: lower-bounded window ``[max(1, int(mean*r)), mean]``. r=0 allows full variability [1, mean]; r=1 fixes length at mean. Full vocab_size range used for token sampling (no special-token exclusion). No BOS adjustment. The default ``--dataset-name random`` is a different algorithm upstream (repeat/truncate ShareGPT token ids) and is not what this style mirrors. |
 
 ### Output Sequence Length (OSL)
 
@@ -887,7 +916,7 @@ Algorithm for generating synthetic video content. Different types produce differ
 
 #### `--video-format` `<str>`
 
-Container format for generated video files. Supports `webm` (VP9, recommended, BSD-licensed) and `mp4` (H.264/H.265, widely compatible). Format choice affects compatibility, file size, and encoding options. Use `webm` for open-source workflows, `mp4` for maximum compatibility.
+Container format for generated video files. Supports `webm` (VP9, recommended, BSD-licensed) and `mp4` (widely compatible container, VP9 by default). Format choice affects compatibility, file size, and encoding options. `mp4` is the more portable container, but note that the default VP9 video and Opus audio are less widely supported by players than H.264/AAC would be.
 
 **Choices:**
 
@@ -898,7 +927,7 @@ Container format for generated video files. Supports `webm` (VP9, recommended, B
 
 #### `--video-codec` `<str>`
 
-The video codec to use for encoding. Common options: libvpx-vp9 (CPU, BSD-licensed, default for WebM), libx264 (CPU, GPL-licensed, widely compatible), libx265 (CPU, GPL-licensed, smaller files), h264_nvenc (NVIDIA GPU), hevc_nvenc (NVIDIA GPU, smaller files). Any FFmpeg-supported codec can be used.
+The video codec to use for encoding. Common options: libvpx-vp9 (CPU, BSD-licensed, default), libvpx (CPU, BSD-licensed, VP8). Any codec the local FFmpeg supports can be used, but the AIPerf container ships a minimal FFmpeg build limited to VP8/VP9 video with Vorbis/Opus audio; codecs such as libx264 or h264_nvenc require an FFmpeg build that includes them.
 <br/>_Default: `libvpx-vp9`_
 
 #### `--video-audio-sample-rate` `<float>`
@@ -915,15 +944,15 @@ Number of audio channels to embed in generated video files. 0 = disabled (no aud
 
 #### `--video-audio-codec` `<str>`
 
-Audio codec for the embedded audio track. If not specified, auto-selects based on video format: aac for MP4, libvorbis for WebM. Options: aac, libvorbis, libopus.
+Audio codec for the embedded audio track. If not specified, auto-selects based on video format: libopus for MP4, libvorbis for WebM. Options: libvorbis, libopus, aac. The AIPerf container ships only libvorbis and libopus; aac requires an FFmpeg build that includes an AAC encoder. libopus always encodes at 48 kHz, so any --video-audio-sample-rate is resampled during muxing.
 
 **Choices:**
 
 | | | |
 |-------|:-------:|-------------|
-| `aac` |  | AAC codec. Default for MP4 containers. |
+| `aac` |  | AAC codec. Not built into the AIPerf container's FFmpeg; selecting it requires an FFmpeg build that includes an AAC encoder. |
 | `libvorbis` |  | Vorbis codec. Default for WebM containers. |
-| `libopus` |  | Opus codec. Alternative for WebM containers. |
+| `libopus` |  | Opus codec. Default for MP4 containers. Always encodes at 48 kHz regardless of the requested sample rate. |
 
 #### `--video-audio-depth` `<str>`
 
@@ -1215,11 +1244,11 @@ Output directory for all benchmark artifacts including metrics (`.csv`, `.json`,
 
 #### `--profile-export-prefix`, `--profile-export-file` `<str>`
 
-Base filename for ALL exported files. With prefix='foo' every output becomes `foo.csv`, `foo.json`, `foo_timeslices.{csv,json}`, `foo.jsonl`, `foo_raw.jsonl`, `foo_gpu_telemetry.jsonl`, and `foo_server_metrics.{jsonl,json,csv,parquet}`. When unset (the default), historical per-file names are used: `profile_export_aiperf.{csv,json}` for the summary, `profile_export.jsonl` and `profile_export_raw.jsonl` for records, `gpu_telemetry_export.jsonl`, and `server_metrics_export.*`. Known suffixes (e.g. `_raw.jsonl`, `_timeslices.csv`, `_server_metrics.parquet`) are stripped from the supplied value.
+Base filename for ALL exported files. With prefix='foo' every output becomes `foo.csv`, `foo.json`, `foo_timeslices.{csv,json}`, `foo.jsonl`, `foo_raw.jsonl`, `foo_outputs.json`, `foo_gpu_telemetry.jsonl`, and `foo_server_metrics.{jsonl,json,csv,parquet}`. When unset (the default), historical per-file names are used: `profile_export_aiperf.{csv,json}` for the summary, `profile_export.jsonl` and `profile_export_raw.jsonl` for records, `outputs.json`, `gpu_telemetry_export.jsonl`, and `server_metrics_export.*`. Known suffixes (e.g. `_raw.jsonl`, `_outputs.json`, `_timeslices.csv`, `_server_metrics.parquet`) are stripped from the supplied value.
 
 #### `--export-level`, `--profile-export-level` `<str>`
 
-Controls which output files are generated. `summary`: Only aggregate metrics files (`.csv`, `.json`). `records`: Includes per-request metrics (`.jsonl`). `raw`: Includes raw request/response data (`_raw.jsonl`).
+Controls which output files are generated. `summary`: Only aggregate metrics files (`.csv`, `.json`). `records`: Includes per-request metrics (`.jsonl`). `raw`: Includes raw request/response data (`_raw.jsonl`) and, unless `--no-export-outputs-json` is passed, the generated text (`_outputs.json`).
 
 **Choices:**
 
@@ -1243,10 +1272,9 @@ Auto-invoke `aiperf plot` against the artifact directory after the benchmark com
 Treat auto-plot failures as fatal: re-raise so `aiperf profile` exits non-zero. Only meaningful when auto-plot is on. Default False = warn and continue.
 <br/>_Flag (no value required)_
 
-#### `--export-outputs-json`
+#### `--export-outputs-json`, `--no-export-outputs-json`
 
-Export generated response text to outputs.json after the run. When enabled, the raw generated-text payload for each request is written to an outputs.json file in the artifact directory.
-<br/>_Flag (no value required)_
+Export generated response text after the run. When enabled, the raw generated-text payload for each request is written to `outputs.json` in the artifact directory, or to `<prefix>_outputs.json` when `--profile-export-prefix` is set (prefix `foo` gives `foo_outputs.json`). Implied by `--export-level raw`; pass `--no-export-outputs-json` to opt out of the extra file while keeping raw export.
 
 #### `--otel-url` `<str>`
 
@@ -1516,7 +1544,7 @@ Repeatable: each occurrence describes one sweep variation. Format: '[name:] key=
 
 #### `--search-sla` `<list>`
 
-SLA filter to attach to the adaptive-search or grid path. Format: 'metric_tag:stat:op:threshold'. Stat in {avg, min, max, p1, p5, p10, p25, p50, p75, p90, p95, p99}; op in {lt, le, gt, ge}; threshold is a float. Repeatable. Example: --search-sla 'time_to_first_token:p95:lt:200' --search-sla 'request_error_rate:p99:lt:0.05'. Composes with recipe-named SLA flags (--ttft-sla-ms etc.); the final filter list is recipe filters first, then --search-sla filters in CLI order.
+SLA filter to attach to the adaptive-search or grid path. Format: 'metric_tag:stat:op:threshold'. Stat in {avg, min, max, p1, p5, p10, p25, p50, p75, p90, p95, p99}; op in {lt, le, gt, ge}; threshold is a float in the metric's native unit. For request_error_rate, 1 means 1% (percentage points), unlike --error-rate-sla, which accepts a fraction. Repeatable. Example: --search-sla 'time_to_first_token:p95:lt:200' --search-sla 'request_error_rate:avg:lt:1'. Composes with recipe-named SLA flags (--ttft-sla-ms etc.); the final filter list is recipe filters first, then --search-sla filters in CLI order.
 
 #### `--search-sla-tier` `<list>`
 
@@ -1552,7 +1580,7 @@ End-to-end request-latency SLA threshold in milliseconds (p99). Maps to the `req
 
 #### `--error-rate-sla` `<float>`
 
-Maximum acceptable request error rate as a fraction in (0, 1) (e.g. 0.05 = 5%). Maps to the `request_error_rate` metric tag (p99). Consumed by the max-concurrency-under-sla recipe; ignored otherwise. Available without streaming.
+Maximum acceptable request error rate as a fraction in (0, 1) (e.g. 0.05 = 5%). Maps to the `request_error_rate` metric tag (avg), converting the fraction to the metric's percentage-point scale. Consumed by the max-concurrency-under-sla recipe; ignored otherwise. Available without streaming.
 <br/>_Constraints: > 0, &lt; 1_
 
 #### `--slo-attainment-fraction` `<float>`
@@ -1883,7 +1911,7 @@ Set a custom API endpoint path (e.g., `/v1/custom`, `/my-api/chat`). By default,
 #### `--endpoint-type` `<str>`
 
 The API endpoint type to benchmark. Determines request/response format and supported features. Common types: `chat` (multi-modal conversations), `embeddings` (vector generation), `completions` (text completion). See enum documentation for all supported endpoint types.
-<br/>_Choices: [`chat`, `cohere_rankings`, `completions`, `responses`, `messages`, `chat_embeddings`, `embeddings`, `hf_tei_rankings`, `huggingface_generate`, `image_generation`, `image_edit`, `video_generation`, `image_retrieval`, `nim_embeddings`, `nim_rankings`, `solido_rag`, `raw`, `template`]_
+<br/>_Choices: [`audio_transcription`, `chat`, `cohere_rankings`, `completions`, `responses`, `messages`, `chat_embeddings`, `embeddings`, `hf_tei_rankings`, `huggingface_generate`, `image_generation`, `image_edit`, `video_generation`, `image_retrieval`, `nim_embeddings`, `nim_rankings`, `solido_rag`, `raw`, `template`]_
 <br/>_Default: `chat`_
 
 #### `--streaming`
@@ -1943,6 +1971,11 @@ Use the legacy 'max_tokens' field instead of 'max_completion_tokens' in request 
 #### `--use-server-token-count`
 
 Use server-reported token counts from API usage fields instead of client-side tokenization. When enabled, tokenizers are still loaded (needed for dataset generation) but tokenizer.encode() is not called for computing metrics. Token count fields will be None if the server does not provide usage information. For OpenAI-compatible streaming endpoints (chat/completions), stream_options.include_usage is automatically configured when this flag is enabled.
+<br/>_Flag (no value required)_
+
+#### `--per-chunk-usage`
+
+Request per-chunk token usage on streaming responses by setting stream_options.continuous_usage_stats, so the server reports cumulative usage on every chunk instead of only the final one. This lets inter-token latency subtract the first content chunk's real token count (fixing TPS/user inflation when a server bundles multiple tokens into the first streamed chunk). Requires a server that supports continuous_usage_stats (e.g. vLLM, TRT-LLM); strict OpenAI rejects it. Requires --use-server-token-count.
 <br/>_Flag (no value required)_
 
 #### `--connection-reuse-strategy` `<str>`
@@ -2020,7 +2053,7 @@ Path to file or directory containing benchmark dataset. Required when using `--c
 #### `--public-dataset` `<str>`
 
 Pre-configured public dataset to download and use for benchmarking (e.g., `sharegpt`). AIPerf automatically downloads and parses these datasets. Mutually exclusive with `--custom-dataset-type`. Run `aiperf plugins public_dataset_loader` to list available datasets. Use `--hf-subset` to override the HuggingFace subset/config for HF-backed datasets.
-<br/>_Choices: [`exgentic_v2`, `exgentic`, `sharegpt`, `aimo`, `mmstar`, `mmvu`, `vision_arena`, `llava_onevision`, `aimo_aime`, `aimo_numina_cot`, `aimo_numina_1_5`, `spec_bench`, `spec_al_gsm8k`, `spec_al_math500`, `spec_al_humaneval`, `spec_al_mbpp`, `spec_al_mtbench`, `instruct_coder`, `blazedit_5k`, `blazedit_10k`, `librispeech`, `voxpopuli`, `gigaspeech`, `ami`, `spgispeech`, `semianalysis_cc_traces_weka`, `semianalysis_cc_traces_weka_no_subagents`, `semianalysis_cc_traces_weka_with_subagents`, `semianalysis_cc_traces_weka_with_subagents_256k`, `semianalysis_cc_traces_weka_with_subagents_060226`, `semianalysis_cc_traces_weka_with_subagents_060226_256k`, `semianalysis_cc_traces_weka_with_subagents_060526`, `semianalysis_cc_traces_weka_with_subagents_060526_256k`, `semianalysis_cc_traces_weka_with_subagents_060826`, `semianalysis_cc_traces_weka_with_subagents_060826_256k`, `semianalysis_cc_traces_weka_061326`, `semianalysis_cc_traces_weka_061326_256k`, `semianalysis_cc_traces_weka_061526`, `semianalysis_cc_traces_weka_061526_256k`, `semianalysis_cc_traces_weka_062126`, `semianalysis_cc_traces_weka_062126_256k`, `weka_hf`]_
+<br/>_Choices: [`exgentic_v2`, `exgentic`, `sharegpt`, `aimo`, `mmstar`, `mmvu`, `vision_arena`, `llava_onevision`, `aimo_aime`, `aimo_numina_cot`, `aimo_numina_1_5`, `spec_bench`, `spec_al_gsm8k`, `spec_al_math500`, `spec_al_humaneval`, `spec_al_mbpp`, `spec_al_mtbench`, `instruct_coder`, `blazedit_5k`, `blazedit_10k`, `librispeech`, `voxpopuli`, `gigaspeech`, `ami`, `spgispeech`, `semianalysis_cc_traces_weka`, `semianalysis_cc_traces_weka_no_subagents`, `semianalysis_cc_traces_weka_with_subagents`, `semianalysis_cc_traces_weka_with_subagents_256k`, `semianalysis_cc_traces_weka_with_subagents_060226`, `semianalysis_cc_traces_weka_with_subagents_060226_256k`, `semianalysis_cc_traces_weka_with_subagents_060526`, `semianalysis_cc_traces_weka_with_subagents_060526_256k`, `semianalysis_cc_traces_weka_with_subagents_060826`, `semianalysis_cc_traces_weka_with_subagents_060826_256k`, `semianalysis_cc_traces_weka_061326`, `semianalysis_cc_traces_weka_061326_256k`, `semianalysis_cc_traces_weka_061526`, `semianalysis_cc_traces_weka_061526_256k`, `semianalysis_cc_traces_weka_062126`, `semianalysis_cc_traces_weka_062126_256k`, `weka_hf`, `speed_bench_qualitative`, `speed_bench_coding`, `speed_bench_humanities`, `speed_bench_math`, `speed_bench_multilingual`, `speed_bench_qa`, `speed_bench_rag`, `speed_bench_reasoning`, `speed_bench_roleplay`, `speed_bench_stem`, `speed_bench_summarization`, `speed_bench_writing`, `speed_bench_throughput_1k`, `speed_bench_throughput_1k_low_entropy`, `speed_bench_throughput_1k_mixed`, `speed_bench_throughput_1k_high_entropy`, `speed_bench_throughput_2k`, `speed_bench_throughput_2k_low_entropy`, `speed_bench_throughput_2k_mixed`, `speed_bench_throughput_2k_high_entropy`, `speed_bench_throughput_8k`, `speed_bench_throughput_8k_low_entropy`, `speed_bench_throughput_8k_mixed`, `speed_bench_throughput_8k_high_entropy`, `speed_bench_throughput_16k`, `speed_bench_throughput_16k_low_entropy`, `speed_bench_throughput_16k_mixed`, `speed_bench_throughput_16k_high_entropy`, `speed_bench_throughput_32k`, `speed_bench_throughput_32k_low_entropy`, `speed_bench_throughput_32k_mixed`, `speed_bench_throughput_32k_high_entropy`, `h_cua_perf`]_
 
 #### `--hf-subset` `<str>`
 
@@ -2036,8 +2069,8 @@ Dataset-specific filter in key=value form. Repeat for multiple filters. Only sup
 
 #### `--custom-dataset-type` `<str>`
 
-Format specification for custom dataset provided via `--input-file`. Determines parsing logic and expected file structure. Options: `single_turn` (JSONL with single exchanges), `multi_turn` (JSONL with conversation history), `mooncake_trace`/`bailian_trace`/`baseten_trace` (timestamped trace files), `random_pool` (directory of reusable prompts; when using `random_pool`, `--conversation-num` defaults to 100 if not specified; batch sizes > 1 sample each modality independently from a flat pool and do not preserve per-entry associations - use `single_turn` if paired modalities must stay together). Requires `--input-file`. Mutually exclusive with `--public-dataset`.
-<br/>_Choices: [`burst_gpt_trace`, `bailian_trace`, `baseten_trace`, `mooncake_trace`, `raw_payload`, `inputs_json`, `dag_jsonl`, `sagemaker_data_capture`, `multi_turn`, `random_pool`, `single_turn`, `speed_bench_qualitative`, `speed_bench_coding`, `speed_bench_humanities`, `speed_bench_math`, `speed_bench_multilingual`, `speed_bench_qa`, `speed_bench_rag`, `speed_bench_reasoning`, `speed_bench_roleplay`, `speed_bench_stem`, `speed_bench_summarization`, `speed_bench_writing`, `speed_bench_throughput_1k`, `speed_bench_throughput_2k`, `speed_bench_throughput_8k`, `speed_bench_throughput_16k`, `speed_bench_throughput_32k`, `speed_bench_throughput_1k_low_entropy`, `speed_bench_throughput_1k_mixed`, `speed_bench_throughput_1k_high_entropy`, `speed_bench_throughput_2k_low_entropy`, `speed_bench_throughput_2k_mixed`, `speed_bench_throughput_2k_high_entropy`, `speed_bench_throughput_8k_low_entropy`, `speed_bench_throughput_8k_mixed`, `speed_bench_throughput_8k_high_entropy`, `speed_bench_throughput_16k_low_entropy`, `speed_bench_throughput_16k_mixed`, `speed_bench_throughput_16k_high_entropy`, `speed_bench_throughput_32k_low_entropy`, `speed_bench_throughput_32k_mixed`, `speed_bench_throughput_32k_high_entropy`, `weka_trace`]_
+Format specification for custom dataset provided via `--input-file`. Determines parsing logic and expected file structure. Options: `single_turn` (JSONL with single exchanges), `multi_turn` (JSONL with conversation history), `tracelab` (TraceLab agentic-coding corpus, JSONL or gzipped JSONL), `mooncake_trace`/`bailian_trace`/`baseten_trace` (timestamped trace files), `random_pool` (directory of reusable prompts; when using `random_pool`, `--conversation-num` defaults to 100 if not specified; batch sizes > 1 sample each modality independently from a flat pool and do not preserve per-entry associations - use `single_turn` if paired modalities must stay together). Requires `--input-file`. Mutually exclusive with `--public-dataset`.
+<br/>_Choices: [`burst_gpt_trace`, `bailian_trace`, `baseten_trace`, `mooncake_trace`, `h_cua_perf`, `raw_payload`, `inputs_json`, `dag_jsonl`, `sagemaker_data_capture`, `multi_turn`, `random_pool`, `single_turn`, `speed_bench_qualitative`, `speed_bench_throughput_1k`, `speed_bench_throughput_2k`, `speed_bench_throughput_8k`, `speed_bench_throughput_16k`, `speed_bench_throughput_32k`, `tracelab`, `weka_trace`]_
 
 #### `--ignore-trace-delays`
 
@@ -2075,7 +2108,7 @@ Fraction of trace sessions to keep for replay, sampled whole-session to preserve
 
 #### `-f`, `--config` `<str>`
 
-Path to a YAML configuration file. CLI flags override values from the config file.
+Path to a YAML configuration file. CLI flags override values from the config file. A flag that cannot be applied on top of a config file is rejected by name rather than ignored, so a run never silently differs from what was asked for.
 
 ### Fixed Schedule
 
@@ -2203,16 +2236,25 @@ Source corpus for synthetic prompt text generation. 'sonnet' uses Shakespeare so
 |-------|:-------:|-------------|
 | `sonnet` |  | Shakespeare sonnets (default). Classic prose for filler text. |
 | `coding` |  | Realistic coding content: code, bash output, JSON, error tracebacks, git diffs. |
+| `random` |  | Random tokens drawn from the full tokenizer vocabulary minus special tokens. Matches vLLM bench's RandomDataset token-generation strategy. |
 
 ### Cache Bust
 
 #### `--cache-bust` `<str>`
 
-Where (and how) to inject a per-conversation cache-bust marker. Prefix variants prepend at token 0 (most aggressive); suffix variants append after existing content. 'none' disables the feature (default).
-<br/>_Choices: [`none`, `system_prefix`, `system_suffix`, `first_turn_prefix`, `first_turn_suffix`]_
+Where (and how) to inject a cache-bust marker. Two families: (1) RID targets (system_prefix, system_suffix, first_turn_prefix, first_turn_suffix) — inject a per-trajectory unique SHA-256 digest marker that is identical across warmup and profiling, so warmup KV-cache work transfers to profiling while preventing cross-trajectory cache sharing. Prefix variants prepend at token 0; suffix variants append after existing content. (2) Warmup-isolation targets (warmup_isolation_system, warmup_isolation_first_turn) — inject a constant '[warmup]' marker only during the WARMUP phase; profiling sees no marker (fully cold start or system-pre-warmed). Incompatible with agentic_replay timing mode. 'none' disables the feature (default). See [cache-bust.md](reference/cache-bust.md) for detailed semantics, trade-offs, and examples.
+<br/>_Choices: [`none`, `system_prefix`, `system_suffix`, `first_turn_prefix`, `first_turn_suffix`, `warmup_isolation_system`, `warmup_isolation_first_turn`]_
 <br/>_Default: `none`_
 
 ### Prefix Prompt
+
+#### `--system-prompt` `<str>`
+
+Verbatim system prompt text, identical across every conversation. Sent as a system-role message ahead of all turns. Works with both synthetic and file/public datasets; when the dataset already carries its own system message, this text is prepended to it. Tokens are additive: `--isl` continues to size the generated user prompt only. Mutually exclusive with `--system-prompt-file`, `--shared-system-prompt-length`, and `--num-prefix-prompts`/`--prefix-prompt-length`.
+
+#### `--system-prompt-file` `<str>`
+
+Path to a UTF-8 text file holding the verbatim system prompt. Preferred over `--system-prompt` for real production prompts, which are long enough that shell quoting mangles them. Read once at startup, so a missing or unreadable file fails immediately rather than mid-run. Mutually exclusive with `--system-prompt`, `--shared-system-prompt-length`, and `--num-prefix-prompts`/`--prefix-prompt-length`.
 
 #### `--prompt-prefix-pool-size`, `--prefix-prompt-pool-size`, `--num-prefix-prompts` `<int>`
 
@@ -2256,6 +2298,21 @@ Token block size for hash-based prompt synthesis when dataset entries carry `has
 #### `--seq-dist`, `--sequence-distribution` `<str>`
 
 Distribution of (ISL, OSL) pairs with probabilities for mixed workload simulation. Format: `ISL,OSL:prob;ISL,OSL:prob` (semicolons separate pairs, probabilities are percentages 0-100 that must sum to 100). Supports optional stddev: `ISL|stddev,OSL|stddev:prob`. Examples: `128,64:25;512,128:50;1024,256:25` or with variance: `256|10,128|5:40;512|20,256|10:60`. Also supports bracket `[(256,128):40,(512,256):60]` and JSON formats.
+
+#### `--random-range-ratio` `<str>`
+
+Sample ISL and OSL uniformly from a ratio-defined integer window around the configured means. The window is computed from `--random-corpus-style` (defaults to `vllm`): vllm style → `[floor(mean*(1-r)), ceil(mean*(1+r))]` (symmetric); sglang style → `[max(1, int(mean*r)), mean]` (lower-bounded). Accepts a single float applied to both ISL and OSL. The JSON object form `{"input": 0.3, "output": 0.5}` for independent values is accepted only under vllm style; sglang style applies one ratio to both and requires a plain float. Requires both `--isl` and `--osl` to be set explicitly — there is no default mean for either. Mutually exclusive with `--seq-dist`. Under vllm style with a tokenizer configured, the ISL mean is automatically reduced by `tokenizer.num_special_tokens_to_add(pair=False)` so `--isl` represents total server-side input tokens, matching `vllm bench serve` semantics; sglang style applies no such adjustment.
+
+#### `--random-corpus-style` `<str>`
+
+Benchmark style for RANDOM corpus generation. Controls range ratio formula, token pool composition, and other per-tool behaviors. `vllm` (default) mirrors `vllm bench serve`: symmetric range window, non-special token pool (special tokens excluded). `sglang` mirrors `sglang.benchmark.serving` run with `--dataset-name random-ids`: lower-bounded range window, full `range(vocab_size)` token pool (no exclusion). Applies in two independent places: token-pool selection whenever `--prompt-corpus random` is set (including with no `--random-range-ratio`, where the pool is the only thing the style selects), and the range-window formula, special-token accounting and RNG algorithm whenever `--random-range-ratio` is set — the latter regardless of corpus.
+
+**Choices:**
+
+| | | |
+|-------|:-------:|-------------|
+| `vllm` | _default_ | vllm bench serve semantics: symmetric window ``[floor(mean*(1-r)), ceil(mean*(1+r))]``. r=0 is fixed at mean; larger r widens the window on both sides. r must be in [0, 1). Special tokens excluded from the sampling pool. BOS subtracted from ISL mean. |
+| `sglang` |  | sglang ``benchmark.serving`` semantics under ``--dataset-name random-ids``: lower-bounded window ``[max(1, int(mean*r)), mean]``. r=0 allows full variability [1, mean]; r=1 fixes length at mean. Full vocab_size range used for token sampling (no special-token exclusion). No BOS adjustment. The default ``--dataset-name random`` is a different algorithm upstream (repeat/truncate ShareGPT token ids) and is not what this style mirrors. |
 
 ### Output Sequence Length (OSL)
 
@@ -2422,7 +2479,7 @@ Algorithm for generating synthetic video content. Different types produce differ
 
 #### `--video-format` `<str>`
 
-Container format for generated video files. Supports `webm` (VP9, recommended, BSD-licensed) and `mp4` (H.264/H.265, widely compatible). Format choice affects compatibility, file size, and encoding options. Use `webm` for open-source workflows, `mp4` for maximum compatibility.
+Container format for generated video files. Supports `webm` (VP9, recommended, BSD-licensed) and `mp4` (widely compatible container, VP9 by default). Format choice affects compatibility, file size, and encoding options. `mp4` is the more portable container, but note that the default VP9 video and Opus audio are less widely supported by players than H.264/AAC would be.
 
 **Choices:**
 
@@ -2433,7 +2490,7 @@ Container format for generated video files. Supports `webm` (VP9, recommended, B
 
 #### `--video-codec` `<str>`
 
-The video codec to use for encoding. Common options: libvpx-vp9 (CPU, BSD-licensed, default for WebM), libx264 (CPU, GPL-licensed, widely compatible), libx265 (CPU, GPL-licensed, smaller files), h264_nvenc (NVIDIA GPU), hevc_nvenc (NVIDIA GPU, smaller files). Any FFmpeg-supported codec can be used.
+The video codec to use for encoding. Common options: libvpx-vp9 (CPU, BSD-licensed, default), libvpx (CPU, BSD-licensed, VP8). Any codec the local FFmpeg supports can be used, but the AIPerf container ships a minimal FFmpeg build limited to VP8/VP9 video with Vorbis/Opus audio; codecs such as libx264 or h264_nvenc require an FFmpeg build that includes them.
 <br/>_Default: `libvpx-vp9`_
 
 #### `--video-audio-sample-rate` `<float>`
@@ -2450,15 +2507,15 @@ Number of audio channels to embed in generated video files. 0 = disabled (no aud
 
 #### `--video-audio-codec` `<str>`
 
-Audio codec for the embedded audio track. If not specified, auto-selects based on video format: aac for MP4, libvorbis for WebM. Options: aac, libvorbis, libopus.
+Audio codec for the embedded audio track. If not specified, auto-selects based on video format: libopus for MP4, libvorbis for WebM. Options: libvorbis, libopus, aac. The AIPerf container ships only libvorbis and libopus; aac requires an FFmpeg build that includes an AAC encoder. libopus always encodes at 48 kHz, so any --video-audio-sample-rate is resampled during muxing.
 
 **Choices:**
 
 | | | |
 |-------|:-------:|-------------|
-| `aac` |  | AAC codec. Default for MP4 containers. |
+| `aac` |  | AAC codec. Not built into the AIPerf container's FFmpeg; selecting it requires an FFmpeg build that includes an AAC encoder. |
 | `libvorbis` |  | Vorbis codec. Default for WebM containers. |
-| `libopus` |  | Opus codec. Alternative for WebM containers. |
+| `libopus` |  | Opus codec. Default for MP4 containers. Always encodes at 48 kHz regardless of the requested sample rate. |
 
 #### `--video-audio-depth` `<str>`
 
@@ -2750,11 +2807,11 @@ Output directory for all benchmark artifacts including metrics (`.csv`, `.json`,
 
 #### `--profile-export-prefix`, `--profile-export-file` `<str>`
 
-Base filename for ALL exported files. With prefix='foo' every output becomes `foo.csv`, `foo.json`, `foo_timeslices.{csv,json}`, `foo.jsonl`, `foo_raw.jsonl`, `foo_gpu_telemetry.jsonl`, and `foo_server_metrics.{jsonl,json,csv,parquet}`. When unset (the default), historical per-file names are used: `profile_export_aiperf.{csv,json}` for the summary, `profile_export.jsonl` and `profile_export_raw.jsonl` for records, `gpu_telemetry_export.jsonl`, and `server_metrics_export.*`. Known suffixes (e.g. `_raw.jsonl`, `_timeslices.csv`, `_server_metrics.parquet`) are stripped from the supplied value.
+Base filename for ALL exported files. With prefix='foo' every output becomes `foo.csv`, `foo.json`, `foo_timeslices.{csv,json}`, `foo.jsonl`, `foo_raw.jsonl`, `foo_outputs.json`, `foo_gpu_telemetry.jsonl`, and `foo_server_metrics.{jsonl,json,csv,parquet}`. When unset (the default), historical per-file names are used: `profile_export_aiperf.{csv,json}` for the summary, `profile_export.jsonl` and `profile_export_raw.jsonl` for records, `outputs.json`, `gpu_telemetry_export.jsonl`, and `server_metrics_export.*`. Known suffixes (e.g. `_raw.jsonl`, `_outputs.json`, `_timeslices.csv`, `_server_metrics.parquet`) are stripped from the supplied value.
 
 #### `--export-level`, `--profile-export-level` `<str>`
 
-Controls which output files are generated. `summary`: Only aggregate metrics files (`.csv`, `.json`). `records`: Includes per-request metrics (`.jsonl`). `raw`: Includes raw request/response data (`_raw.jsonl`).
+Controls which output files are generated. `summary`: Only aggregate metrics files (`.csv`, `.json`). `records`: Includes per-request metrics (`.jsonl`). `raw`: Includes raw request/response data (`_raw.jsonl`) and, unless `--no-export-outputs-json` is passed, the generated text (`_outputs.json`).
 
 **Choices:**
 
@@ -2778,10 +2835,9 @@ Auto-invoke `aiperf plot` against the artifact directory after the benchmark com
 Treat auto-plot failures as fatal: re-raise so `aiperf profile` exits non-zero. Only meaningful when auto-plot is on. Default False = warn and continue.
 <br/>_Flag (no value required)_
 
-#### `--export-outputs-json`
+#### `--export-outputs-json`, `--no-export-outputs-json`
 
-Export generated response text to outputs.json after the run. When enabled, the raw generated-text payload for each request is written to an outputs.json file in the artifact directory.
-<br/>_Flag (no value required)_
+Export generated response text after the run. When enabled, the raw generated-text payload for each request is written to `outputs.json` in the artifact directory, or to `<prefix>_outputs.json` when `--profile-export-prefix` is set (prefix `foo` gives `foo_outputs.json`). Implied by `--export-level raw`; pass `--no-export-outputs-json` to opt out of the extra file while keeping raw export.
 
 #### `--otel-url` `<str>`
 
@@ -3051,7 +3107,7 @@ Repeatable: each occurrence describes one sweep variation. Format: '[name:] key=
 
 #### `--search-sla` `<list>`
 
-SLA filter to attach to the adaptive-search or grid path. Format: 'metric_tag:stat:op:threshold'. Stat in {avg, min, max, p1, p5, p10, p25, p50, p75, p90, p95, p99}; op in {lt, le, gt, ge}; threshold is a float. Repeatable. Example: --search-sla 'time_to_first_token:p95:lt:200' --search-sla 'request_error_rate:p99:lt:0.05'. Composes with recipe-named SLA flags (--ttft-sla-ms etc.); the final filter list is recipe filters first, then --search-sla filters in CLI order.
+SLA filter to attach to the adaptive-search or grid path. Format: 'metric_tag:stat:op:threshold'. Stat in {avg, min, max, p1, p5, p10, p25, p50, p75, p90, p95, p99}; op in {lt, le, gt, ge}; threshold is a float in the metric's native unit. For request_error_rate, 1 means 1% (percentage points), unlike --error-rate-sla, which accepts a fraction. Repeatable. Example: --search-sla 'time_to_first_token:p95:lt:200' --search-sla 'request_error_rate:avg:lt:1'. Composes with recipe-named SLA flags (--ttft-sla-ms etc.); the final filter list is recipe filters first, then --search-sla filters in CLI order.
 
 #### `--search-sla-tier` `<list>`
 
@@ -3087,7 +3143,7 @@ End-to-end request-latency SLA threshold in milliseconds (p99). Maps to the `req
 
 #### `--error-rate-sla` `<float>`
 
-Maximum acceptable request error rate as a fraction in (0, 1) (e.g. 0.05 = 5%). Maps to the `request_error_rate` metric tag (p99). Consumed by the max-concurrency-under-sla recipe; ignored otherwise. Available without streaming.
+Maximum acceptable request error rate as a fraction in (0, 1) (e.g. 0.05 = 5%). Maps to the `request_error_rate` metric tag (avg), converting the fraction to the metric's percentage-point scale. Consumed by the max-concurrency-under-sla recipe; ignored otherwise. Available without streaming.
 <br/>_Constraints: > 0, &lt; 1_
 
 #### `--slo-attainment-fraction` `<float>`
@@ -3267,13 +3323,16 @@ Select the ZMQ dual-bind communication backend (IPC + TCP). All dual-bind knobs 
 
 ## `aiperf speed-bench-report`
 
-Assemble per-category SPEED-Bench aiperf results into a matrix report.
+Assemble SPEED-Bench aiperf results into a matrix report.
 
-Run ``aiperf profile`` once per SPEED-Bench category, then point this command at the output directories to produce a matrix matching the SPEED-Bench paper format.
+Point this command at one or more ``aiperf profile`` output directories. A single run over an aggregate SPEED-Bench split (``speed_bench_qualitative``) already carries every category, and each of its per-request records is stamped with the category it came from, so one run produces the whole matrix. Runs over a single category still work and contribute one column each.
 
 **Examples:**
 
 ```bash
+# One run over all categories: matrix comes from its per-request records
+aiperf speed-bench-report ./artifacts/speed_bench_qualitative/
+
 # Scan a parent directory for per-category run subdirectories
 aiperf speed-bench-report ./artifacts/
 
@@ -3283,8 +3342,11 @@ aiperf speed-bench-report ./artifacts/run_coding/ ./artifacts/run_math/
 # Acceptance rate matrix (accepted / draft tokens)
 aiperf speed-bench-report ./artifacts/ --metric accept_rate
 
-# Throughput matrix (output tokens/sec per category)
+# Throughput matrix (output tokens/sec per run)
 aiperf speed-bench-report ./artifacts/ --metric throughput
+
+# Force the Prometheus scrape, ignoring any per-request records
+aiperf speed-bench-report ./artifacts/ --source server
 ```
 
 #### `--paths`, `--empty-paths` `<list>` _(Required)_
@@ -3305,6 +3367,11 @@ Output format - 'csv', 'table', or 'both'. Defaults to 'both'.
 
 Which metric to report - 'accept_length', 'accept_rate', or 'throughput'. Defaults to 'accept_length'.
 <br/>_Default: `accept_length`_
+
+#### `--source` `<str>`
+
+Where acceptance numbers come from - 'records' (per-request ``profile_export.jsonl``), 'summary' (the same per-request data reduced to run-level scalars in ``profile_export_aiperf.json``, the only source left at ``--export-level summary``), 'server' (Prometheus scrape in ``server_metrics_export.json``), or 'auto' to try them in that order. Only 'records' can split one run into per-category columns; only 'server' reads server-side data. Defaults to 'auto'.
+<br/>_Default: `auto`_
 
 <hr/>
 

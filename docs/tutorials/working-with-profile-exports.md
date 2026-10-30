@@ -16,6 +16,7 @@ AIPerf generates multiple output formats after each benchmark run, each optimize
 - [**`profile_export.jsonl`**](#per-request-records-jsonl) - Per-request metric records in JSON Lines format with one record per line
 - [**`profile_export_aiperf.json`**](#aggregated-statistics-json) - Aggregated statistics and user configuration as a single JSON object
 - [**`profile_export_aiperf.csv`**](#aggregated-statistics-csv) - Aggregated statistics in CSV format
+- **`outputs.json`** - Generated response text per request, with a small set of per-request metrics. Written when `--export-outputs-json` is set, which `--export-level raw` implies. See [`outputs.json` schema](../reference/json-export-schema.md#outputsjson-schema).
 
 ## Data Models
 
@@ -183,6 +184,7 @@ AIPerf output files can be parsed using the native Pydantic models for type-safe
 
 ### Synchronous Loading
 ```python
+from pathlib import Path
 from aiperf.common.models import MetricRecordInfo
 
 def load_records(file_path: Path) -> list[MetricRecordInfo]:
@@ -201,6 +203,7 @@ def load_records(file_path: Path) -> list[MetricRecordInfo]:
 For large benchmark runs with thousands of requests, use async file I/O for better performance:
 
 ```python
+from pathlib import Path
 import aiofiles
 from aiperf.common.models import MetricRecordInfo
 

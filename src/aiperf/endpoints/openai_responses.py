@@ -18,6 +18,7 @@ from aiperf.common.models import (
     Turn,
 )
 from aiperf.common.types import JsonObject
+from aiperf.common.utils import is_truthy_flag
 from aiperf.endpoints import _openai_responses_replay as _replay
 from aiperf.endpoints.base_endpoint import BaseEndpoint
 
@@ -189,15 +190,20 @@ class ResponsesEndpoint(BaseEndpoint):
         # lives in top-level ``instructions``. The per-conversation
         # ``user_context_message`` is prepended as a leading user item.
         input_items: list[dict[str, Any]] = []
-        if request_info.user_context_message:
-            input_items.append(
-                {
-                    "type": "message",
-                    "role": self.DEFAULT_TURN_ROLE,
-                    "content": request_info.user_context_message,
-                }
-            )
-        input_items.extend(self.build_messages(turns))
+        if request_info.previous_response_id:
+            # Stateful chaining: previous_response_id points to server-side history.
+            self._warn_chaining_isl_once()
+            input_items.extend(self.build_messages([turns[-1]]))
+        else:
+            if request_info.user_context_message:
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": self.DEFAULT_TURN_ROLE,
+                        "content": request_info.user_context_message,
+                    }
+                )
+            input_items.extend(self.build_messages(turns))
 
         # Conversation-level fields walk turns from the end so FORK-mode
         # children whose final turn lacks model/tools still inherit the parent's
@@ -211,6 +217,9 @@ class ResponsesEndpoint(BaseEndpoint):
             "model": model_name or model_endpoint.primary_model_name,
             "stream": model_endpoint.endpoint.streaming,
         }
+        if request_info.previous_response_id:
+            payload["previous_response_id"] = request_info.previous_response_id
+
         for key, value in (
             ("instructions", request_info.system_message or None),
             ("max_output_tokens", max_tokens),
@@ -228,6 +237,84 @@ class ResponsesEndpoint(BaseEndpoint):
 
         self.trace(lambda: f"Formatted payload: {payload}")
         return payload
+
+    _warned_chaining_isl: bool = False
+
+    def _warn_chaining_isl_once(self) -> None:
+        """Warn once that chained turns only send the newest turn on the wire.
+
+        With ``previous_response_id`` the prior history lives server-side, so
+        client-side Input Sequence Length (the default) reflects only the newest
+        turn and undercounts the prompt the server actually prefills. Server-side
+        token counts (``use_server_token_count``) report the true prompt size.
+        """
+        if (
+            self._warned_chaining_isl
+            or self.model_endpoint.endpoint.use_server_token_count
+        ):
+            return
+        self._warned_chaining_isl = True
+        self.warning(
+            "Stateful Responses chaining is active (previous_response_id): only "
+            "the newest turn is sent on the wire, so client-side Input Sequence "
+            "Length undercounts the server-side prompt for chained turns. Enable "
+            "--use-server-token-count for accurate multi-turn ISL."
+        )
+
+    def extract_response_id(self, record: RequestRecord) -> str | None:
+        """Extract the server-generated response ID (``resp_<hash>``) for stateful
+        chaining, but only when storage was requested for this run.
+
+        ``store`` is a *request* parameter, not a standard field of the Responses
+        object: the OpenAI spec does not list it on the response, and real
+        servers (e.g. vLLM's agentic-api) accept it on the request but never
+        serialize it back onto ``response.created`` / ``response.completed``.
+        Gating on the echoed response ``store`` therefore never fires against
+        those servers and silently disables chaining. We instead chain when
+        storage was requested via ``--extra-inputs store:true`` (endpoint
+        ``extra``); a server that *does* echo ``store: true`` is honored too.
+        When neither is set we return ``None`` so the caller falls back to
+        sending the full history.
+
+        The response object lives under ``response`` for streaming lifecycle
+        events (``response.created`` / ``response.completed`` / ...) and at the
+        top level for a non-streaming response body.
+
+        A request that returns HTTP 200 but fails does not set
+        ``RequestRecord.error``. Streaming signals this via a
+        ``response.failed`` / ``response.incomplete`` event; a non-streaming
+        body signals it via top-level ``status``. In either case the advertised
+        id belongs to an aborted response, so chaining onto it would corrupt the
+        next turn and we return ``None`` regardless of the advertised id.
+        """
+        store_requested = self._store_requested()
+        resp_id: str | None = None
+        for response in record.responses:
+            json_obj = response.get_json()
+            if not isinstance(json_obj, dict):
+                continue
+            if _replay.is_failure_event(json_obj):
+                return None
+            nested = json_obj.get("response")
+            source = nested if isinstance(nested, dict) else json_obj
+            if _replay.is_failure_status(source):
+                return None
+            candidate = source.get("id")
+            if not (isinstance(candidate, str) and candidate):
+                continue
+            if store_requested or source.get("store"):
+                resp_id = candidate
+        return resp_id
+
+    def _store_requested(self) -> bool:
+        """Whether the run requested server-side storage via endpoint ``extra``.
+
+        ``EndpointInfo.extra`` is a list of ``(key, value)`` pairs; ``store`` may
+        arrive as a bool or a string depending on how ``--extra-inputs`` was
+        supplied.
+        """
+        store = dict(self.model_endpoint.endpoint.extra or []).get("store")
+        return is_truthy_flag(store)
 
     @staticmethod
     def _maybe_enable_usage_stream_options(
@@ -450,7 +537,8 @@ class ResponsesEndpoint(BaseEndpoint):
         tokens:
 
         - ``message`` items contribute their ``output_text`` parts.
-        - ``reasoning`` items contribute their ``summary_text`` parts.
+        - ``reasoning`` items contribute their ``reasoning_text`` parts, or
+          their ``summary_text`` parts when there are none.
         - ``function_call`` items contribute ``name`` + ``arguments`` -
           the model generated those tokens, and the server's
           ``usage.completion_tokens`` already counts them, so client-side
@@ -514,25 +602,39 @@ class ResponsesEndpoint(BaseEndpoint):
         """
         item_type = item.get("type")
         if item_type == "reasoning":
-            ResponsesEndpoint._collect_reasoning_summary(item, reasoning_parts)
+            ResponsesEndpoint._collect_reasoning(item, reasoning_parts)
         elif item_type == "message":
             ResponsesEndpoint._collect_message_content(item, text_parts)
         elif item_type == "function_call":
             ResponsesEndpoint._collect_function_call(item, tool_call_parts)
 
     @staticmethod
-    def _collect_reasoning_summary(
-        item: dict[str, Any], reasoning_parts: list[str]
-    ) -> None:
-        """Append non-empty ``summary_text`` strings from a reasoning item."""
-        summary = item.get("summary")
-        if not isinstance(summary, list):
-            return
-        for part in summary:
-            if isinstance(part, dict) and part.get("type") == "summary_text":
-                text = part.get("text")
-                if text:
-                    reasoning_parts.append(text)
+    def _collect_reasoning(item: dict[str, Any], reasoning_parts: list[str]) -> None:
+        """Append a reasoning item's text: its ``reasoning_text`` content parts,
+        else its ``summary_text`` parts.
+
+        ``reasoning_text`` is the full reasoning, matching the streaming
+        ``response.reasoning_text.delta`` events; servers such as vLLM serving
+        gpt-oss return it with an empty ``summary``. A summary condenses the
+        same reasoning, so taking both would count it twice.
+        """
+        reasoning_parts.extend(
+            ResponsesEndpoint._part_texts(item.get("content"), "reasoning_text")
+            or ResponsesEndpoint._part_texts(item.get("summary"), "summary_text")
+        )
+
+    @staticmethod
+    def _part_texts(parts: Any, part_type: str) -> list[str]:
+        if not isinstance(parts, list):
+            return []
+        return [
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("type") == part_type
+            and isinstance(part.get("text"), str)
+            and part["text"]
+        ]
 
     @staticmethod
     def _collect_message_content(item: dict[str, Any], text_parts: list[str]) -> None:
