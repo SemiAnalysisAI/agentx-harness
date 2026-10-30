@@ -265,6 +265,7 @@ flowchart LR
 Details worth knowing:
 
 - **One hash namespace per trace file.** `hash_id_scope: "local"` is enforced for everything in a file — root, subagent children, and detected chains share one decode scope, so the same `hash_id` yields identical tokens everywhere and the server observes the genuine shared prefixes. The theoretical prefix-cache metric uses one shared per-trace seen-set in global time order for the same reason.
+- **Shared hash ID objects.** Within each trace, repeated `hash_ids` values are stored as one `int` object, which cuts dataset preparation memory on large corpora. Values, order and serialization are unchanged.
 - **Setup prefix ("keep the longer one").** The latest captures declare `tool_tokens: 0` / `system_tokens: 0`, so the system-segment boundary is derived empirically per namespace group (the LCP over member chains' first requests) and the longer of declared vs observed wins. Every turn 0 in a group places the system|user boundary at the same block offset, which keeps rendered prompts byte-shared across conversations.
 - **Same-model rule.** A chain is only ever continued by requests of the same model; cross-model attachment is always a spawn (a Haiku worker reading Opus context is a different agent).
 - **Escape hatch.** `AIPERF_DATASET_WEKA_SPLIT_FLATTENED_AGENTS=false` disables detection at **both** layers: all top-level requests serialize into one root conversation, and each subagent entry emits exactly one child with its inner requests in time order.
