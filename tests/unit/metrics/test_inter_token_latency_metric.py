@@ -141,6 +141,7 @@ class TestFullResponseInterTokenLatencyMetric:
             FullResponseInterTokenLatencyMetric().parse_record(
                 create_record(), MetricRecordDict()
             )
+
     def test_inter_token_latency_subtracts_bundled_first_chunk(self):
         """When the server reports the first content chunk carried N tokens, ITL
         divides the decode window by (OSL - N), not (OSL - 1), so a server that
