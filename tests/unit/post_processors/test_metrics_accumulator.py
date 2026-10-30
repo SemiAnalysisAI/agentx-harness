@@ -1233,7 +1233,11 @@ class TestTimesliceRaggedIndex:
         warmup = ExportContext(phase=CreditPhase.WARMUP)
         profiling = ExportContext(phase=CreditPhase.PROFILING)
         expected_warmup = self._dump(await accumulator.export_results(warmup))
-        expected_profiling = self._dump(await accumulator.export_results(profiling))
+        expected_profiling = self._dump(
+            accumulator._summarize_for_export_context(
+                profiling, include_timeslices=False
+            )
+        )
 
         compute_results = MetricsAccumulator._compute_results
         pending = [profiling]
@@ -1243,7 +1247,11 @@ class TestTimesliceRaggedIndex:
             # The realtime summary runs on the event loop while the export's
             # slice loop runs in a worker thread.
             if kwargs.get("is_timeslice") and pending:
-                overlapped.append(self._summarize_for_export_context(pending.pop()))
+                overlapped.append(
+                    self._summarize_for_export_context(
+                        pending.pop(), include_timeslices=False
+                    )
+                )
             return compute_results(self, *args, **kwargs)
 
         with patch.object(
