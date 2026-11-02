@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pytest import param
 
 from aiperf.common.models import MetricResult
 from aiperf.common.models.export_models import JsonExportData
@@ -129,6 +130,53 @@ class TestMetricsJsonExporter:
             "hf_split": "train",
             "num_dataset_entries": 393,
         }
+
+    @pytest.mark.parametrize(
+        ("measurement_start_sec", "expected"),
+        [
+            param(720.0, 720.0, id="set"),
+            param(None, None, id="unset"),
+        ],
+    )  # fmt: skip
+    @pytest.mark.asyncio
+    async def test_json_export_metadata_records_measurement_start(
+        self,
+        mock_results,
+        measurement_start_sec: float | None,
+        expected: float | None,
+    ) -> None:
+        cfg = BenchmarkConfig.model_validate(
+            {
+                "models": ["test-model"],
+                "endpoint": {"urls": ["http://localhost:8000/v1/chat/completions"]},
+                "datasets": [{"name": "main", "type": "synthetic", "entries": 10}],
+                "phases": [
+                    {
+                        "name": "profiling",
+                        "type": "concurrency",
+                        "concurrency": 1,
+                        "duration": 600,
+                    }
+                ],
+            }
+        )
+        mock_results.measurement_start_sec = measurement_start_sec
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            exporter = MetricsJsonExporter(
+                make_exporter_config(
+                    results=mock_results,
+                    cfg=cfg,
+                    artifact_directory=output_dir,
+                    telemetry_results=None,
+                )
+            )
+            await exporter.export()
+
+            with open(output_dir / OutputDefaults.PROFILE_EXPORT_AIPERF_JSON_FILE) as f:
+                raw = json.load(f)
+
+        assert (raw.get("metadata") or {}).get("measurement_start_seconds") == expected
 
     @pytest.mark.asyncio
     async def test_metrics_json_exporter_creates_expected_json(

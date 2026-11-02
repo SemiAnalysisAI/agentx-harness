@@ -20,6 +20,7 @@ from aiperf.common.models import (
     MetricResult,
     PhaseProfileResults,
     ProfileResults,
+    WindowProfileResults,
 )
 from aiperf.common.models.export_models import TelemetryExportData, TelemetrySummary
 from aiperf.common.models.server_metrics_models import ServerMetricsResults
@@ -257,6 +258,80 @@ class TestExporterManager:
         )
         assert server_metrics_json["phase"]["phase_kind"] == "profiling"
         assert server_metrics_json["data"]["benchmark_id"] == "bench"
+
+    @pytest.mark.asyncio
+    async def test_export_window_artifacts_writes_window_dirs_and_manifest(
+        self, endpoint_config, output_config, mock_cfg
+    ) -> None:
+        manager = ExporterManager(
+            results=ProfileResults(
+                records=[],
+                start_ns=1,
+                end_ns=10,
+                completed=0,
+                was_cancelled=False,
+                error_summary=[],
+            ),
+            run=make_run_from_cli(mock_cfg),
+            telemetry_results=None,
+        )
+        entries = [
+            await manager.export_window_artifacts(
+                WindowProfileResults(
+                    start_offset_sec=offset_sec,
+                    phase_name=name,
+                    phase_kind="profiling",
+                    records=[
+                        MetricResult(
+                            tag="request_latency",
+                            header="Request Latency",
+                            unit="ms",
+                            avg=latency_ms,
+                            count=2,
+                        )
+                    ],
+                    start_ns=start_ns,
+                    end_ns=10,
+                    successful_request_count=2,
+                    server_metrics_results=ServerMetricsResults(
+                        benchmark_id="bench",
+                        endpoint_summaries={},
+                        start_ns=start_ns,
+                        end_ns=10,
+                        endpoints_configured=["server"],
+                        endpoints_successful=["server"],
+                    ),
+                )
+            )
+            for offset_sec, name, start_ns, latency_ms in (
+                (60.0, "start_60s", 6, 20.0),
+                (0.0, "start_0s", 1, 10.0),
+            )
+        ]
+        await manager.write_window_manifest(entries)
+
+        windows_dir = output_config / "windows"
+        manifest = json.loads(
+            (windows_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert [entry["start_offset_sec"] for entry in manifest["windows"]] == [
+            0.0,
+            60.0,
+        ]
+        late = manifest["windows"][1]
+        assert late["metrics_json"] == "windows/start_60s/profile_export_aiperf.json"
+        assert late["metrics_csv"] == "windows/start_60s/profile_export_aiperf.csv"
+        assert late["server_metrics_json"] == "windows/start_60s/server_metrics.json"
+        assert late["start_ns"] == 6
+        assert late["end_ns"] == 10
+        assert "gpu_telemetry_json" not in late
+        late_json = json.loads(
+            (windows_dir / "start_60s" / "profile_export_aiperf.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert late_json["request_latency"]["avg"] == 20.0
+        assert not (output_config / "phase_manifest.json").exists()
 
     @pytest.mark.asyncio
     async def test_write_phase_export_handles_disabled_and_failed_exporters(

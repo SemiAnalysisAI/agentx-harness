@@ -166,7 +166,9 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         Exported ``warmup_end_ns`` is the aggregation window end (may extend
         past the credit-phase complete timestamp to include the end-of-warmup
         scrape) so ``phase_time_ranges["warmup"]`` matches
-        ``warmup_endpoint_summaries``.
+        ``warmup_endpoint_summaries``. A ``ctx.min_request_start_ns`` (the
+        profiling measurement start) moves the summary start there, timeslices
+        included; the Parquet artifact still spans the whole phase.
 
         Returns:
             ServerMetricsResults containing endpoint summaries with computed statistics,
@@ -187,14 +189,27 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         if not self._server_metrics_hierarchy.endpoints:
             return None
 
-        endpoint_summaries = self._compute_phase_endpoint_summaries(
-            CreditPhase.PROFILING,
-            self._slice_duration,
-            include_final_collection=not ctx.is_phase_scoped,
-        )
+        summary_start_ns = start_ns
+        if ctx.min_request_start_ns is not None:
+            # A measurement start cuts the summary by time, like a suffix window;
+            # phase-tagged series would keep every sample since the phase began.
+            summary_start_ns = ctx.min_request_start_ns
+            endpoint_summaries = self._compute_endpoint_summaries(
+                summary_start_ns,
+                end_ns,
+                self._slice_duration,
+                include_final_collection=True,
+                window_scoped_info=True,
+            )
+        else:
+            endpoint_summaries = self._compute_phase_endpoint_summaries(
+                CreditPhase.PROFILING,
+                self._slice_duration,
+                include_final_collection=not ctx.is_phase_scoped,
+            )
         if not endpoint_summaries:
             endpoint_summaries = self._compute_endpoint_summaries(
-                start_ns,
+                summary_start_ns,
                 end_ns,
                 self._slice_duration,
                 include_final_collection=not ctx.is_phase_scoped,
@@ -233,7 +248,7 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
             benchmark_id=self.run.benchmark_id,
             endpoint_summaries=endpoint_summaries,
             warmup_endpoint_summaries=warmup_endpoint_summaries or None,
-            start_ns=start_ns,
+            start_ns=summary_start_ns,
             end_ns=end_ns,
             endpoints_configured=endpoint_list,
             endpoints_successful=endpoint_list,
@@ -250,6 +265,42 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
             await self._export_parquet_widened(start_ns, end_ns)
 
         return results
+
+    async def export_window_results(
+        self, ctx: ExportContext
+    ) -> ServerMetricsResults | None:
+        """Export one suffix window of the run, cut by time rather than phase tag.
+
+        Phase-tagged series ignore the context bounds, so a window would keep
+        every sample since the phase began. The time-bounded path uses the last
+        scrape before ``ctx.start_ns`` as the counter/histogram delta reference
+        and, like the whole-run export, includes the final collection. Endpoint
+        collection info covers the same span. Timeslices, warmup summaries and
+        Parquet stay whole-run artifacts.
+        """
+        if not self._server_metrics_hierarchy.endpoints:
+            return None
+        start_ns = ctx.start_ns or 0
+        end_ns = ctx.end_ns or 0
+        endpoint_summaries = self._compute_endpoint_summaries(
+            start_ns,
+            end_ns,
+            None,
+            include_final_collection=True,
+            window_scoped_info=True,
+        )
+        if not endpoint_summaries:
+            return None
+        endpoint_list = list(self._server_metrics_hierarchy.endpoints.keys())
+        return ServerMetricsResults(
+            benchmark_id=self.run.benchmark_id,
+            endpoint_summaries=endpoint_summaries,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            endpoints_configured=endpoint_list,
+            endpoints_successful=endpoint_list,
+            error_summary=ctx.error_summary or [],
+        )
 
     async def _export_parquet_widened(self, start_ns: int, end_ns: int) -> None:
         """Export the Parquet artifact over the collection-widened window.
@@ -281,6 +332,7 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         slice_duration: float | None = None,
         *,
         include_final_collection: bool,
+        window_scoped_info: bool = False,
     ) -> dict[str, ServerMetricsEndpointSummary]:
         """Compute all server metrics summaries with per-endpoint time filters.
 
@@ -365,7 +417,11 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
                         series=[series_stats],
                     )
 
-            info_filter = None if include_final_collection else time_filter
+            info_filter = (
+                time_filter
+                if window_scoped_info or not include_final_collection
+                else None
+            )
             summaries[endpoint_display] = ServerMetricsEndpointSummary(
                 endpoint_url=endpoint_url,
                 info=self._compute_endpoint_info(time_series, info_filter),

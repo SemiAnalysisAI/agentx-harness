@@ -60,7 +60,8 @@ transparency.
   `--streaming` auto-enables if you omit it.
 - **Always on, no flag:** replay delays are always end-to-start (see below); there is no toggle.
 - **Scenario defaults** (auto-filled if omitted; you may override): `--benchmark-duration 1800` (floor
-  900s), `--trajectory-start-min-ratio 0.0` / `--trajectory-start-max-ratio 1.0` (sample t\* across the
+  900s), `--measurement-start 720` (the reported metrics start 720s into profiling, which runs that much
+  longer), `--trajectory-start-min-ratio 0.0` / `--trajectory-start-max-ratio 1.0` (sample t\* across the
   full run).
 - **Auto-injected, no flag:** `ignore_eos=true` is added to `--extra-inputs` (passing `ignore_eos=false`
   is rejected), and a fresh `--random-seed` is filled in — pin one yourself for reproducible run-to-run
@@ -91,7 +92,7 @@ pinned `--random-seed`, and `--ui simple`.
 What to expect:
 
 - **What this does to your server:** holds 256 concurrent agent sessions (trajectory trees) for the
-  benchmark duration (1800s here), replaying the real *shape* of coding-agent traffic — large reused
+  measurement start plus the benchmark duration (720 + 1800s here), replaying the real *shape* of coding-agent traffic — large reused
   prefixes, varied decode lengths, and subagent fan-out (with synthetic filler content) — rather than
   synthetic uniform load.
 - **The first run is slow on purpose:** before any traffic, AIPerf reconstructs the corpus into a
@@ -156,6 +157,7 @@ What to expect:
     - [How do I scale the offered load up or down?](#q-how-do-i-scale-the-offered-load-up-or-down)
     - [Can I sweep concurrency (e.g. `--concurrency 64,128,256`) in one invocation?](#q-can-i-sweep-concurrency-eg---concurrency-64128256-in-one-invocation)
 7. [Reading the results: metrics, validity, and submission requirements](#7-reading-the-results-metrics-validity-and-submission-requirements)
+    - [How do I exclude the startup transient?](#q-how-do-i-exclude-the-startup-transient)
     - [What performance numbers does the benchmark report?](#q-what-performance-numbers-does-the-benchmark-report)
     - [Are latencies measured per request or per session?](#q-are-latencies-measured-per-request-or-per-session)
     - [How do I compare two runs (or two servers) fairly?](#q-how-do-i-compare-two-runs-or-two-servers-fairly)
@@ -246,10 +248,13 @@ Three things a uniform-random-prompt benchmark cannot reproduce:
 ### Q: How is the load shaped over time?
 Each lane's **initial** session is replayed starting from a random wall-clock instant **t\*** sampled
 uniformly across the **full** recorded run (0%–100%) under the AgentX scenario (the generic
-agentic-replay default outside the scenario is 25%–75%). For each session mid-flight at t\*, the
-**single turn immediately before t\*** is sent during a **warmup** phase — that request carries the
-accumulated prefix, priming your server's cache to the session's state at t\*; everything *at or
-after* t\* is sent during the **profiling** phase that produces the reported metrics. Because t\* can
+agentic-replay default outside the scenario is 25%–75%). Everything *at or after* t\* is sent during
+the **profiling** phase that produces the reported metrics; each session's first request there carries
+its accumulated prefix. With `--agentic-warmup`, the **single turn immediately before t\*** of each
+session mid-flight at t\* is first sent during a **warmup** phase, priming your server's cache to the
+session's state at t\*. Without it (the default), the replay starts cold and the startup transient is
+excluded after the run by choosing a later measured window
+([§7](#q-how-do-i-exclude-the-startup-transient)). Because t\* can
 land anywhere, the measured window is a realistic mix of session depths — from near-cold early
 sessions through nearly-complete late ones — rather than exclusively mid-run warm-cache traffic.
 
@@ -544,13 +549,15 @@ results.)*
 Two reasons. First, real servers mostly serve sessions that are *already in progress*, so anchoring
 sessions at sampled points across their traces (rather than always at turn 0) keeps warm-cache
 behavior representative — while the full 0%–100% spread still mixes in near-cold early sessions. Second, sampling t\* uniformly across many sessions gives you a
-realistic mix of session depths in flight simultaneously. The warmup phase sends only the **single turn
-immediately before t\*** (which carries the whole accumulated prefix), so when profiling starts, each
-in-flight session's prefix is already cached on your server.
+realistic mix of session depths in flight simultaneously. With `--agentic-warmup`, the warmup phase
+sends only the **single turn immediately before t\*** (which carries the whole accumulated prefix), so
+when profiling starts, each in-flight session's prefix is already cached on your server. Without it, each
+session's first profiling request carries that prefix to a cold cache.
 
 ### Q: What exactly does the warmup phase send?
-For each in-flight session, the **single turn immediately before t\*** — enough to bring your
-server's cache to the state it would be in at t\*. Three details worth knowing:
+The warmup phase runs only with `--agentic-warmup`. For each in-flight session, it sends the **single
+turn immediately before t\*** — enough to bring your server's cache to the state it would be in at
+t\*. Three details worth knowing:
 
 - **Boundary timing.** In the default (spread) mode, warmup dispatches are timed so that **every
   session's t\* lands at the same instant** — the warmup-to-profiling boundary — so profiling begins
@@ -691,8 +698,8 @@ independent t\*, so concurrent copies of the same trace don't move in lockstep; 
 trace is sent during profiling.
 
 ### Q: Does the run length depend on the dataset size?
-The run is bounded by `--benchmark-duration` (the scenario requires at least 900 seconds and defaults
-to 1800). Lanes recycle continuously, so a small dataset is simply replayed more times; the duration,
+The run is bounded by `--measurement-start` + `--benchmark-duration` (the scenario defaults to
+720 + 1800 seconds and requires a duration of at least 900). Lanes recycle continuously, so a small dataset is simply replayed more times; the duration,
 not the dataset size, determines how long load is applied.
 
 ### Q: How do I scale the offered load up or down?
@@ -720,9 +727,24 @@ allowed under the scenario.
 
 ## 7. Reading the results: metrics, validity, and submission requirements
 
+### Q: How do I exclude the startup transient?
+The scenarios do it by default. Every replay starts with lanes idle at their sampled t\* and cold
+caches, and the per-trace idle cap releases the lanes that sit in long recorded gaps within its first
+interval (each tree's first release is staggered to a seeded random share of the cap, so they do not
+all return at once), so the first several minutes are not steady state. `--measurement-start 720` (the scenario default) starts
+every reported metric 720 seconds into profiling and runs profiling that much longer, so
+`--benchmark-duration` stays the measured length; the earlier requests still load the server.
+
+To choose a different start after the run, `--window-start-interval SECONDS` (60 under the `agentx`
+preset) writes the profiling summary for each window that starts `k × SECONDS` into profiling and ends at its
+end, under `windows/start_<offset>s/`, indexed by `windows/manifest.json`. Request metrics there cover
+requests that started in the window; server metrics deltas start from the last scrape before it. See
+[Choosing the measured window](../tutorials/agentx-mvp.md#choosing-the-measured-window).
+
 ### Q: What performance numbers does the benchmark report?
-The standard AIPerf metric set, computed over the **profiling phase only** (warmup traffic is excluded
-from every reported number). Full definitions live in
+The standard AIPerf metric set, computed over profiling requests that start after
+`--measurement-start` (warmup traffic and the startup transient are excluded from every reported
+number; per-window summaries are described above). Full definitions live in
 [the metrics reference](../metrics-reference.md); the ones a serving engineer watches here are:
 
 - **Time to First Token (TTFT)** and **Inter Token Latency (ITL)** — the streaming latency KPIs. These
@@ -1028,7 +1050,7 @@ Not as a *valid* run: any `--benchmark-duration` below 900s refuses to start (th
 - **Lowering `--concurrency`** lightens the load but shortens nothing — the 900s floor is
   wall-clock. A small concurrency at 900s is the cheapest *valid* run.
 - **A true minutes-long shakeout** (connectivity, endpoint, artifacts) is `--unsafe-override` plus a
-  short duration: it exercises the full pipeline and is marked invalid, which is fine for plumbing
+  short duration and `--measurement-start 0`: it exercises the full pipeline and is marked invalid, which is fine for plumbing
   verification.
 
 The useful trick: reconstruction cost depends on corpus size, not duration or concurrency — so run
@@ -1153,7 +1175,8 @@ The ones a serving engineer is most likely to use:
 | Setting | What it does |
 |---|---|
 | `--concurrency N` | Number of concurrent agent sessions (trees). Your main load dial. |
-| `--benchmark-duration S` | How long profiling runs (scenario minimum 900s, default 1800s). |
+| `--benchmark-duration S` | How long profiling is measured (scenario minimum 900s, default 1800s). |
+| `--measurement-start S` | Seconds into profiling at which the reported metrics start; profiling runs `S` longer (scenario default 720s, `0` reports the whole phase). |
 | `--random-seed` | Makes t\* sampling and lane selection reproducible across runs. Also required for dataset-cache reuse — the cache key includes the seed (see §8). |
 
 ### Fidelity / shape
@@ -1238,7 +1261,7 @@ ones triggers a fresh dataset reconstruction (and cache entry).
   cache hits when concurrency exceeds the trace pool, while preserving within-session sharing.
   Disabling it will make your prefix-cache numbers look better than they are.
 
-- **Warmup failures abort before profiling.** A terminal error or cancellation on any *root* session's
-  warmup turn stops the run rather than letting it report steady-state numbers against a cold/degraded
+- **Warmup failures abort before profiling** (with `--agentic-warmup`). A terminal error or
+  cancellation on any *root* session's warmup turn stops the run rather than letting it report steady-state numbers against a cold/degraded
   pool — so a clean profiling run means every root trajectory really was warm. (Subagent-stream warmup
   failures do not trigger the abort; only failures on root (depth-0) sessions' warmup requests do.)

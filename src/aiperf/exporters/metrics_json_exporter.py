@@ -91,6 +91,9 @@ class MetricsJsonExporter(MetricsBaseExporter):
         dataset = public_dataset_provenance(self._cfg)
         if dataset is not None:
             run_metadata["dataset"] = dataset
+        measurement_start_sec = getattr(self._results, "measurement_start_sec", None)
+        if isinstance(measurement_start_sec, int | float) and measurement_start_sec > 0:
+            run_metadata["measurement_start_seconds"] = measurement_start_sec
         metric_duration_coverage = getattr(
             self._results, "metric_duration_coverage", []
         )

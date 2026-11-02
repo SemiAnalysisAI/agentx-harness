@@ -85,6 +85,12 @@ class ExportContext:
     is_phase_scoped: bool = False
     """True when exporting an individual concrete phase rather than aggregate results."""
 
+    min_request_start_ns: int | None = None
+    """Inclusive lower bound on request start (ns) applied on top of phase selection,
+    for suffix-window exports and the profiling measurement start; time-indexed
+    accumulators cut their summaries there. None leaves phase-tagged selection
+    unbounded."""
+
     error_summary: list[ErrorDetailsCount] | None = None
     """De-duplicated profile-run error counts to surface in the export, if any."""
 

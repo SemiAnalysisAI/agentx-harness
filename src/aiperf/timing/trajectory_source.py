@@ -322,6 +322,11 @@ class TrajectorySource(ConversationSource):
         self._log_trajectory_summary()
 
     @property
+    def random_seed(self) -> int:
+        """Base seed every per-trace and per-lane draw is derived from."""
+        return self._random_seed
+
+    @property
     def cache_bust_ledger(self) -> CacheBustLedger:
         """Marker ledger shared by the WARMUP and PROFILING strategy instances.
 

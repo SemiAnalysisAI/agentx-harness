@@ -27,3 +27,14 @@ class ServerMetricsAccumulatorProtocol(Protocol):
     async def export_results(self, ctx: ExportContext) -> ServerMetricsResults | None:
         """Export accumulated server metrics scoped to ``ctx``."""
         ...
+
+
+@runtime_checkable
+class ServerMetricsWindowExporterProtocol(Protocol):
+    """Optional capability: export one profiling suffix window cut by time."""
+
+    async def export_window_results(
+        self, ctx: ExportContext
+    ) -> ServerMetricsResults | None:
+        """Export server metrics for ``[ctx.start_ns, ctx.end_ns]``, cut by time."""
+        ...

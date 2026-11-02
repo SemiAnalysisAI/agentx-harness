@@ -416,6 +416,16 @@ class PhaseProfileResults(AIPerfBaseModel):
     )
 
 
+class WindowProfileResults(PhaseProfileResults):
+    """Metric summary for one suffix window of the profiling phase."""
+
+    start_offset_sec: float = Field(
+        ge=0,
+        description="Window start in seconds after the profiling phase start; the "
+        "window ends at the profiling end.",
+    )
+
+
 class ProfileMetricDurationCoverage(AIPerfBaseModel):
     """Observed profiling-metric coverage relative to a configured phase duration."""
 
@@ -480,6 +490,13 @@ class ProfileResults(AIPerfBaseModel):
     was_cancelled: bool = Field(
         default=False,
         description="Whether the profile run was cancelled early",
+    )
+    measurement_start_sec: float | None = Field(
+        default=None,
+        ge=0,
+        description="Seconds after the profiling start at which the summary metrics "
+        "begin; ``start_ns`` is that instant. None when the summaries cover the "
+        "whole profiling phase.",
     )
     successful_request_count: int = Field(
         default=0,

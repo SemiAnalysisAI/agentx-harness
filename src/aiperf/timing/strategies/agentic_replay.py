@@ -64,6 +64,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
+import numpy as np
 from msgspec.structs import replace as _struct_replace
 
 from aiperf.common.constants import MILLIS_PER_SECOND
@@ -82,6 +83,7 @@ from aiperf.timing.trajectory_source import (
     TrajectorySnapshot,
     TrajectorySource,
     _as_timestamp_ms,
+    _seed_for_trace_lane,
 )
 
 _WARMUP_MAX_TOKENS = 1
@@ -1849,7 +1851,29 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
 
         root_correlation_id = self._lane_root_corr(snapshot)
         if root_correlation_id is not None:
-            self.credit_issuer.replay_gate.observe_idle_root(root_correlation_id)
+            self.credit_issuer.replay_gate.observe_idle_root(
+                root_correlation_id,
+                budget_fraction=self._initial_idle_budget_fraction(trajectory, lane),
+            )
+
+    def _initial_idle_budget_fraction(
+        self, trajectory: Trajectory, lane: int
+    ) -> float | None:
+        """Seeded per-lane share of the first idle cap, when staggering is on.
+
+        Drawn from (0, 1] so lanes waiting out long recorded gaps are released
+        spread over one cap interval instead of all at once.
+        """
+        if not Environment.AGENTX.STAGGER_INITIAL_IDLE_CAP:
+            return None
+        rng = np.random.default_rng(
+            _seed_for_trace_lane(
+                self.conversation_source.random_seed,
+                f"{trajectory.conversation_id}:initial-idle-cap",
+                lane,
+            )
+        )
+        return 1.0 - rng.random()
 
     def _get_snapshot(self, trajectory: Trajectory) -> TrajectorySnapshot:
         """Return the persistent sampled snapshot for a trajectory lane.

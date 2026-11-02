@@ -381,7 +381,7 @@ class TimingResolver:
             if phase.duration is None:
                 duration_unknown = True
                 continue
-            total += phase.duration
+            total += phase.duration + (phase.measurement_start or 0.0)
             if phase.grace_period is not None:
                 total += phase.grace_period
 

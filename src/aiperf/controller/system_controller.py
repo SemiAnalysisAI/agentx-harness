@@ -1283,6 +1283,15 @@ class SystemController(SignalHandlerMixin, BaseService):
         duration = self._profile_results.get(BenchmarkDurationMetric.tag)
         if duration:
             duration_str = f"[bold green]{BenchmarkDurationMetric.header}[/bold green]: {duration.avg:.2f} {duration.unit}"
+            measurement_start_sec = self._profile_results.results.measurement_start_sec
+            if (
+                isinstance(measurement_start_sec, int | float)
+                and measurement_start_sec > 0
+            ):
+                duration_str += (
+                    f" (summaries start {measurement_start_sec:g}s after the "
+                    "profiling start)"
+                )
             if self._was_cancelled:
                 duration_str += " [italic yellow](cancelled early)[/italic yellow]"
             console.print(duration_str)

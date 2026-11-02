@@ -56,6 +56,7 @@ from aiperf.common.enums import (
     VideoFormat,
     VideoSynthType,
 )
+from aiperf.common.finite import FiniteFloat
 from aiperf.config.artifacts import OutputDefaults
 from aiperf.config.base import BaseConfig
 from aiperf.config.cli_parameter import CLIParameter, Groups
@@ -1948,6 +1949,26 @@ class CLIConfig(BaseConfig):
         ),
     ] = 30.0
 
+    measurement_start: Annotated[
+        Annotated[FiniteFloat, Field(ge=0)] | None,
+        Field(
+            description="Seconds after the profiling start at which the reported summary "
+            "metrics begin (console table, `profile_export_aiperf.json`/`.csv`, server "
+            "metrics and GPU telemetry summaries). The profiling phase runs "
+            "`--measurement-start` + `--benchmark-duration` seconds, so "
+            "`--benchmark-duration` stays the measured length. Requests started earlier "
+            "still load the server and appear in the per-request records, timeslices "
+            "and suffix windows. Requires `--benchmark-duration` (or a scenario "
+            "default) and a profiling phase that is the only phase; cannot be combined "
+            "with `--agentic-warmup`. The `agentx` and `inferencex-agentx-mvp` "
+            "scenarios default to 720; 0 turns it off.",
+        ),
+        CLIParameter(
+            name=("--measurement-start",),
+            group=Groups.LOAD_GENERATOR,
+        ),
+    ] = None
+
     concurrency: Annotated[
         Any,
         Field(
@@ -2269,6 +2290,25 @@ class CLIConfig(BaseConfig):
         ),
     ] = None
 
+    agentic_warmup: Annotated[
+        bool,
+        Field(
+            description="AGENTIC_REPLAY only: run the synthesized warmup phase "
+            "(t* snapshot primers, plus the optional cache-pressure substage) "
+            "before profiling. Off by default: profiling replays from t* with no "
+            "preceding warmup, so the server sees one continuous replay, and "
+            "`--measurement-start` excludes the startup transient from the "
+            "reported metrics instead. Cannot be combined with a nonzero "
+            "`--measurement-start` (the AgentX scenarios default it to 720; pass "
+            "`--measurement-start 0`). Required by `--agentic-cache-warmup-duration`, "
+            "`--warmup-requests-per-lane` and `--agentic-warmup-grace-period`.",
+        ),
+        CLIParameter(
+            name=("--agentic-warmup",),
+            group=Groups.WARMUP,
+        ),
+    ] = False
+
     agentic_cache_warmup_duration: Annotated[
         float | None,
         Field(
@@ -2278,7 +2318,7 @@ class CLIConfig(BaseConfig):
             "trajectories without recorded idle delays and with one-token outputs, "
             "then drains and resumes profiling from the resulting trajectory state "
             "using each live stream's residual next-turn delay. Mutually exclusive "
-            "with --warmup-requests-per-lane.",
+            "with --warmup-requests-per-lane. Requires --agentic-warmup.",
         ),
         CLIParameter(
             name=("--agentic-cache-warmup-duration",),
@@ -2294,7 +2334,7 @@ class CLIConfig(BaseConfig):
             "budget per concurrency lane, additional to mandatory snapshot "
             "primers. For example, 10 with concurrency 16 sends 160 additional "
             "cache-pressure requests after the primers. Mutually exclusive with "
-            "--agentic-cache-warmup-duration.",
+            "--agentic-cache-warmup-duration. Requires --agentic-warmup.",
         ),
         CLIParameter(
             name=("--warmup-requests-per-lane",),
@@ -2312,7 +2352,8 @@ class CLIConfig(BaseConfig):
             "the profiling phase rather than a user-declared warmup phase, so it "
             "does NOT honor `--warmup-grace-period` (which requires "
             "`--warmup-duration`). If not set, the warmup barrier waits "
-            "indefinitely until every primed trajectory returns.",
+            "indefinitely until every primed trajectory returns. Requires "
+            "`--agentic-warmup`.",
         ),
         CLIParameter(
             name=("--agentic-warmup-grace-period",),
@@ -2572,6 +2613,24 @@ class CLIConfig(BaseConfig):
             group=Groups.OUTPUT,
         ),
     ] = OutputDefaults.SLICE_DURATION
+
+    window_start_interval: Annotated[
+        Annotated[FiniteFloat, Field(ge=0)] | None,
+        Field(
+            description="Spacing in seconds of suffix-window start offsets. At run end, "
+            "AIPerf also exports the profiling summary (request metrics, server "
+            "metrics, GPU telemetry) for each window that starts k * interval "
+            "seconds after the profiling start and ends at the profiling end, under "
+            "`windows/start_<offset>s/` with an index in `windows/manifest.json`, so "
+            "the measured window can be chosen after the run. Requires a single "
+            "profiling phase that is the last phase. 0 disables windows, overriding "
+            "a scenario preset.",
+        ),
+        CLIParameter(
+            name=("--window-start-interval",),
+            group=Groups.OUTPUT,
+        ),
+    ] = None
 
     auto_plot: Annotated[
         bool | None,

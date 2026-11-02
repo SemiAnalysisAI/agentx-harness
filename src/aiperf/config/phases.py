@@ -13,12 +13,14 @@ from __future__ import annotations
 from typing import Annotated, ClassVar, Literal, Self
 
 from pydantic import (
+    BeforeValidator,
     ConfigDict,
     Discriminator,
     Field,
     model_validator,
 )
 
+from aiperf.common.finite import FiniteFloat
 from aiperf.common.phase import infer_legacy_phase_kind
 from aiperf.common.types import PhaseKind
 from aiperf.config.adaptive_scale_phase import AdaptiveScalePhaseMixin
@@ -218,6 +220,21 @@ class BasePhaseConfig(AdaptiveScalePhaseMixin, BaseConfig):
         ),
     ]
 
+    measurement_start: Annotated[
+        Annotated[FiniteFloat, Field(ge=0)] | None,
+        BeforeValidator(_normalize_duration),
+        Field(
+            default=None,
+            description="Profiling only: seconds after the profiling start at which "
+            "the reported summary metrics begin (must be >= 0). The phase runs "
+            "measurement_start + duration seconds, so 'duration' stays the measured "
+            "length; requests started earlier still reach the server and the "
+            "per-request records, but not the summaries. Requires 'duration', a "
+            "profiling phase that is the only phase, and no agentic warmup. Unset "
+            "means 0 unless a scenario sets a default. Supports: 720, '12m'.",
+        ),
+    ]
+
     cancellation: Annotated[
         CancellationConfig | None,
         Field(
@@ -344,6 +361,20 @@ class BasePhaseConfig(AdaptiveScalePhaseMixin, BaseConfig):
             "request arrives within this limit. Per-trace timing, timer order, "
             "and relative spacing are otherwise preserved. None disables the "
             "global idle cap.",
+        ),
+    ]
+
+    agentic_warmup: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="AGENTIC_REPLAY only: run the synthesized warmup phase "
+            "(t* snapshot primers, plus the optional cache-pressure substage) "
+            "before profiling. Off by default: profiling replays from t* with "
+            "no preceding warmup, so the server sees one continuous replay. "
+            "Cannot be combined with a nonzero measurement_start. Required by "
+            "agentic_cache_warmup_duration, warmup_requests_per_lane and "
+            "agentic_warmup_grace_period.",
         ),
     ]
 

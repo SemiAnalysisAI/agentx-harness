@@ -647,6 +647,35 @@ class TestTimingResolver:
 
         assert run.resolved.total_expected_duration == 70.0
 
+    def test_includes_measurement_start(self, tmp_path):
+        config = BenchmarkConfig(
+            models=["test-model"],
+            endpoint={"urls": ["http://localhost:8000/v1/chat/completions"]},
+            datasets=[
+                {
+                    "name": "main",
+                    "type": "synthetic",
+                    "entries": 10,
+                    "prompts": {"isl": 32},
+                }
+            ],
+            phases=[
+                {
+                    "name": "profiling",
+                    "type": "concurrency",
+                    "duration": 60,
+                    "grace_period": 10,
+                    "measurement_start": 30,
+                    "concurrency": 1,
+                }
+            ],
+        )
+        run = _make_run(config, artifact_dir=tmp_path)
+
+        TimingResolver().resolve(run)
+
+        assert run.resolved.total_expected_duration == 100.0
+
     def test_none_when_phase_lacks_duration(self, tmp_path):
         config = BenchmarkConfig(
             models=["test-model"],

@@ -18,6 +18,8 @@ import copy
 import logging
 from typing import TYPE_CHECKING, Any
 
+from pydantic.alias_generators import to_camel
+
 from aiperf.common.enums import DatasetType
 from aiperf.common.phase import infer_legacy_phase_kind
 from aiperf.config.flags._resolver_gpu_telemetry import (
@@ -102,7 +104,9 @@ def resolve_config(
         if pre_overrides
         else yaml_dict
     )
-    base_config = AIPerfConfig.model_validate(pre_merged)
+    base_config = AIPerfConfig.model_validate(
+        _for_preliminary_validation(pre_merged, cli_config)
+    )
 
     overrides = build_cli_overrides(cli_config, benchmark_config=base_config.benchmark)
     overrides = _wrap_under_envelope(overrides) if overrides else overrides
@@ -118,7 +122,31 @@ def resolve_config(
         promote_magic_lists_to_sweep_block=_promote_magic_lists_to_sweep_block,
         retarget_dataset_magic_lists=_retarget_dataset_magic_lists,
     )
-    return AIPerfConfig.model_validate(merged)
+    config = AIPerfConfig.model_validate(merged)
+    _reject_ignored_generic_warmup_flags(cli_config, config)
+    return config
+
+
+def _reject_ignored_generic_warmup_flags(cli: CLIConfig, config: Any) -> None:
+    """Reject CLI generic warmup triggers on an agentic replay config file run."""
+    from aiperf.common.scenario import get_scenario
+    from aiperf.config.flags.converter import reject_ignored_generic_warmup_flags
+    from aiperf.plugin.enums import TimingMode
+    from aiperf.timing.config import _is_agentic_replay
+
+    benchmark = config.benchmark
+    profiling_phases = benchmark.get_profiling_phases()
+    agentic = (
+        get_scenario(benchmark.scenario).timing_mode == TimingMode.AGENTIC_REPLAY
+        if benchmark.scenario is not None
+        else _is_agentic_replay(profiling_phases)
+    )
+    if agentic:
+        reject_ignored_generic_warmup_flags(
+            cli,
+            agentic_warmup=any(phase.agentic_warmup for phase in profiling_phases),
+            context="agentic replay",
+        )
 
 
 def _normalize_loaded_benchmark_shorthands(yaml_dict: dict[str, Any]) -> None:
@@ -408,6 +436,7 @@ _LOADGEN_PHASE_FIELD_MAP: tuple[tuple[str, str], ...] = (
     ("request_count", "requests"),
     ("benchmark_duration", "duration"),
     ("benchmark_grace_period", "grace_period"),
+    ("measurement_start", "measurement_start"),
     ("concurrency", "concurrency"),
     ("prefill_concurrency", "prefill_concurrency"),
     ("request_rate", "rate"),
@@ -478,6 +507,9 @@ def _apply_phase_loadgen_overrides(merged: dict[str, Any], cli: CLIConfig) -> No
         value = getattr(cli, attr)
         if value is None:
             continue
+        # A camelCase YAML key next to the snake_case override would be
+        # rejected as an extra input.
+        target.pop(to_camel(key), None)
         target[key] = value
 
     if (
@@ -489,6 +521,65 @@ def _apply_phase_loadgen_overrides(merged: dict[str, Any], cli: CLIConfig) -> No
         target["grace_period"] = cli.benchmark_grace_period
 
     _apply_agentic_replay_fields(target, cli)
+
+
+_MEASUREMENT_START_KEYS = frozenset({"measurement_start", "measurementStart"})
+
+
+def _for_preliminary_validation(
+    config_dict: dict[str, Any], cli: CLIConfig
+) -> dict[str, Any]:
+    """Return the config dict the preliminary (recipe-view) validation sees.
+
+    The AGENTIC_REPLAY phase flags are overlaid so --agentic-warmup reaches a
+    YAML that carries agentic warmup tuning (see
+    :func:`_apply_phase_loadgen_overrides` for the full overlay). The suffix
+    window interval and the phases' measurement start are dropped: their
+    cross-field checks need the CLI overrides merged first (e.g.
+    ``--measurement-start 0``), and the final validation runs them on the
+    merged config.
+    """
+    from aiperf.config.flags._converter_profiling import (
+        _AGENTIC_REPLAY_ROUTES,
+        _apply_agentic_replay_fields,
+    )
+
+    benchmark = config_dict.get("benchmark")
+    if not isinstance(benchmark, dict):
+        return config_dict
+    artifacts = benchmark.get("artifacts")
+    window_keys = (
+        {"window_start_interval", "windowStartInterval"} & artifacts.keys()
+        if isinstance(artifacts, dict)
+        else set()
+    )
+    phases = benchmark.get("phases")
+    phase_entries = (
+        [entry for entry in phases if isinstance(entry, dict)]
+        if isinstance(phases, list)
+        else []
+    )
+    has_measurement_start = any(
+        _MEASUREMENT_START_KEYS & entry.keys() for entry in phase_entries
+    )
+    overlay_agentic = bool(
+        cli.model_fields_set.intersection(_AGENTIC_REPLAY_ROUTES)
+    ) and bool(phase_entries)
+    if not window_keys and not has_measurement_start and not overlay_agentic:
+        return config_dict
+    config_dict = copy.deepcopy(config_dict)
+    benchmark = config_dict["benchmark"]
+    for key in window_keys:
+        benchmark["artifacts"].pop(key)
+    for entry in benchmark.get("phases") or []:
+        if isinstance(entry, dict):
+            for key in _MEASUREMENT_START_KEYS & entry.keys():
+                entry.pop(key)
+    if overlay_agentic:
+        target = _find_profiling_phase(benchmark["phases"])
+        if target is not None:
+            _apply_agentic_replay_fields(target, cli)
+    return config_dict
 
 
 def _reject_loadgen_target_collisions(fields_set: set[str]) -> None:

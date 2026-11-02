@@ -98,6 +98,7 @@ from aiperf.common.models.record_models import (
     TokenCounts,
     ToolCallResponseData,
     VideoResponseData,
+    WindowProfileResults,
 )
 from aiperf.common.models.sequence_distribution import (
     DistributionParser,
@@ -279,6 +280,7 @@ __all__ = [
     "Usage",
     "Video",
     "VideoResponseData",
+    "WindowProfileResults",
     "WorkerProcessingStats",
     "WorkerStats",
     "WorkerTaskStats",

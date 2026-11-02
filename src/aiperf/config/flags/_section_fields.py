@@ -142,6 +142,7 @@ OUTPUT_FIELDS: frozenset[str] = frozenset(
         "profile_export_prefix",
         "show_trace_timing",
         "slice_duration",
+        "window_start_interval",
     }
 )
 
@@ -164,6 +165,7 @@ LOADGEN_FIELDS: frozenset[str] = frozenset(
         "concurrency",
         "concurrency_ramp_duration",
         "failed_request_threshold",
+        "measurement_start",
         "num_users",
         "prefill_concurrency",
         "prefill_concurrency_ramp_duration",

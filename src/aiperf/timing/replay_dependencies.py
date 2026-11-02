@@ -204,19 +204,25 @@ class ReplayBarrierCoordinator:
             state.idle_watchdog.cancel()
             state.idle_watchdog = None
 
-    def observe_idle_root(self, root_id: str) -> None:
+    def observe_idle_root(
+        self, root_id: str, *, budget_fraction: float | None = None
+    ) -> None:
         """Start monitoring a known-idle tree with pending runtime work.
 
         Profiling snapshots may begin with every stream scheduled in the
         future, before any request from that runtime root has reached the wire.
         Registering the root after those timers are installed lets the same
         completion-driven watchdog cover that initial idle interval.
+        ``budget_fraction`` in (0, 1] arms that first watchdog with only that
+        fraction of the cap, as if the tree had already been idle for the rest.
         """
         if not self._active:
             return
         state = self._root_state(root_id)
         if state.in_flight == 0:
-            self._arm_root_idle_watchdog(root_id, state)
+            self._arm_root_idle_watchdog(
+                root_id, state, budget_fraction=budget_fraction
+            )
 
     def activate(self) -> None:
         """Enable barriers after baseline cache priming completes."""
@@ -292,7 +298,13 @@ class ReplayBarrierCoordinator:
             state.idle_cap_expired = False
             self._arm_root_idle_watchdog(root_id, state)
 
-    def _arm_root_idle_watchdog(self, root_id: str, state: _RootBarrierState) -> None:
+    def _arm_root_idle_watchdog(
+        self,
+        root_id: str,
+        state: _RootBarrierState,
+        *,
+        budget_fraction: float | None = None,
+    ) -> None:
         """Advance only this tree's timers after a fully idle capped gap."""
         cap = self._root_idle_gap_cap_seconds
         if (
@@ -304,6 +316,8 @@ class ReplayBarrierCoordinator:
             return
         loop = asyncio.get_running_loop()
         delay = 0.0 if state.idle_cap_expired else cap
+        if budget_fraction is not None:
+            delay *= budget_fraction
         state.idle_watchdog = loop.call_later(
             delay, self._enforce_root_idle_cap, root_id
         )
@@ -497,9 +511,13 @@ class ReplayIssueGate:
         if self._coordinator is not None:
             self._coordinator.complete(credit)
 
-    def observe_idle_root(self, root_correlation_id: str) -> None:
+    def observe_idle_root(
+        self, root_correlation_id: str, *, budget_fraction: float | None = None
+    ) -> None:
         if self._coordinator is not None:
-            self._coordinator.observe_idle_root(root_correlation_id)
+            self._coordinator.observe_idle_root(
+                root_correlation_id, budget_fraction=budget_fraction
+            )
 
     def close_root(self, root_correlation_id: str) -> None:
         if self._coordinator is not None:

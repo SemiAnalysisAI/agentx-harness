@@ -445,3 +445,49 @@ async def test_resumed_prefix_is_exact_and_submission_order_independent(
 async def _record_issue(issued: list[str], name: str) -> bool:
     issued.append(name)
     return True
+
+
+@pytest.mark.asyncio
+async def test_initial_idle_budget_fraction_shortens_first_watchdog() -> None:
+    scheduler = LoopScheduler()
+    coordinator = ReplayBarrierCoordinator(
+        _metadata(),
+        scheduler=scheduler,
+        root_idle_gap_cap_seconds=0.4,
+    )
+    coordinator.activate()
+    fired = asyncio.Event()
+
+    async def mark_fired() -> None:
+        fired.set()
+
+    scheduler.schedule_later(5.0, mark_fired(), group_id="one")
+    started = asyncio.get_running_loop().time()
+    coordinator.observe_idle_root("one", budget_fraction=0.1)
+    await asyncio.wait_for(fired.wait(), timeout=0.3)
+
+    assert asyncio.get_running_loop().time() - started < 0.3
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_rearms_full_cap_after_fractional_first_budget() -> None:
+    """Only the first watchdog uses the budget fraction; later idle gaps get the cap."""
+    scheduler = MagicMock()
+    scheduler.cap_pending_delay_for_group.return_value = 1.0
+    coordinator = ReplayBarrierCoordinator(
+        _metadata(),
+        scheduler=scheduler,
+        root_idle_gap_cap_seconds=30.0,
+    )
+    coordinator.activate()
+    loop = asyncio.get_running_loop()
+
+    coordinator.observe_idle_root("one", budget_fraction=0.1)
+    first = coordinator._roots["one"].idle_watchdog
+    assert first.when() - loop.time() == pytest.approx(3.0, abs=0.5)
+
+    coordinator.observe_issued(_credit("a", "one"))
+    coordinator.complete(_credit("a", "one"))
+    second = coordinator._roots["one"].idle_watchdog
+    assert second.when() - loop.time() == pytest.approx(30.0, abs=0.5)
+    coordinator.close_root("one")

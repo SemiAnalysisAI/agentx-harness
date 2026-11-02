@@ -42,6 +42,7 @@ from aiperf.config.accuracy import (
 )
 from aiperf.config.artifacts import (
     ArtifactsConfig,
+    OutputDefaults,
 )
 from aiperf.config.base import BaseConfig
 from aiperf.config.comm.build import build_comm_config
@@ -99,6 +100,16 @@ from aiperf.config.wandb import (
 )
 
 _logger = AIPerfLogger(__name__)
+
+# (profiling-phase field, CLI flag) pairs that only tune the opt-in agentic warmup.
+_AGENTIC_WARMUP_DEPENDENT_FLAGS: tuple[tuple[str, str], ...] = (
+    ("agentic_cache_warmup_duration", "--agentic-cache-warmup-duration"),
+    ("warmup_requests_per_lane", "--warmup-requests-per-lane"),
+    (
+        "agentic_warmup_grace_period",
+        "--agentic-warmup-grace-period (or --warmup-grace-period under --scenario)",
+    ),
+)
 
 # `aiperf.config.plot` is imported lazily inside `_resolve_plot_path`. A
 # top-level import would cycle: aiperf.config.plot -> aiperf.plot.core ->
@@ -607,7 +618,7 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
 
     @model_validator(mode="after")
     def validate_agentic_cache_warmup(self) -> Self:
-        """Restrict accelerated cache warmup to the agentic_replay timing mode.
+        """Gate the opt-in agentic warmup to the agentic_replay timing mode.
 
         The mutually exclusive duration and deterministic request-budget modes
         are consumed solely by
@@ -626,20 +637,32 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
         same ``_is_agentic_replay``/``_phase_timing_mode`` logic the timing
         builder uses (explicit ``timing_mode`` override, else the phase-type
         mapping) and reject the flag when nothing resolves to AGENTIC_REPLAY.
+
+        The agentic warmup is opt-in (``agentic_warmup``), and its tuning
+        fields are rejected without it rather than silently ignored.
         """
         from aiperf.plugin.enums import TimingMode
         from aiperf.timing.config import _is_agentic_replay
 
         profiling_phases = self.get_profiling_phases()
-        has_duration = any(
-            getattr(phase, "agentic_cache_warmup_duration", None) is not None
+        for phase in profiling_phases:
+            if getattr(phase, "agentic_warmup", False) is True:
+                continue
+            dependent = [
+                flag
+                for attr, flag in _AGENTIC_WARMUP_DEPENDENT_FLAGS
+                if getattr(phase, attr, None) is not None
+            ]
+            if dependent:
+                raise ValueError(
+                    f"Passing {', '.join(dependent)} requires --agentic-warmup "
+                    "(the agentic warmup phase is off by default)."
+                )
+        has_warmup = any(
+            getattr(phase, "agentic_warmup", False) is True
             for phase in profiling_phases
         )
-        has_request_budget = any(
-            getattr(phase, "warmup_requests_per_lane", None) is not None
-            for phase in profiling_phases
-        )
-        if not has_duration and not has_request_budget:
+        if not has_warmup:
             return self
 
         if any(
@@ -658,7 +681,7 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
             scenario_timing_mode = get_scenario(self.scenario).timing_mode
             if scenario_timing_mode != TimingMode.AGENTIC_REPLAY:
                 raise ValueError(
-                    "agentic cache warmup requires the agentic_replay "
+                    "--agentic-warmup requires the agentic_replay "
                     f"timing mode; scenario {self.scenario!r} locks "
                     f"timing_mode={scenario_timing_mode}."
                 )
@@ -666,11 +689,89 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
 
         if not _is_agentic_replay(profiling_phases):
             raise ValueError(
-                "agentic cache warmup requires the agentic_replay "
+                "--agentic-warmup requires the agentic_replay "
                 "timing mode (set today by --scenario inferencex-agentx-mvp); "
                 "the profiling phase(s) are not agentic_replay."
             )
         return self
+
+    @model_validator(mode="after")
+    def validate_window_start_interval(self) -> Self:
+        """Bound suffix windows to a single profiling phase that ends the run.
+
+        Windows run from the profiling start to the profiling end and select
+        requests by phase kind, so several profiling phases would put the gaps
+        between them inside a window, and a trailing phase would leak into its
+        server metrics. A duration-bounded phase also caps the window count.
+        """
+        interval = self.artifacts.window_start_interval
+        if interval is None:
+            return self
+        profiling_phases = self.get_profiling_phases()
+        if len(profiling_phases) != 1 or self.phases[-1] is not profiling_phases[0]:
+            raise ValueError(
+                "--window-start-interval requires exactly one profiling phase, and "
+                "it must be the last phase; got phases "
+                f"{[(phase.name, phase.kind) for phase in self.phases]}."
+            )
+        duration = profiling_phases[0].duration
+        if isinstance(duration, int | float):
+            duration += profiling_phases[0].measurement_start or 0.0
+        max_windows = OutputDefaults.MAX_SUFFIX_WINDOWS
+        if isinstance(duration, int | float) and duration / interval > max_windows:
+            raise ValueError(
+                f"--window-start-interval {interval:g} gives more than {max_windows} "
+                f"windows for a {duration:g}s profiling phase; use an interval of at "
+                f"least {duration / max_windows:g}s."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_measurement_start(self) -> Self:
+        """Reject a measurement start the summaries cannot honor.
+
+        A scenario fills ``duration`` after this validator runs and re-checks
+        with :func:`measurement_start_error` once it has.
+        """
+        error = measurement_start_error(
+            self, allow_missing_duration=self.scenario is not None
+        )
+        if error is not None:
+            raise ValueError(error)
+        return self
+
+
+def measurement_start_error(
+    cfg: BenchmarkConfig, *, allow_missing_duration: bool = False
+) -> str | None:
+    """Return why a nonzero ``measurement_start`` cannot apply to ``cfg``, or None.
+
+    The summaries cut one phase's requests at a single offset and the phase is
+    extended by that offset, so the profiling phase must be the only phase and
+    duration-bounded. The agentic warmup already excludes a startup period;
+    combining both would discard it twice.
+    """
+    offset_phases = [phase for phase in cfg.phases if phase.measurement_start]
+    if not offset_phases:
+        return None
+    phase = offset_phases[0]
+    if len(cfg.phases) != 1 or phase.kind != "profiling":
+        return (
+            "--measurement-start requires a profiling phase that is the only phase; "
+            f"got phases {[(p.name, p.kind) for p in cfg.phases]}."
+        )
+    if phase.agentic_warmup:
+        return (
+            f"--measurement-start {phase.measurement_start:g} cannot be combined with "
+            "--agentic-warmup, which already excludes a startup period; pass "
+            "--measurement-start 0 to use the agentic warmup."
+        )
+    if phase.duration is None and not allow_missing_duration:
+        return (
+            "--measurement-start requires --benchmark-duration: the profiling phase "
+            "runs measurement start + duration seconds."
+        )
+    return None
 
 
 class AIPerfConfig(BaseConfig):

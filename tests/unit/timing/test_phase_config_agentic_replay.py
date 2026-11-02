@@ -3,6 +3,8 @@
 """AGENTIC_REPLAY warmup/profiling CreditPhaseConfig construction."""
 
 import pydantic
+import pytest
+from pytest import param
 
 from aiperf.common.enums import CreditPhase
 from aiperf.config.phases import PhaseConfig
@@ -25,8 +27,22 @@ def _ar_profiling_phase(concurrency: int = 10, duration: float = 900) -> PhaseCo
             "concurrency": concurrency,
             "duration": duration,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
         }
     )
+
+
+def test_warmup_config_absent_without_agentic_warmup() -> None:
+    phase = _PHASE_ADAPTER.validate_python(
+        {
+            "name": "profiling",
+            "type": "concurrency",
+            "concurrency": 10,
+            "duration": 900,
+            "timing_mode": TimingMode.AGENTIC_REPLAY,
+        }
+    )
+    assert _build_agentic_warmup_config(phase) is None
 
 
 def test_warmup_config_uses_agentic_replay_when_top_level_is_agentic_replay() -> None:
@@ -50,6 +66,35 @@ def test_profiling_config_propagates_cap() -> None:
     )
     assert profiling.timing_mode == TimingMode.AGENTIC_REPLAY
     assert profiling.phase == CreditPhase.PROFILING
+
+
+@pytest.mark.parametrize(
+    ("measurement_start", "expected"),
+    [
+        param(None, 900.0, id="unset"),
+        param(0, 900.0, id="zero"),
+        param(720, 1620.0, id="offset-added"),
+    ],
+)  # fmt: skip
+def test_profiling_config_runs_measurement_start_plus_duration(
+    measurement_start: float | None, expected: float
+) -> None:
+    phase = _PHASE_ADAPTER.validate_python(
+        {
+            "name": "profiling",
+            "type": "concurrency",
+            "concurrency": 10,
+            "duration": 900,
+            "measurement_start": measurement_start,
+        }
+    )
+    profiling = _build_profiling_config(
+        phase,
+        default_cancellation=RequestCancellationConfig(),
+        phase_index=0,
+        profiling_index=0,
+    )
+    assert profiling.expected_duration_sec == expected
 
 
 def test_warmup_config_total_expected_requests_set() -> None:
@@ -87,6 +132,7 @@ def test_warmup_grace_uses_agentic_warmup_grace_period() -> None:
             "concurrency": 10,
             "duration": 900,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_warmup_grace_period": 30.0,
         }
     )
@@ -105,6 +151,7 @@ def test_warmup_grace_ignores_profiling_grace_period() -> None:
             "duration": 900,
             "grace_period": 45.0,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
         }
     )
     warmup = _build_agentic_warmup_config(phase)
@@ -121,6 +168,7 @@ def test_warmup_grace_zero_is_honored() -> None:
             "concurrency": 10,
             "duration": 900,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_warmup_grace_period": 0.0,
         }
     )
@@ -139,6 +187,7 @@ def test_cache_warmup_uses_strategy_controlled_stop() -> None:
             "duration": 900,
             "grace_period": 30.0,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_cache_warmup_duration": 600.0,
         }
     )
@@ -160,6 +209,7 @@ def test_cache_warmup_request_budget_scales_with_concurrency() -> None:
             "concurrency": 16,
             "duration": 900,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "warmup_requests_per_lane": 10,
         }
     )
@@ -181,6 +231,7 @@ def test_cache_warmup_grace_uses_short_duration_without_benchmark_grace() -> Non
             "concurrency": 10,
             "duration": 900,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_cache_warmup_duration": 2.0,
         }
     )
@@ -200,6 +251,7 @@ def test_cache_warmup_grace_keeps_larger_benchmark_grace() -> None:
             "duration": 900,
             "grace_period": 30.0,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_cache_warmup_duration": 2.0,
         }
     )
@@ -219,6 +271,7 @@ def test_cache_warmup_explicit_warmup_grace_overrides_benchmark_grace() -> None:
             "duration": 900,
             "grace_period": 30.0,
             "timing_mode": TimingMode.AGENTIC_REPLAY,
+            "agentic_warmup": True,
             "agentic_cache_warmup_duration": 600.0,
             "agentic_warmup_grace_period": 7.0,
         }

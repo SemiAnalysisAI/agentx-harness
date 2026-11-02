@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from aiperf.common.enums import ExportLevel
+from aiperf.common.finite import FiniteFloat
 from aiperf.config.base import BaseConfig
 from aiperf.config.phases import _normalize_duration
 from aiperf.config.user_files import UserFile
@@ -68,6 +69,8 @@ class OutputDefaults:
     EXPORT_HTTP_TRACE = False
     SHOW_TRACE_TIMING = False
     SLICE_DURATION = None
+    # Every window is a full summary built at run end, so the grid stays bounded.
+    MAX_SUFFIX_WINDOWS = 256
 
 
 class ArtifactsConfig(BaseConfig):
@@ -153,6 +156,19 @@ class ArtifactsConfig(BaseConfig):
             description="Time slice duration in seconds for trend analysis (must be > 0). "
             "Divides benchmark into windows for per-window statistics. "
             "Supports: 30, '30s', '5m', '2h'.",
+        ),
+    ]
+
+    window_start_interval: Annotated[
+        Annotated[FiniteFloat, Field(gt=0)] | None,
+        BeforeValidator(_normalize_duration),
+        Field(
+            default=None,
+            description="Spacing in seconds of suffix-window start offsets (must be > 0). "
+            "At run end, AIPerf also exports the profiling summary for each window "
+            "that starts k * interval seconds after the profiling start and ends at "
+            "the profiling end, under `windows/`, so the measured window can be "
+            "chosen after the run. Supports: 60, '60s', '5m'.",
         ),
     ]
 

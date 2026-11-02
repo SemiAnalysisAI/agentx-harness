@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 
 from pydantic import ConfigDict, Field, model_validator
 
+from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.enums import CacheBustTarget, CreditPhase
 from aiperf.common.models.base_models import AIPerfBaseModel
 from aiperf.common.types import PhaseKind
@@ -47,6 +48,9 @@ _PHASE_TYPE_TO_ARRIVAL_PATTERN: dict[PhaseType, ArrivalPattern] = {
     PhaseType.CONCURRENCY: ArrivalPattern.CONCURRENCY_BURST,
     PhaseType.FIXED_SCHEDULE: ArrivalPattern.CONCURRENCY_BURST,
 }
+
+
+_logger = AIPerfLogger(__name__)
 
 
 def _phase_timing_mode(phase: PhaseConfig) -> TimingMode:
@@ -169,9 +173,16 @@ class TimingConfig(AIPerfBaseModel):
             if agentic_warmup is not None:
                 configs.append(agentic_warmup)
 
+        warmup_synthesized = bool(configs)
         profiling_index = 0
         for phase_index, phase in enumerate(cfg.phases):
             if agentic and phase.kind == "warmup":
+                if not warmup_synthesized:
+                    _logger.warning(
+                        f"Ignoring warmup phase {phase.name!r}: agentic replay runs "
+                        "no declared warmup phase, and its own warmup requires "
+                        "agentic_warmup on the profiling phase."
+                    )
                 continue
             current_profiling_index = None
             if phase.kind == "profiling":
@@ -578,6 +589,14 @@ def _build_warmup_config(
     )
 
 
+def _profiling_run_duration(phase: PhaseConfig) -> float | None:
+    """Seconds the profiling phase issues credits: the measured duration plus the
+    measurement start, whose earlier requests the summaries exclude."""
+    if phase.duration is None:
+        return None
+    return phase.duration + (phase.measurement_start or 0.0)
+
+
 def _agentic_warmup_grace_period(phase: PhaseConfig) -> float | None:
     """Resolve the agentic auto-warmup barrier grace from the profiling phase.
 
@@ -625,7 +644,11 @@ def _build_agentic_warmup_config(phase: PhaseConfig) -> CreditPhaseConfig | None
     warmup, where the strategy-terminated drain must be bounded: there the
     benchmark grace period (resolved onto the profiling phase's
     ``grace_period``) caps the drain instead.
+
+    Returns None unless the profiling phase opts in with ``agentic_warmup``.
     """
+    if getattr(phase, "agentic_warmup", False) is not True:
+        return None
     concurrency = getattr(phase, "concurrency", None)
     grace_period = _agentic_warmup_grace_period(phase)
     cache_warmup_duration = getattr(phase, "agentic_cache_warmup_duration", None)
@@ -692,7 +715,7 @@ def _build_profiling_config(
         phase_kind=phase.kind,
         request_cancellation=_phase_cancellation_config(phase, default_cancellation),
         timing_mode=timing_mode,
-        expected_duration_sec=phase.duration,
+        expected_duration_sec=_profiling_run_duration(phase),
         total_expected_requests=phase.requests,
         expected_num_sessions=phase.sessions,
         concurrency=phase.concurrency,

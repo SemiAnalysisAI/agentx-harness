@@ -440,6 +440,47 @@ def test_duration_unset_auto_filled_to_scenario_default() -> None:
     assert run.cfg.get_profiling_phases()[0].duration == 1800.0
 
 
+@pytest.mark.parametrize("scenario", ["inferencex-agentx-mvp", "agentx"])
+def test_measurement_start_unset_auto_filled_to_scenario_default(
+    scenario: str,
+) -> None:
+    run = _build_run(scenario=scenario, streaming=True, extra={"ignore_eos": True})
+    outcome = apply_scenario(run)
+    assert run.cfg.get_profiling_phases()[0].measurement_start == 720.0
+    assert "default_measurement_start" in outcome.applied_locks
+
+
+@pytest.mark.parametrize("value", [0.0, 300.0])
+def test_measurement_start_explicit_value_honored(value: float) -> None:
+    run = _build_run(
+        streaming=True,
+        extra={"ignore_eos": True},
+        profiling_overrides={"measurement_start": value},
+    )
+    apply_scenario(run)
+    assert run.cfg.get_profiling_phases()[0].measurement_start == value
+
+
+def test_measurement_start_default_with_agentic_warmup_raises() -> None:
+    run = _build_run(
+        streaming=True,
+        extra={"ignore_eos": True},
+        profiling_overrides={"agentic_warmup": True},
+    )
+    with pytest.raises(ScenarioLockError) as exc:
+        apply_scenario(run)
+    assert "--measurement-start 0" in str(exc.value)
+
+
+def test_measurement_start_zero_with_agentic_warmup_ok() -> None:
+    run = _build_run(
+        streaming=True,
+        extra={"ignore_eos": True},
+        profiling_overrides={"agentic_warmup": True, "measurement_start": 0},
+    )
+    assert apply_scenario(run).violations == []
+
+
 def test_trajectory_ratios_auto_filled_when_default() -> None:
     run = _build_run(streaming=True, extra={"ignore_eos": True})
     phase = run.cfg.get_profiling_phases()[0]

@@ -161,6 +161,14 @@ Named multi-phase workflows keep the root exports (`profile_export_aiperf.{json,
 
 For server metrics specifically, the root `server_metrics_export.json` preserves the legacy aggregate semantic phase view; in workflows with multiple phases of the same kind, its phase ranges may span inter-phase gaps. Consumers that need exact per-phase telemetry should read the phase-scoped `server_metrics.json` files.
 
+### Profiling window artifacts
+
+With `--window-start-interval SECONDS`, AIPerf also writes one summary per profiling suffix window: window `k` starts `k × SECONDS` after the profiling start and ends at the profiling end. Files land in `windows/start_<offset>s/` with the same names as phase artifacts (`profile_export_aiperf.{json,csv}`, `server_metrics.json`, `gpu_telemetry.json`), and `windows/manifest.json` lists every window with its `start_offset_sec`, `start_ns`, `end_ns`, request counts, and file paths. Window request metrics cover profiling requests that started in the window; window server metrics and GPU telemetry are cut by time, with counter deltas starting from the last scrape before the window start, and carry no timeslices. Window sweep metrics (concurrency, `effective_*` throughputs, tokens in flight) describe only requests that started in the window, so unlike the same tags in timeslices they exclude requests in flight at its start. Run-level-only results (timeslices, pooled speculative-decoding histogram, theoretical prefix-cache hit, analyzer metrics, replay send-lag metrics, error details) are not repeated per window. Windows require a single profiling phase that is the last phase, stop at the first window without requests, and are capped at 256. Window offsets count from the profiling start, independent of `--measurement-start`.
+
+### Measurement start
+
+With `--measurement-start SECONDS` (720 under the AgentX scenarios), the root summaries start that many seconds after the profiling start: request metrics cover profiling requests that started from then on, the server-metrics and GPU-telemetry summaries (their timeslices included) are cut by time, `start_time` is the measurement start, and `metadata.measurement_start_seconds` records the offset. Request-metric timeslices, `profile_export.jsonl` and the server-metrics Parquet export keep the whole profiling phase, and the phase runs `SECONDS` longer than `--benchmark-duration`.
+
 ## For downstream parsers
 
 - **Treat absent fields as "not applicable to this metric type," not "data missing."** A derived-metric block with no `count` is normal; a record-metric block with no `count` indicates a bug.

@@ -1022,6 +1022,10 @@ The grace period in seconds to wait for responses after benchmark duration ends.
 <br/>_Constraints: ≥ 0_
 <br/>_Default: `30.0`_
 
+#### `--measurement-start` `<float>`
+
+Seconds after the profiling start at which the reported summary metrics begin (console table, `profile_export_aiperf.json`/`.csv`, server metrics and GPU telemetry summaries). The profiling phase runs `--measurement-start` + `--benchmark-duration` seconds, so `--benchmark-duration` stays the measured length. Requests started earlier still load the server and appear in the per-request records, timeslices and suffix windows. Requires `--benchmark-duration` (or a scenario default) and a profiling phase that is the only phase; cannot be combined with `--agentic-warmup`. The `agentx` and `inferencex-agentx-mvp` scenarios default to 720; 0 turns it off.
+
 #### `--concurrency` `<str>`
 
 Number of concurrent requests to maintain. AIPerf issues a new request immediately when one completes, maintaining this level of in-flight requests. Can be combined with `--request-rate` to control the request rate. Pass a comma-separated list (e.g. `--concurrency 10,20,30`) to sweep over multiple concurrencies; the converter promotes the list to a sweep before AIPerfConfig validation.
@@ -1123,19 +1127,24 @@ The maximum number of warmup requests to send before benchmarking. If not set an
 The maximum duration in seconds for the warmup phase. If not set, it will use the `--warmup-request-count` value. If neither are set, no warmup phase will be used.
 <br/>_Constraints: > 0_
 
+#### `--agentic-warmup`
+
+AGENTIC_REPLAY only: run the synthesized warmup phase (t* snapshot primers, plus the optional cache-pressure substage) before profiling. Off by default: profiling replays from t* with no preceding warmup, so the server sees one continuous replay, and `--measurement-start` excludes the startup transient from the reported metrics instead. Cannot be combined with a nonzero `--measurement-start` (the AgentX scenarios default it to 720; pass `--measurement-start 0`). Required by `--agentic-cache-warmup-duration`, `--warmup-requests-per-lane` and `--agentic-warmup-grace-period`.
+<br/>_Flag (no value required)_
+
 #### `--agentic-cache-warmup-duration` `<float>`
 
-Additional agentic replay warmup duration in seconds. After the normal snapshot warmup drains, AIPerf continues the live trajectories without recorded idle delays and with one-token outputs, then drains and resumes profiling from the resulting trajectory state using each live stream's residual next-turn delay. Mutually exclusive with --warmup-requests-per-lane.
+Additional agentic replay warmup duration in seconds. After the normal snapshot warmup drains, AIPerf continues the live trajectories without recorded idle delays and with one-token outputs, then drains and resumes profiling from the resulting trajectory state using each live stream's residual next-turn delay. Mutually exclusive with --warmup-requests-per-lane. Requires --agentic-warmup.
 <br/>_Constraints: > 0_
 
 #### `--warmup-requests-per-lane` `<int>`
 
-Deterministic agentic cache-pressure warmup request budget per concurrency lane, additional to mandatory snapshot primers. For example, 10 with concurrency 16 sends 160 additional cache-pressure requests after the primers. Mutually exclusive with --agentic-cache-warmup-duration.
+Deterministic agentic cache-pressure warmup request budget per concurrency lane, additional to mandatory snapshot primers. For example, 10 with concurrency 16 sends 160 additional cache-pressure requests after the primers. Mutually exclusive with --agentic-cache-warmup-duration. Requires --agentic-warmup.
 <br/>_Constraints: > 0_
 
 #### `--agentic-warmup-grace-period` `<float>`
 
-AGENTIC_REPLAY only: grace period in seconds the auto-synthesized warmup barrier waits for in-flight priming requests after the warmup burst sends. The agentic warmup is synthesized from the profiling phase rather than a user-declared warmup phase, so it does NOT honor `--warmup-grace-period` (which requires `--warmup-duration`). If not set, the warmup barrier waits indefinitely until every primed trajectory returns.
+AGENTIC_REPLAY only: grace period in seconds the auto-synthesized warmup barrier waits for in-flight priming requests after the warmup burst sends. The agentic warmup is synthesized from the profiling phase rather than a user-declared warmup phase, so it does NOT honor `--warmup-grace-period` (which requires `--warmup-duration`). If not set, the warmup barrier waits indefinitely until every primed trajectory returns. Requires `--agentic-warmup`.
 <br/>_Constraints: ≥ 0_
 
 #### `--num-warmup-sessions` `<int>`
@@ -1233,6 +1242,10 @@ Controls which output files are generated. `summary`: Only aggregate metrics fil
 
 Duration in seconds for time-sliced metric analysis. When set, AIPerf divides the benchmark timeline into fixed-length windows and computes metrics separately for each window. This enables analysis of performance trends and variations over time (e.g., warmup effects, degradation under sustained load).
 <br/>_Constraints: > 0_
+
+#### `--window-start-interval` `<float>`
+
+Spacing in seconds of suffix-window start offsets. At run end, AIPerf also exports the profiling summary (request metrics, server metrics, GPU telemetry) for each window that starts k * interval seconds after the profiling start and ends at the profiling end, under `windows/start_<offset>s/` with an index in `windows/manifest.json`, so the measured window can be chosen after the run. Requires a single profiling phase that is the last phase. 0 disables windows, overriding a scenario preset.
 
 #### `--auto-plot`, `--no-auto-plot`
 
@@ -2557,6 +2570,10 @@ The grace period in seconds to wait for responses after benchmark duration ends.
 <br/>_Constraints: ≥ 0_
 <br/>_Default: `30.0`_
 
+#### `--measurement-start` `<float>`
+
+Seconds after the profiling start at which the reported summary metrics begin (console table, `profile_export_aiperf.json`/`.csv`, server metrics and GPU telemetry summaries). The profiling phase runs `--measurement-start` + `--benchmark-duration` seconds, so `--benchmark-duration` stays the measured length. Requests started earlier still load the server and appear in the per-request records, timeslices and suffix windows. Requires `--benchmark-duration` (or a scenario default) and a profiling phase that is the only phase; cannot be combined with `--agentic-warmup`. The `agentx` and `inferencex-agentx-mvp` scenarios default to 720; 0 turns it off.
+
 #### `--concurrency` `<str>`
 
 Number of concurrent requests to maintain. AIPerf issues a new request immediately when one completes, maintaining this level of in-flight requests. Can be combined with `--request-rate` to control the request rate. Pass a comma-separated list (e.g. `--concurrency 10,20,30`) to sweep over multiple concurrencies; the converter promotes the list to a sweep before AIPerfConfig validation.
@@ -2658,19 +2675,24 @@ The maximum number of warmup requests to send before benchmarking. If not set an
 The maximum duration in seconds for the warmup phase. If not set, it will use the `--warmup-request-count` value. If neither are set, no warmup phase will be used.
 <br/>_Constraints: > 0_
 
+#### `--agentic-warmup`
+
+AGENTIC_REPLAY only: run the synthesized warmup phase (t* snapshot primers, plus the optional cache-pressure substage) before profiling. Off by default: profiling replays from t* with no preceding warmup, so the server sees one continuous replay, and `--measurement-start` excludes the startup transient from the reported metrics instead. Cannot be combined with a nonzero `--measurement-start` (the AgentX scenarios default it to 720; pass `--measurement-start 0`). Required by `--agentic-cache-warmup-duration`, `--warmup-requests-per-lane` and `--agentic-warmup-grace-period`.
+<br/>_Flag (no value required)_
+
 #### `--agentic-cache-warmup-duration` `<float>`
 
-Additional agentic replay warmup duration in seconds. After the normal snapshot warmup drains, AIPerf continues the live trajectories without recorded idle delays and with one-token outputs, then drains and resumes profiling from the resulting trajectory state using each live stream's residual next-turn delay. Mutually exclusive with --warmup-requests-per-lane.
+Additional agentic replay warmup duration in seconds. After the normal snapshot warmup drains, AIPerf continues the live trajectories without recorded idle delays and with one-token outputs, then drains and resumes profiling from the resulting trajectory state using each live stream's residual next-turn delay. Mutually exclusive with --warmup-requests-per-lane. Requires --agentic-warmup.
 <br/>_Constraints: > 0_
 
 #### `--warmup-requests-per-lane` `<int>`
 
-Deterministic agentic cache-pressure warmup request budget per concurrency lane, additional to mandatory snapshot primers. For example, 10 with concurrency 16 sends 160 additional cache-pressure requests after the primers. Mutually exclusive with --agentic-cache-warmup-duration.
+Deterministic agentic cache-pressure warmup request budget per concurrency lane, additional to mandatory snapshot primers. For example, 10 with concurrency 16 sends 160 additional cache-pressure requests after the primers. Mutually exclusive with --agentic-cache-warmup-duration. Requires --agentic-warmup.
 <br/>_Constraints: > 0_
 
 #### `--agentic-warmup-grace-period` `<float>`
 
-AGENTIC_REPLAY only: grace period in seconds the auto-synthesized warmup barrier waits for in-flight priming requests after the warmup burst sends. The agentic warmup is synthesized from the profiling phase rather than a user-declared warmup phase, so it does NOT honor `--warmup-grace-period` (which requires `--warmup-duration`). If not set, the warmup barrier waits indefinitely until every primed trajectory returns.
+AGENTIC_REPLAY only: grace period in seconds the auto-synthesized warmup barrier waits for in-flight priming requests after the warmup burst sends. The agentic warmup is synthesized from the profiling phase rather than a user-declared warmup phase, so it does NOT honor `--warmup-grace-period` (which requires `--warmup-duration`). If not set, the warmup barrier waits indefinitely until every primed trajectory returns. Requires `--agentic-warmup`.
 <br/>_Constraints: ≥ 0_
 
 #### `--num-warmup-sessions` `<int>`
@@ -2768,6 +2790,10 @@ Controls which output files are generated. `summary`: Only aggregate metrics fil
 
 Duration in seconds for time-sliced metric analysis. When set, AIPerf divides the benchmark timeline into fixed-length windows and computes metrics separately for each window. This enables analysis of performance trends and variations over time (e.g., warmup effects, degradation under sustained load).
 <br/>_Constraints: > 0_
+
+#### `--window-start-interval` `<float>`
+
+Spacing in seconds of suffix-window start offsets. At run end, AIPerf also exports the profiling summary (request metrics, server metrics, GPU telemetry) for each window that starts k * interval seconds after the profiling start and ends at the profiling end, under `windows/start_<offset>s/` with an index in `windows/manifest.json`, so the measured window can be chosen after the run. Requires a single profiling phase that is the last phase. 0 disables windows, overriding a scenario preset.
 
 #### `--auto-plot`, `--no-auto-plot`
 

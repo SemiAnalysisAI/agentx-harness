@@ -90,6 +90,7 @@ def apply_scenario(run: BenchmarkRun) -> ScenarioOutcome:
     _apply_require_loader(run, spec, violations, applied)
     _apply_require_cache_bust(run, spec, violations, applied)
     _apply_duration(run, spec, violations, applied)
+    _apply_measurement_start(run, spec, violations, applied)
     _apply_trajectory_ratios(run, spec, applied)
     _apply_inter_turn_delay_cap(run, spec, violations, applied)
     _apply_trace_idle_gap_cap(run, spec, violations, applied)
@@ -605,6 +606,45 @@ def _apply_duration(
         for phase in profiling_phases
     ):
         applied.append("min_benchmark_duration")
+
+
+def _apply_measurement_start(
+    run: BenchmarkRun,
+    spec: ScenarioSpec,
+    violations: list[ScenarioViolation],
+    applied: list[str],
+) -> None:
+    """Auto-fill the profiling measurement start, then validate it.
+
+    Runs after ``_apply_duration`` so the duration the offset requires is in
+    place when the shared config check runs.
+    """
+    from aiperf.config.config import measurement_start_error
+
+    default = spec.default_measurement_start_seconds
+    if default is not None:
+        for phase in run.cfg.get_profiling_phases():
+            if phase.measurement_start is None:
+                phase.measurement_start = float(default)
+                _logger.info(
+                    "Scenario %r: auto-set --measurement-start=%s (was unset).",
+                    spec.name,
+                    default,
+                )
+        applied.append("default_measurement_start")
+
+    error = measurement_start_error(run.cfg)
+    if error is not None:
+        violations.append(
+            ScenarioViolation(
+                flag="--measurement-start",
+                current_value=[
+                    phase.measurement_start for phase in run.cfg.get_profiling_phases()
+                ],
+                required_value="0, or a single profiling phase without --agentic-warmup",
+                message=error,
+            )
+        )
 
 
 def _apply_trajectory_ratios(

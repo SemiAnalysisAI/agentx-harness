@@ -68,6 +68,7 @@ from aiperf.common.models import (
 from aiperf.common.scenario.registry import get_scenario
 from aiperf.common.types import MetricTagT
 from aiperf.common.utils import yield_to_event_loop
+from aiperf.config.artifacts import OutputDefaults
 from aiperf.config.comm import ZMQDualBindConfig
 from aiperf.credit.messages import (
     CreditPhaseCompleteMessage,
@@ -76,6 +77,7 @@ from aiperf.credit.messages import (
     CreditPhaseStartMessage,
     CreditsCompleteMessage,
 )
+from aiperf.exporters.exporter_manager import ExporterManager
 from aiperf.gpu_telemetry.protocols import GPUTelemetryAccumulatorProtocol
 from aiperf.metrics.accumulator_models import AccumulatorMetricsSummary
 from aiperf.metrics.cache_reporting_hint import (
@@ -101,7 +103,11 @@ from aiperf.records.records_manager_processing import (
     load_stream_exporters,
 )
 from aiperf.records.records_tracker import RecordsTracker
-from aiperf.server_metrics.protocols import ServerMetricsAccumulatorProtocol
+from aiperf.records.window_results import iter_window_profile_results
+from aiperf.server_metrics.protocols import (
+    ServerMetricsAccumulatorProtocol,
+    ServerMetricsWindowExporterProtocol,
+)
 
 if TYPE_CHECKING:
     from aiperf.config.config import BenchmarkConfig
@@ -566,6 +572,8 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         # would otherwise double-publish and double-finalize stream exporters.
         self._process_results_lock = asyncio.Lock()
         self._processed_results: dict[CreditPhase, ProcessRecordsResult] = {}
+        self._window_export_cancelled = False
+        self._root_result_during_window_export: ProcessRecordsResult | None = None
 
         self._metric_record_accumulators = [
             accumulator
@@ -1136,6 +1144,12 @@ class RecordsManager(PullClientMixin, BaseComponentService):
 
         # Mark the phase as cancelled in the tracker
         self._records_tracker.mark_phase_cancelled(CreditPhase.PROFILING)
+        # Natural finalization may be exporting windows under the results lock:
+        # stop it, and answer with its finished root result without waiting.
+        self._window_export_cancelled = True
+        staged = self._root_result_during_window_export
+        if staged is not None:
+            return staged
 
         return await self._process_results(phase=CreditPhase.PROFILING, cancelled=True)
 
@@ -1472,9 +1486,13 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         error_results: list[ErrorDetails] = []
 
         phase_stats = RecordsManager._create_result_stats_for_phase(self, phase)
+        measurement_start_ns = RecordsManager._measurement_start_ns(
+            self, phase, phase_stats
+        )
+        summary_start_ns = measurement_start_ns or phase_stats.start_ns
         summary_ctx = SummaryContext(
             accumulators=dict(self._accumulators),
-            start_ns=phase_stats.start_ns or 0,
+            start_ns=summary_start_ns or 0,
             end_ns=phase_stats.requests_end_ns or 0,
             phase=phase,
             cancelled=cancelled,
@@ -1490,9 +1508,10 @@ class RecordsManager(PullClientMixin, BaseComponentService):
             return records_results, timeslices, error_results, summary_ctx
 
         ctx = ExportContext(
-            start_ns=phase_stats.start_ns,
+            start_ns=summary_start_ns,
             end_ns=phase_stats.requests_end_ns,
             phase=phase,
+            min_request_start_ns=measurement_start_ns,
             error_summary=self._error_tracker.get_error_summary_for_phase(phase),
             cancelled=cancelled,
         )
@@ -1511,6 +1530,16 @@ class RecordsManager(PullClientMixin, BaseComponentService):
             )
             if ts:
                 timeslices = ts
+        if measurement_start_ns is not None and not any(
+            result.tag in ("request_count", "error_request_count") and result.avg
+            for result in records_results
+        ):
+            self.warning(
+                "No request started after the measurement start "
+                f"({RecordsManager._measurement_start_sec(self):g}s into profiling), "
+                "so the summary metrics are empty; the per-request records and "
+                "timeslices still cover the whole run."
+            )
         self._adjust_multi_phase_aggregate_rates(phase, records_results)
         return records_results, timeslices, error_results, summary_ctx
 
@@ -1581,6 +1610,33 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         result = by_tag.get(tag)
         if result is not None:
             result.avg = value
+
+    def _measurement_start_ns(
+        self, phase: CreditPhase, stats: PhaseRecordsStats
+    ) -> int | None:
+        """Instant the profiling summaries start, when a measurement start is set.
+
+        Config validation allows a nonzero measurement start only on a profiling
+        phase that is the only phase, so the aggregate phase start anchors it.
+        """
+        if phase != CreditPhase.PROFILING or stats.start_ns is None:
+            return None
+        offset_sec = RecordsManager._measurement_start_sec(self)
+        if offset_sec is None:
+            return None
+        return stats.start_ns + round(offset_sec * NANOS_PER_SECOND)
+
+    def _measurement_start_sec(self) -> float | None:
+        cfg = getattr(getattr(self, "run", None), "cfg", None)
+        if cfg is None:
+            return None
+        offsets = [
+            float(phase.measurement_start)
+            for phase in cfg.get_profiling_phases()
+            if isinstance(phase.measurement_start, int | float)
+            and phase.measurement_start > 0
+        ]
+        return offsets[0] if offsets else None
 
     def _create_result_stats_for_phase(self, phase: CreditPhase) -> PhaseRecordsStats:
         if self._has_multiple_phase_instances(phase):
@@ -1657,6 +1713,66 @@ class RecordsManager(PullClientMixin, BaseComponentService):
                 )
             )
         return phase_results or None
+
+    async def _export_window_artifacts(self, root_results: ProfileResults) -> None:
+        """Write the profiling suffix windows when a start interval is set.
+
+        Runs before the root result is published, so every window is on disk
+        before the controller can shut the run down. A profile cancel answers
+        with the staged root result at once and stops the export before the
+        next window. Best-effort: a failure costs only the windows.
+        """
+        cfg = self.run.cfg
+        interval_sec = cfg.artifacts.window_start_interval
+        metrics_accumulator = self._accumulators.get(AccumulatorType.METRIC_RESULTS)
+        if not isinstance(interval_sec, int | float) or metrics_accumulator is None:
+            return
+        server_metrics_accumulator = (
+            None if cfg.server_metrics_disabled else self._server_metrics_accumulator
+        )
+        if server_metrics_accumulator is not None and not isinstance(
+            server_metrics_accumulator, ServerMetricsWindowExporterProtocol
+        ):
+            self.warning(
+                f"{type(server_metrics_accumulator).__name__} cannot export "
+                "suffix windows; window artifacts omit server metrics"
+            )
+            server_metrics_accumulator = None
+        exporter = ExporterManager(
+            results=root_results, run=self.run, telemetry_results=None
+        )
+        entries: list[dict[str, Any]] = []
+        try:
+            async for window in iter_window_profile_results(
+                should_stop=lambda: self._window_export_cancelled is True,
+                metrics_accumulator=metrics_accumulator,
+                server_metrics_accumulator=server_metrics_accumulator,
+                gpu_telemetry_accumulator=None
+                if cfg.gpu_telemetry_disabled
+                else self._gpu_telemetry_accumulator,
+                stats=self._records_tracker.create_aggregate_stats_for_phase(
+                    CreditPhase.PROFILING
+                ),
+                interval_sec=interval_sec,
+                max_windows=OutputDefaults.MAX_SUFFIX_WINDOWS,
+                final_scrape_grace_ns=Environment.GPU.FINAL_SCRAPE_GRACE_NS,
+            ):
+                entries.append(await exporter.export_window_artifacts(window))
+        except Exception as e:  # noqa: BLE001 - windows must not cost the run its results
+            self.exception(f"Failed to export profiling windows: {e!r}")
+        if self._window_export_cancelled is True:
+            self.warning(f"Profile cancelled; exported {len(entries)} window(s)")
+        if not entries:
+            return
+        try:
+            await exporter.write_window_manifest(entries)
+        except (OSError, ValueError) as e:
+            self.warning(f"Failed to write window manifest: {e!r}")
+            return
+        self.info(
+            f"Exported {len(entries)} profiling window(s) starting every "
+            f"{interval_sec:g}s; index: {cfg.artifacts.dir / 'windows' / 'manifest.json'}"
+        )
 
     @staticmethod
     def _phase_error_counts(
@@ -1793,14 +1909,20 @@ class RecordsManager(PullClientMixin, BaseComponentService):
                 )
                 continue
 
+            # Coverage is judged over the measured span: duration seconds that
+            # start at the measurement start.
+            measurement_start_ns = RecordsManager._measurement_start_ns(
+                self, CreditPhase.PROFILING, stats
+            )
             ctx = ExportContext(
-                start_ns=stats.start_ns,
+                start_ns=measurement_start_ns or stats.start_ns,
                 end_ns=stats.requests_end_ns,
                 phase=CreditPhase.PROFILING,
                 phase_index=stats.phase_index,
                 phase_name=phase_config.name,
                 phase_kind="profiling",
                 is_phase_scoped=True,
+                min_request_start_ns=measurement_start_ns,
                 cancelled=False,
             )
             coverage = calculate(
@@ -2098,6 +2220,9 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         await self._finalize_stream_exporters()
 
         phase_stats = RecordsManager._create_result_stats_for_phase(self, phase)
+        measurement_start_ns = RecordsManager._measurement_start_ns(
+            self, phase, phase_stats
+        )
         phase_records = await RecordsManager._build_phase_profile_results(
             self, phase, cancelled
         )
@@ -2118,10 +2243,13 @@ class RecordsManager(PullClientMixin, BaseComponentService):
                 warmup_records=warmup_records_results,
                 timeslices=timeslices or None,
                 completed=records_completed,
-                start_ns=phase_stats.start_ns or time.time_ns(),
+                start_ns=measurement_start_ns or phase_stats.start_ns or time.time_ns(),
                 end_ns=phase_stats.requests_end_ns or time.time_ns(),
                 error_summary=self._error_tracker.get_error_summary_for_phase(phase),
                 was_cancelled=cancelled,
+                measurement_start_sec=RecordsManager._measurement_start_sec(self)
+                if measurement_start_ns is not None
+                else None,
                 successful_request_count=phase_stats.success_records,
                 error_request_count=phase_stats.error_records,
                 branch_stats=self._latest_branch_stats
@@ -2143,6 +2271,12 @@ class RecordsManager(PullClientMixin, BaseComponentService):
             fatal_errors=fatal_errors,
         )
         self.debug(lambda: f"Process records result: {result}")
+        if phase == CreditPhase.PROFILING and not cancelled:
+            self._root_result_during_window_export = result
+            try:
+                await RecordsManager._export_window_artifacts(self, result.results)
+            finally:
+                self._root_result_during_window_export = None
         self.debug("Publishing ProcessRecordsResultMessage...")
         await self.publish(
             ProcessRecordsResultMessage(
@@ -2223,9 +2357,12 @@ class RecordsManager(PullClientMixin, BaseComponentService):
             if phase_stats.requests_end_ns is not None
             else None
         )
+        measurement_start_ns = RecordsManager._measurement_start_ns(
+            self, CreditPhase.PROFILING, phase_stats
+        )
         telemetry_export_data = await self._gpu_telemetry_accumulator.export_results(
             ExportContext(
-                start_ns=phase_stats.start_ns,
+                start_ns=measurement_start_ns or phase_stats.start_ns,
                 end_ns=profiling_end_ns,
                 phase=CreditPhase.PROFILING,
                 error_summary=error_summary,
@@ -2328,6 +2465,9 @@ class RecordsManager(PullClientMixin, BaseComponentService):
                 ExportContext(
                     start_ns=profiling_start_ns,
                     end_ns=profiling_end_ns,
+                    min_request_start_ns=RecordsManager._measurement_start_ns(
+                        self, CreditPhase.PROFILING, phase_stats
+                    ),
                     error_summary=error_summary,
                     warmup_start_ns=warmup_phase_stats.start_ns,
                     warmup_end_ns=warmup_phase_stats.requests_end_ns,

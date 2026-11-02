@@ -16,7 +16,11 @@ from aiperf.common.exceptions import (
 )
 from aiperf.common.finite import scrub_non_finite
 from aiperf.common.mixins import AIPerfLoggerMixin
-from aiperf.common.models import ProfileResults
+from aiperf.common.models import (
+    PhaseProfileResults,
+    ProfileResults,
+    WindowProfileResults,
+)
 from aiperf.common.models.export_models import TelemetryExportData
 from aiperf.common.models.server_metrics_models import ServerMetricsResults
 from aiperf.exporters.exporter_config import ExporterConfig, FileExportInfo
@@ -121,77 +125,98 @@ class ExporterManager(AIPerfLoggerMixin):
         phase_records = getattr(self._results, "phase_records", None) or []
         if not phase_records:
             return
-        manifest_entries: list[dict[str, Any]] = []
-        for phase_result in phase_records:
-            phase_dir = self._run.cfg.artifacts.dir / "phases" / phase_result.phase_name
-            await asyncio.to_thread(phase_dir.mkdir, parents=True, exist_ok=True)
-            completed = (
-                phase_result.successful_request_count + phase_result.error_request_count
+        manifest_entries = [
+            await self._export_scoped_metric_artifact(
+                phase_result, self._run.cfg.artifacts.dir / "phases"
             )
-            phase_profile = ProfileResults(
-                records=phase_result.records,
-                completed=completed,
-                start_ns=phase_result.start_ns or self._results.start_ns,
-                end_ns=phase_result.end_ns or self._results.end_ns,
-                was_cancelled=phase_result.was_cancelled,
-                successful_request_count=phase_result.successful_request_count,
-                error_request_count=phase_result.error_request_count,
-                error_summary=phase_result.error_summary,
-            )
-            entry: dict[str, Any] = {
-                "phase_index": phase_result.phase_index,
-                "profiling_index": phase_result.profiling_index,
-                "phase_name": phase_result.phase_name,
-                "phase_kind": phase_result.phase_kind,
-                "start_ns": phase_result.start_ns,
-                "end_ns": phase_result.end_ns,
-                "was_cancelled": phase_result.was_cancelled,
-                "successful_request_count": phase_result.successful_request_count,
-                "error_request_count": phase_result.error_request_count,
-                "total_request_count": completed,
-                "error_summary": [
-                    item.model_dump(mode="json") for item in phase_result.error_summary
-                ],
-            }
-            await self._write_phase_export(
-                exporter_cls=MetricsJsonExporter,
-                phase_profile=phase_profile,
-                file_path=phase_dir
-                / self._run.cfg.artifacts.profile_export_json_file.name,
-                manifest_entry=entry,
-                manifest_key="metrics_json",
-            )
-            await self._write_phase_export(
-                exporter_cls=MetricsCsvExporter,
-                phase_profile=phase_profile,
-                file_path=phase_dir
-                / self._run.cfg.artifacts.profile_export_csv_file.name,
-                manifest_entry=entry,
-                manifest_key="metrics_csv",
-            )
-            await self._write_phase_observability_export(
-                phase_result=phase_result,
-                phase_dir=phase_dir,
-                manifest_entry=entry,
-                attr="telemetry_results",
-                warnings_attr="telemetry_warnings",
-                file_name="gpu_telemetry.json",
-                manifest_key="gpu_telemetry_json",
-            )
-            await self._write_phase_observability_export(
-                phase_result=phase_result,
-                phase_dir=phase_dir,
-                manifest_entry=entry,
-                attr="server_metrics_results",
-                warnings_attr="server_metrics_warnings",
-                file_name="server_metrics.json",
-                manifest_key="server_metrics_json",
-            )
-            manifest_entries.append(entry)
+            for phase_result in phase_records
+        ]
         try:
             await asyncio.to_thread(self._write_phase_manifest, manifest_entries)
         except (OSError, ValueError) as exc:
             self.warning(f"Failed to write phase artifact manifest: {exc}")
+
+    async def export_window_artifacts(
+        self, window: WindowProfileResults
+    ) -> dict[str, Any]:
+        """Write one profiling suffix window under ``windows/``; return its manifest entry."""
+        entry = await self._export_scoped_metric_artifact(
+            window, self._run.cfg.artifacts.dir / "windows"
+        )
+        entry["start_offset_sec"] = window.start_offset_sec
+        return entry
+
+    async def write_window_manifest(self, entries: list[dict[str, Any]]) -> None:
+        """Write ``windows/manifest.json`` listing the exported windows by start."""
+        await asyncio.to_thread(self._write_window_manifest, entries)
+
+    async def _export_scoped_metric_artifact(
+        self, phase_result: PhaseProfileResults, root_dir: Path
+    ) -> dict[str, Any]:
+        """Write one directory of metric artifacts for a scoped result; return its manifest entry."""
+        phase_dir = root_dir / phase_result.phase_name
+        await asyncio.to_thread(phase_dir.mkdir, parents=True, exist_ok=True)
+        completed = (
+            phase_result.successful_request_count + phase_result.error_request_count
+        )
+        phase_profile = ProfileResults(
+            records=phase_result.records,
+            completed=completed,
+            start_ns=phase_result.start_ns or self._results.start_ns,
+            end_ns=phase_result.end_ns or self._results.end_ns,
+            was_cancelled=phase_result.was_cancelled,
+            successful_request_count=phase_result.successful_request_count,
+            error_request_count=phase_result.error_request_count,
+            error_summary=phase_result.error_summary,
+        )
+        entry: dict[str, Any] = {
+            "phase_index": phase_result.phase_index,
+            "profiling_index": phase_result.profiling_index,
+            "phase_name": phase_result.phase_name,
+            "phase_kind": phase_result.phase_kind,
+            "start_ns": phase_result.start_ns,
+            "end_ns": phase_result.end_ns,
+            "was_cancelled": phase_result.was_cancelled,
+            "successful_request_count": phase_result.successful_request_count,
+            "error_request_count": phase_result.error_request_count,
+            "total_request_count": completed,
+            "error_summary": [
+                item.model_dump(mode="json") for item in phase_result.error_summary
+            ],
+        }
+        await self._write_phase_export(
+            exporter_cls=MetricsJsonExporter,
+            phase_profile=phase_profile,
+            file_path=phase_dir / self._run.cfg.artifacts.profile_export_json_file.name,
+            manifest_entry=entry,
+            manifest_key="metrics_json",
+        )
+        await self._write_phase_export(
+            exporter_cls=MetricsCsvExporter,
+            phase_profile=phase_profile,
+            file_path=phase_dir / self._run.cfg.artifacts.profile_export_csv_file.name,
+            manifest_entry=entry,
+            manifest_key="metrics_csv",
+        )
+        await self._write_phase_observability_export(
+            phase_result=phase_result,
+            phase_dir=phase_dir,
+            manifest_entry=entry,
+            attr="telemetry_results",
+            warnings_attr="telemetry_warnings",
+            file_name="gpu_telemetry.json",
+            manifest_key="gpu_telemetry_json",
+        )
+        await self._write_phase_observability_export(
+            phase_result=phase_result,
+            phase_dir=phase_dir,
+            manifest_entry=entry,
+            attr="server_metrics_results",
+            warnings_attr="server_metrics_warnings",
+            file_name="server_metrics.json",
+            manifest_key="server_metrics_json",
+        )
+        return entry
 
     async def _write_phase_observability_export(
         self,
@@ -290,6 +315,21 @@ class ExporterManager(AIPerfLoggerMixin):
             ),
         }
         manifest_path.write_bytes(
+            orjson.dumps(
+                scrub_non_finite(payload),
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            )
+            + b"\n"
+        )
+
+    def _write_window_manifest(self, entries: list[dict[str, Any]]) -> None:
+        windows_dir = self._run.cfg.artifacts.dir / "windows"
+        windows_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "windows": sorted(entries, key=lambda item: item["start_offset_sec"]),
+        }
+        (windows_dir / "manifest.json").write_bytes(
             orjson.dumps(
                 scrub_non_finite(payload),
                 option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,

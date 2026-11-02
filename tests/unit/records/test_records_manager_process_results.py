@@ -20,7 +20,7 @@ The pipeline:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -29,6 +29,7 @@ from aiperf.common.messages import (
     ProcessAllResultsMessage,
     ProcessRecordsResultMessage,
     ProcessServerMetricsResultMessage,
+    ProfileCancelCommand,
 )
 from aiperf.common.models import (
     MetricResult,
@@ -455,6 +456,118 @@ class TestProcessResultsCancelled:
         assert result.results.was_cancelled is False
 
 
+class TestProcessResultsMeasurementStart:
+    """A measurement start moves the root summary, its start time and the
+    coverage check to the measured span."""
+
+    _START_NS = 1_000_000_000
+    _CUT_NS = 721_000_000_000
+
+    @staticmethod
+    def _phase_scoped_accumulator(request_count: float) -> MagicMock:
+        acc = MagicMock()
+        acc.__class__.__name__ = "StubMetricsAccumulator"
+        acc.supports_phase_scoped_export = True
+        acc.export_results = AsyncMock(
+            return_value=AccumulatorMetricsSummary(
+                results={
+                    "request_count": MetricResult(
+                        tag="request_count",
+                        header="Request Count",
+                        unit="requests",
+                        avg=request_count,
+                    )
+                },
+                timeslices=None,
+            )
+        )
+        return acc
+
+    def _manager(self, acc: MagicMock, *, measurement_start: object) -> MagicMock:
+        mgr = _make_manager_mock(
+            accumulators={AccumulatorType.METRIC_RESULTS: acc},
+            start_ns=self._START_NS,
+            end_ns=4_000_000_000_000,
+        )
+        mgr._has_multiple_phase_instances.return_value = False
+        phase_config = MagicMock()
+        phase_config.name = "profiling"
+        phase_config.duration = 3600.0
+        phase_config.measurement_start = measurement_start
+        mgr.run.cfg.get_profiling_phases.return_value = [phase_config]
+        return mgr
+
+    @pytest.mark.asyncio
+    async def test_root_summary_starts_at_measurement_start(self) -> None:
+        acc = self._phase_scoped_accumulator(3.0)
+        mgr = self._manager(acc, measurement_start=720.0)
+
+        result = await mgr._process_results(
+            phase=CreditPhase.PROFILING, cancelled=False
+        )
+
+        ctx = acc.export_results.await_args.args[0]
+        assert ctx.start_ns == self._CUT_NS
+        assert ctx.min_request_start_ns == self._CUT_NS
+        assert result.results.start_ns == self._CUT_NS
+        assert result.results.measurement_start_sec == 720.0
+        mgr.warning.assert_not_called()
+
+    @pytest.mark.parametrize("measurement_start", [None, 0.0])
+    @pytest.mark.asyncio
+    async def test_no_measurement_start_keeps_phase_start(
+        self, measurement_start: float | None
+    ) -> None:
+        acc = self._phase_scoped_accumulator(3.0)
+        mgr = self._manager(acc, measurement_start=measurement_start)
+
+        result = await mgr._process_results(
+            phase=CreditPhase.PROFILING, cancelled=False
+        )
+
+        ctx = acc.export_results.await_args.args[0]
+        assert ctx.start_ns == self._START_NS
+        assert ctx.min_request_start_ns is None
+        assert result.results.start_ns == self._START_NS
+        assert result.results.measurement_start_sec is None
+
+    @pytest.mark.asyncio
+    async def test_empty_measured_span_warns(self) -> None:
+        acc = self._phase_scoped_accumulator(0.0)
+        mgr = self._manager(acc, measurement_start=720.0)
+
+        await mgr._process_results(phase=CreditPhase.PROFILING, cancelled=True)
+
+        assert "No request started after the measurement start" in str(
+            mgr.warning.call_args
+        )
+
+    @pytest.mark.asyncio
+    async def test_coverage_measured_from_measurement_start(self) -> None:
+        acc = self._phase_scoped_accumulator(3.0)
+        acc.profile_metric_duration_coverage.return_value = (
+            ProfileMetricDurationCoverage(
+                phase_name="profiling",
+                expected_duration_seconds=3600.0,
+                required_ratio=0.95,
+                ttft_ratio=1.0,
+                inter_token_latency_ratio=1.0,
+            )
+        )
+        mgr = self._manager(acc, measurement_start=720.0)
+        mgr.run.cfg.scenario = "inferencex-agentx-mvp"
+
+        result = await mgr._process_results(
+            phase=CreditPhase.PROFILING, cancelled=False
+        )
+
+        assert result.fatal_errors == []
+        call = acc.profile_metric_duration_coverage.call_args
+        assert call.args[0].start_ns == self._CUT_NS
+        assert call.args[0].min_request_start_ns == self._CUT_NS
+        assert call.kwargs["expected_duration_seconds"] == 3600.0
+
+
 # ---------------------------------------------------------------------------
 # Tests: _finalize_stream_exporters integration
 # ---------------------------------------------------------------------------
@@ -574,3 +687,144 @@ class TestProcessResultsServerMetricsFailure:
             "Failed to process server metrics results" in str(call.args[0])
             for call in mgr.exception.call_args_list
         )
+
+
+class TestProcessResultsWindowArtifacts:
+    """``window_start_interval`` writes profiling suffix windows before the root publish."""
+
+    @staticmethod
+    def _windowed_manager(
+        interval: float | None, *, export_exc: BaseException | None = None
+    ) -> tuple[MagicMock, MagicMock, list[str]]:
+        acc = _make_summary_accumulator([_STUB_METRIC_RESULT])
+        count = MetricResult(
+            tag="request_count", header="Request Count", unit="requests", avg=3
+        )
+        acc.export_window_results = AsyncMock(
+            side_effect=export_exc,
+            return_value=AccumulatorMetricsSummary(results={count.tag: count}),
+        )
+        mgr = _make_manager_mock(accumulators={AccumulatorType.METRIC_RESULTS: acc})
+        mgr._window_export_cancelled = False
+        mgr.run.cfg.artifacts.window_start_interval = interval
+        mgr._records_tracker.create_aggregate_stats_for_phase.return_value = (
+            PhaseRecordsStats(
+                phase=CreditPhase.PROFILING,
+                start_ns=1_000_000_000,
+                requests_end_ns=2_000_000_000,
+            )
+        )
+        events: list[str] = []
+        exporter = MagicMock()
+        exporter.export_window_artifacts = AsyncMock(
+            side_effect=lambda window: events.append(window.phase_name) or {}
+        )
+        exporter.write_window_manifest = AsyncMock(
+            side_effect=lambda entries: events.append("manifest")
+        )
+
+        async def publish(message) -> None:  # noqa: ANN001
+            events.append(type(message).__name__)
+
+        mgr.publish = AsyncMock(side_effect=publish)
+        return mgr, exporter, events
+
+    @pytest.mark.asyncio
+    async def test_windows_are_written_before_root_result_publish(self) -> None:
+        mgr, exporter, events = self._windowed_manager(0.5)
+
+        with patch(
+            "aiperf.records.records_manager.ExporterManager", return_value=exporter
+        ):
+            await mgr._process_results(phase=CreditPhase.PROFILING, cancelled=False)
+
+        assert events[:4] == [
+            "start_0s",
+            "start_0.5s",
+            "manifest",
+            "ProcessRecordsResultMessage",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_profile_cancel_before_window_export_skips_windows(self) -> None:
+        mgr, exporter, events = self._windowed_manager(0.5)
+        mgr._window_export_cancelled = True
+
+        with patch(
+            "aiperf.records.records_manager.ExporterManager", return_value=exporter
+        ):
+            await mgr._process_results(phase=CreditPhase.PROFILING, cancelled=False)
+
+        exporter.export_window_artifacts.assert_not_awaited()
+        assert events[0] == "ProcessRecordsResultMessage"
+
+    @pytest.mark.asyncio
+    async def test_profile_cancel_during_window_export_returns_staged_root(
+        self,
+    ) -> None:
+        mgr, exporter, events = self._windowed_manager(0.5)
+        mgr._records_tracker.mark_phase_cancelled = MagicMock()
+        cancel_responses: list = []
+
+        async def export_and_cancel(window):  # noqa: ANN001, ANN202
+            events.append(window.phase_name)
+            # Runs inside natural finalization, which holds the results lock:
+            # the cancel must answer without waiting for it.
+            cancel_responses.append(
+                await asyncio.wait_for(
+                    RecordsManager._on_profile_cancel_command(
+                        mgr, ProfileCancelCommand(service_id="controller")
+                    ),
+                    timeout=1.0,
+                )
+            )
+            return {}
+
+        exporter.export_window_artifacts = AsyncMock(side_effect=export_and_cancel)
+
+        with patch(
+            "aiperf.records.records_manager.ExporterManager", return_value=exporter
+        ):
+            result = await mgr._process_results(
+                phase=CreditPhase.PROFILING, cancelled=False
+            )
+
+        assert cancel_responses == [result]
+        assert events[:3] == ["start_0s", "manifest", "ProcessRecordsResultMessage"]
+
+    @pytest.mark.asyncio
+    async def test_window_failure_keeps_root_result(self) -> None:
+        mgr, exporter, events = self._windowed_manager(
+            60, export_exc=RuntimeError("boom")
+        )
+
+        with patch(
+            "aiperf.records.records_manager.ExporterManager", return_value=exporter
+        ):
+            result = await mgr._process_results(
+                phase=CreditPhase.PROFILING, cancelled=False
+            )
+
+        assert _STUB_METRIC_RESULT in result.results.records
+        assert "ProcessRecordsResultMessage" in events
+        exporter.write_window_manifest.assert_not_awaited()
+        assert any(
+            "Failed to export profiling windows" in str(call.args[0])
+            for call in mgr.exception.call_args_list
+        )
+
+    @pytest.mark.parametrize("interval", [None, 60])
+    @pytest.mark.asyncio
+    async def test_no_windows_without_interval_or_on_cancelled_processing(
+        self, interval: float | None
+    ) -> None:
+        mgr, exporter, events = self._windowed_manager(interval)
+
+        with patch(
+            "aiperf.records.records_manager.ExporterManager", return_value=exporter
+        ):
+            await mgr._process_results(
+                phase=CreditPhase.PROFILING, cancelled=interval is not None
+            )
+
+        exporter.export_window_artifacts.assert_not_awaited()

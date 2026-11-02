@@ -296,6 +296,10 @@ Aggregated statistics from profiling period. Metrics from all endpoints are merg
 
 > [!NOTE]
 > In named multi-phase runs, `server_metrics_export.json` remains the run-level export for existing readers. For exact server metrics from one phase, use `phases/<phase_name>/server_metrics.json`; `phase_manifest.json` lists which phase files were written.
+>
+> With `--measurement-start`, `server_metrics_export.json` covers the span from the measurement start to the profiling end, cut by time like a window; the Parquet export keeps the whole phase.
+>
+> With `--window-start-interval`, `windows/start_<offset>s/server_metrics.json` holds the stats for each profiling suffix window, cut by time with counter and histogram deltas starting from the last scrape before the window start; `windows/manifest.json` lists them.
 
 ```json
 {

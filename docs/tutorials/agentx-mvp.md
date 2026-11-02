@@ -46,12 +46,16 @@ for flag-based profiles. The equivalent compatibility command is
 `aiperf profile --scenario agentx`. An explicit `--scenario` overrides the
 wrapper default; `--config`/`-f` continues to use the scenario in the YAML file.
 
-The preset supplies streaming chat, a 3,600-second profiling duration, seed 42,
-trajectory start ratios 0.25–0.75, 10 warmup requests per lane, a 1,800-second
-warmup grace period, a 0.10 live failure threshold, a 300-second trace idle cap,
-393 dataset entries, server token counts, disabled GPU telemetry, 30-second
-stats, and 1-second metric slices. It also defaults these runtime settings for
-the profiling process and its child services:
+The preset supplies streaming chat, a 3,600-second measured profiling duration
+that starts 720 seconds into profiling
+([Choosing the Measured Window](#choosing-the-measured-window)), seed 42,
+trajectory start ratios 0.25–0.75, a 0.10 live failure threshold, a 300-second
+trace idle cap, 393 dataset entries, server token counts, disabled GPU
+telemetry, 30-second stats, 1-second metric slices, and
+[suffix-window summaries](#choosing-the-measured-window) every 60 seconds. It
+runs no agentic warmup; with `--agentic-warmup` it also supplies 10 warmup
+requests per lane and a 1,800-second warmup grace period. It also defaults these
+runtime settings for the profiling process and its child services:
 
 | Environment setting | Default |
 | --- | --- |
@@ -60,9 +64,9 @@ the profiling process and its child services:
 | `AIPERF_UI_REALTIME_METRICS_ENABLED` | `true` |
 | `AIPERF_HTTP_TCP_USER_TIMEOUT` | `900000` milliseconds |
 
-Explicit CLI flags and runtime environment settings override the preset defaults. For example, `--warmup-grace-period 3600` extends warmup, and
-`--agentic-cache-warmup-duration 60` selects duration-based cache warmup instead
-of the default request budget. The argument preset applies to flag-based
+Explicit CLI flags and runtime environment settings override the preset defaults. For example, `--agentic-warmup --warmup-grace-period 3600` extends warmup, and
+`--agentic-warmup --agentic-cache-warmup-duration 60` selects duration-based cache warmup instead
+of the default request budget. The warmup flags require `--agentic-warmup`. The argument preset applies to flag-based
 `aiperf profile` commands; `--config` continues to define benchmark settings
 in the YAML file.
 
@@ -223,7 +227,11 @@ explicit value is honored *silently*, with no error and no change to the
   Leave them at `0.0`/`1.0` for any run you intend to compare.
 - **`--benchmark-duration 1800`** (30 minutes) is the scenario default;
   900 seconds (15 minutes) is the enforced minimum, and AIPerf rejects
-  anything shorter. Longer values are accepted without complaint.
+  anything shorter. Longer values are accepted without complaint. It is the
+  measured length: profiling runs `--measurement-start` seconds longer.
+- **`--measurement-start 720`** (12 minutes) is the scenario default: the
+  reported metrics start 720 seconds into profiling, after the startup
+  transient. See [Choosing the Measured Window](#choosing-the-measured-window).
 - **`--random-seed`**: omitted, AIPerf picks a fresh random seed and logs it;
   passing your own (any integer) makes the run reproducible up front.
   Pinning a seed also keys the reconstructed-dataset disk cache: unseeded
@@ -298,10 +306,12 @@ from killing a healthy run (a Ctrl+C stamps it `run_cancelled` / invalid):
    [Troubleshooting](#troubleshooting) if it exceeds the default
    configuration timeout. Later runs with the same corpus, settings, and a
    pinned `--random-seed` restore it from the on-disk cache in seconds.
-2. **Warmup.** Each lane replays one deep-prefix turn to prime the server's
-   KV cache. With deep histories in real coding traces this is a meaningful
-   chunk of wall time on its own.
-3. **Profiling** for `--benchmark-duration` (1800 s by default) — with
+2. **Warmup (only with `--agentic-warmup`).** Each lane replays one
+   deep-prefix turn to prime the server's KV cache. With deep histories in real
+   coding traces this is a meaningful chunk of wall time on its own. Without the
+   flag, profiling starts directly and the cold start is part of the replay.
+3. **Profiling** for `--measurement-start` + `--benchmark-duration`
+   (720 + 1800 s by default; the reported metrics cover the last 1800 s) — with
    `--ui simple`, per-phase progress and request counts tick along as
    traffic flows.
 4. **Drain and export.** In-flight requests finish during a grace-period
@@ -309,8 +319,8 @@ from killing a healthy run (a Ctrl+C stamps it `run_cancelled` / invalid):
    paths (under `./artifacts/` unless you set `--artifact-dir`).
 
 End to end, a cold first run therefore takes noticeably longer than the 30
-minutes the duration flag suggests — reconstruction, warmup, and drain all
-sit on top of it.
+minutes the duration flag suggests — the 12-minute measurement start,
+reconstruction, any warmup, and drain all sit on top of it.
 
 ---
 
@@ -334,14 +344,15 @@ flag.
 | `--cache-bust first_turn_prefix` | A unique per-conversation marker is injected at the start of the first user turn for every play (each dispatch of a trace, initial or recycled) | Without this, every time a trace is recycled the server's prefix cache would warm up further on identical content, and steady-state cache-hit rates would inflate the longer the run goes. The marker gives every recycled play a fresh prompt prefix. |
 | Loader is a pinned Weka with-subagents corpus | The dataset must be a with-subagents `--public-dataset` alias or `--hf-weka-dataset semianalysisai/cc-traces-weka-062126` (`weka_hf`). A local `weka_trace` directory is format-compatible but unpinned — the run refuses unless you pass `--unsafe-override` (which stamps `submission_valid: false`). The [Troubleshooting](#troubleshooting) entry for this lock lists the exact flag forms. | Submission validity requires a known public corpus identity; arbitrary local dirs are not hash-verifiable. |
 | `--benchmark-duration >= 900` (defaults to 1800 when unset) | The run lasts at least 15 minutes; if omitted, it runs for 30 minutes | Steady-state needs time to stabilize; short runs are noise. |
+| `--measurement-start` defaults to 720 | Reported metrics start 12 minutes into profiling, which runs 12 minutes longer so the measured span keeps `--benchmark-duration`; `--measurement-start 0` turns it off | The first minutes of a replay are a cold-start transient, not steady state. |
 | No client-side input truncation | `--synthesis-max-isl` — the file-based synthesis ISL filter — is rejected because it drops traces whose input length exceeds the cap (the `--public-dataset` corpus has no synthesis filter, so there the flag has no effect either way) | Truncating prompts on the client side would falsify the workload. |
 | `--random-seed` is set | If you didn't pass one, AIPerf picks a strong random one and logs it | Reproducibility — every replayed result can be regenerated. |
 
 If you forget to pass the `ignore_eos` extra-input, `--streaming`,
 `--cache-bust`, or `--random-seed`, AIPerf
 injects the locked value and tells you at INFO log level. The same goes for
-`--system-idle-gap-cap-seconds` and `--benchmark-duration` (1800s default)
-when you don't set them explicitly. If you pass one of these explicitly with
+`--system-idle-gap-cap-seconds`, `--benchmark-duration` (1800s default) and
+`--measurement-start` (720s default) when you don't set them explicitly. If you pass one of these explicitly with
 a value that conflicts with the scenario, AIPerf errors with all the
 violations listed at once — you don't have to fix them one at a time.
 
@@ -428,9 +439,17 @@ evolving (see the status note at the top).
 
 ### Warmup Phase: Trajectories and `k_i`
 
-Before AIPerf measures anything, it runs a **warmup phase** that primes the
-server's KV cache. This isn't the generic AIPerf warmup — it's a
-trajectory-based warmup specific to the agentic-replay scheduler.
+The agentic warmup is opt-in. Without `--agentic-warmup`, AIPerf runs no warmup
+phase: profiling replays every trajectory from its sampled start, each stream's
+first request carries its accumulated prefix to a cold cache, and the server
+sees one continuous replay. Exclude the resulting startup transient after the
+run by [choosing the measured window](#choosing-the-measured-window).
+
+With `--agentic-warmup`, before AIPerf measures anything, it runs a **warmup
+phase** that primes the server's KV cache. This isn't the generic AIPerf warmup
+— it's a trajectory-based warmup specific to the agentic-replay scheduler.
+`--agentic-cache-warmup-duration`, `--warmup-requests-per-lane`, and
+`--agentic-warmup-grace-period` all require `--agentic-warmup`.
 
 Here's the picture. You set `--concurrency 100`. The scheduler builds 100
 active trajectory lanes, drawing traces from the dataset sampler. Filling more
@@ -505,9 +524,87 @@ warmup.
 These requests remain part of warmup, so they are excluded from exported
 request metrics.
 
+### Choosing the Measured Window
+
+Every agentic replay starts with a transient: lanes begin idle at their sampled
+`t*`, caches are cold, and most lanes sit inside a long recorded idle gap, so
+the per-trace idle cap (`--trace-idle-gap-cap-seconds`, 300 seconds under the
+preset) releases them within its first interval. Each tree's first idle-cap
+release is staggered to a seeded random share of the cap, so those lanes do not
+all return at the same instant; a first recorded gap shorter than the cap can
+be shortened too. `AIPERF_AGENTX_STAGGER_INITIAL_IDLE_CAP=false` arms every
+first release with the full cap instead. Rather than change client behavior at a
+phase boundary, AIPerf replays continuously and only moves where the reported
+metrics start.
+
+`--measurement-start SECONDS` (720 under both AgentX scenarios) starts the
+console table and the root exports (`profile_export_aiperf.json`/`.csv`,
+`server_metrics_export.json`, GPU telemetry) that many seconds into profiling.
+720 seconds covered the startup transient of high-concurrency AgentX runs; the
+suffix windows below show where yours settles. The profiling phase runs
+`--measurement-start` + `--benchmark-duration` seconds, so
+`--benchmark-duration` stays the measured length, and the latency-coverage
+check is judged over that measured span. In detail:
+
+- Request metrics cover profiling requests that **started** after the
+  measurement start, and throughputs divide by the span from it to the
+  profiling end. Earlier requests still load the server and still appear in
+  `profile_export.jsonl`.
+- Server metrics (and GPU telemetry) summaries are cut by time, with deltas
+  starting from the last scrape before the measurement start; their
+  timeslices are cut too. The server-metrics Parquet export keeps the whole
+  phase.
+- Request-metric timeslices keep the whole phase, so the transient stays
+  visible.
+- The JSON export records the offset as `metadata.measurement_start_seconds`,
+  and its `start_time` is the measurement start.
+
+It requires a single profiling phase with a duration and no other phase, and
+cannot be combined with `--agentic-warmup` (pass `--measurement-start 0` to
+use the warmup). `--measurement-start 0` reports the whole profiling phase.
+
+To choose a different start after the run, `--window-start-interval SECONDS` (60 under the `agentx` preset) exports, at
+run end, the profiling summary for every window that starts `k × SECONDS` after
+the profiling start and ends at the profiling end:
+
+```text
+windows/manifest.json
+windows/start_0s/profile_export_aiperf.json
+windows/start_0s/profile_export_aiperf.csv
+windows/start_0s/server_metrics.json
+windows/start_60s/profile_export_aiperf.json
+...
+```
+
+`windows/manifest.json` lists each window's `start_offset_sec`, `start_ns`,
+`end_ns`, request counts, and file paths. In each window:
+
+- Request metrics cover profiling requests that **started** in the window, and
+  throughputs divide by the window length. Sweep metrics (concurrency,
+  `effective_*` throughputs, tokens in flight) therefore describe only that
+  cohort; unlike the same metrics in timeslices, they leave out requests already
+  in flight at the window start.
+- Server metrics (and GPU telemetry, when enabled) are cut by time: counter and
+  histogram deltas start from the last scrape before the window start, and the
+  endpoint collection info covers the same span.
+- Timeslices, the pooled speculative-decoding histogram, theoretical prefix-cache
+  hit, energy-efficiency metrics, the replay send-lag metrics, and error details
+  stay run-level only; each window carries its error count.
+
+Windows require a single profiling phase that is the last phase. The grid stops
+at the first window with no requests and after at most 256 windows, and a
+profiling duration that would need more is rejected at startup.
+`--window-start-interval 0` turns the preset's windows off. Windows are written
+before the run's results are published; a Ctrl+C during that step is answered
+with the finished root results and stops the export before the next window.
+
+The window that starts at `--measurement-start` has the same request metrics
+as the root exports. Run long enough that the window you keep still spans the
+duration you want to measure.
+
 ### Profiling Phase: Faithful Replay, Recycle, Global Idle Guard
 
-After warmup, the profiling phase opens. Now you're measuring. Each trajectory
+After warmup, if any, the profiling phase opens. Now you're measuring. Each trajectory
 keeps replaying its conversation from turn `k_i + 1` onward, honoring the
 original recorded inter-turn gaps as end-to-start delays counted from the
 moment the previous turn completes. At the phase boundary, AIPerf subtracts
@@ -574,7 +671,8 @@ A few wrinkles worth knowing:
   active `--cache-bust` target. With wrap on, one source trace
   can back several lanes (each keeping its own start position and recycle
   behavior). An *empty* pool after filtering is still an error.
-- **Profiling ends** when `--benchmark-duration` elapses. Anything in flight
+- **Profiling ends** `--measurement-start` + `--benchmark-duration` seconds
+  after it starts. Anything in flight
   finishes during a grace-period drain and is included in the metrics; nothing
   *new* starts after the duration ends.
 
@@ -685,7 +783,7 @@ resolvable HF repo name (a local server alias, a private build), pass
 [Tokenizer Auto-Detection](../reference/tokenizer-auto-detection.md).
 
 **Run aborts early: `aborting run early (broadcasting ProfileCancelCommand)` / warmup failure**
-Your inference server rejected a warmup request. Each warmup request gets
+This applies only with `--agentic-warmup`: your inference server rejected a warmup request. Each warmup request gets
 exactly one attempt — there is no retry — and AgentX MVP aborts on the
 **first** terminal root-conversation warmup failure rather than producing a
 partial result: the run cancels immediately and the failing trace is named
@@ -784,9 +882,10 @@ restore it in seconds. See
 **Run is slower than I expected**
 On a cold first run, the corpus reconstruction described in the previous
 entry happens before any traffic — budget several extra minutes for it.
-After that, the warmup phase replays a full conversation prefix for every
-trajectory stream before profiling starts; with deep histories in real
-coding traces, that's a meaningful chunk of wall time on its own. Subagent
+After that, with `--agentic-warmup`, the warmup phase replays a full
+conversation prefix for every trajectory stream before profiling starts; with
+deep histories in real coding traces, that's a meaningful chunk of wall time on
+its own. Subagent
 fan-out can also create additional in-flight requests beyond the active
 parent trajectory count. If your server is concurrency-limited and you
 raised `--concurrency` above its limit, you'll also see queueing. Drop

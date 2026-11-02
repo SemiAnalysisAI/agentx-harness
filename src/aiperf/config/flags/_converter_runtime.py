@@ -59,6 +59,9 @@ def build_artifacts(cli: CLIConfig) -> dict[str, Any]:
     cli_set = cli.model_fields_set
     if "slice_duration" in cli_set and cli.slice_duration is not None:
         artifacts["slice_duration"] = cli.slice_duration
+    if "window_start_interval" in cli_set and cli.window_start_interval is not None:
+        # 0 turns windows off, including a scenario preset's default interval.
+        artifacts["window_start_interval"] = cli.window_start_interval or None
     # Only emit records/raw when the user explicitly set --export-level.
     # The CLIConfig default is RECORDS, but we must not override a YAML
     # config that set `artifacts.records: false` just because the default

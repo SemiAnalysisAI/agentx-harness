@@ -295,10 +295,10 @@ class TestFixedTrialsStrategy:
         AGENTIC_REPLAY warmup is not a stored ``exclude_from_results`` phase; it
         is derived from the surviving profiling phase by
         ``TimingConfig.from_run`` -> ``_build_agentic_warmup_config``, keyed off
-        the profiling phase's ``agentic_cache_warmup_duration``. Stripping the
-        excluded phases alone leaves that field set, so the accelerated
-        cache-pressure substage would re-run on every trial. Pin that
-        ``_disable_warmup`` zeroes it so trials 2+ run with NO warmup at all.
+        the profiling phase's ``agentic_warmup`` opt-in. Stripping the
+        excluded phases alone leaves it set, so the agentic warmup would re-run
+        on every trial. Pin that ``_disable_warmup`` turns it off and clears its
+        tuning so trials 2+ run with NO warmup at all.
         """
         from aiperf.plugin.enums import TimingMode
 
@@ -311,7 +311,9 @@ class TestFixedTrialsStrategy:
                     "requests": 100,
                     "concurrency": 1,
                     "timing_mode": TimingMode.AGENTIC_REPLAY,
+                    "agentic_warmup": True,
                     "agentic_cache_warmup_duration": 30.0,
+                    "agentic_warmup_grace_period": 60.0,
                 },
             ],
         )
@@ -334,7 +336,9 @@ class TestFixedTrialsStrategy:
         # Second trial must have the cache-pressure warmup suppressed.
         second_config = strategy.get_next_config(config, results)
         for phase in second_config.get_profiling_phases():
+            assert phase.agentic_warmup is False
             assert phase.agentic_cache_warmup_duration is None
+            assert phase.agentic_warmup_grace_period is None
 
         # Original config untouched (deep copy).
         assert config.get_profiling_phases()[0].agentic_cache_warmup_duration == 30.0
@@ -351,6 +355,7 @@ class TestFixedTrialsStrategy:
                     "requests": 100,
                     "concurrency": 1,
                     "timing_mode": TimingMode.AGENTIC_REPLAY,
+                    "agentic_warmup": True,
                     "warmup_requests_per_lane": 10,
                 },
             ],

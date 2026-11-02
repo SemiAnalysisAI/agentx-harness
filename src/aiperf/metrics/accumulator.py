@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
@@ -288,6 +289,8 @@ class MetricsAccumulator(BaseMetricsProcessor):
         """
         if not self._acceptance_pool_by_phase:
             return None
+        if ctx is not None and ctx.min_request_start_ns is not None:
+            return None
         if ctx is not None and ctx.phase is not None:
             phase = str(ctx.phase)
             selected = [
@@ -333,6 +336,8 @@ class MetricsAccumulator(BaseMetricsProcessor):
         ``requests_end_ns`` and fail a strict ``start_ns < end_ns`` check.
         Phase-less contexts (realtime rolling windows) keep the half-open
         ``[start_ns, end_ns)`` semantics so adjacent windows never overlap.
+        Suffix-window exports add ``min_request_start_ns``, a lower bound only,
+        so the phase's own end semantics are unchanged.
         """
         if ctx is None:
             return None
@@ -350,6 +355,8 @@ class MetricsAccumulator(BaseMetricsProcessor):
                 mask &= self._column_store.mask_for_categorical(
                     "phase_index", str(ctx.phase_index)
                 )
+            if ctx.min_request_start_ns is not None:
+                mask &= self._column_store.start_ns[:n] >= ctx.min_request_start_ns
             return mask
         if ctx.start_ns is not None:
             mask &= self._column_store.start_ns[:n] >= ctx.start_ns
@@ -706,6 +713,7 @@ class MetricsAccumulator(BaseMetricsProcessor):
         *,
         include_timeslices: bool,
         include_sweeps: bool = True,
+        include_run_scoped: bool = True,
     ) -> AccumulatorMetricsSummary:
         mask = self._mask_for_export_context(ctx)
 
@@ -715,6 +723,7 @@ class MetricsAccumulator(BaseMetricsProcessor):
             mask,
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
+            is_timeslice=not include_run_scoped,
         )
 
         timeslices: list[TimesliceResult] | None = None
@@ -741,10 +750,21 @@ class MetricsAccumulator(BaseMetricsProcessor):
                 adjusted_arrays = compute_network_adjusted_arrays(
                     self._column_store, self._network_rtt_ns
                 )
-            if include_timeslices and self._slice_duration_ns is not None:
+            if (
+                include_timeslices
+                and self._slice_duration_ns is not None
+                and (ctx is None or ctx.min_request_start_ns is None)
+            ):
                 timeslices = self._compute_timeslices(
                     sweeps, mask=mask, adjusted_arrays=adjusted_arrays
                 )
+        if (
+            include_timeslices
+            and self._slice_duration_ns is not None
+            and ctx is not None
+            and ctx.min_request_start_ns is not None
+        ):
+            timeslices = self._whole_phase_timeslices(ctx, adjusted_arrays)
 
         overall_results = self._convert_display_units(overall_results)
 
@@ -763,13 +783,14 @@ class MetricsAccumulator(BaseMetricsProcessor):
                 )
             # Run-scoped replay send-lag family (fixed-schedule only): anchored at
             # the run-global least-late request, so computed once over the masked
-            # offset column, never per timeslice.
-            inject_replay_sched_lag_metrics(
-                self._column_store,
-                overall_results,
-                mask=mask,
-                warn_degraded=self._warn_replay_degraded,
-            )
+            # offset column, never per timeslice or suffix window.
+            if include_run_scoped:
+                inject_replay_sched_lag_metrics(
+                    self._column_store,
+                    overall_results,
+                    mask=mask,
+                    warn_degraded=self._warn_replay_degraded,
+                )
 
         overall_results = self._filter_hidden_metrics(overall_results)
         self.debug(lambda: f"Summarized {len(overall_results)} metric results")
@@ -781,9 +802,42 @@ class MetricsAccumulator(BaseMetricsProcessor):
             ),
         )
 
+    def _whole_phase_timeslices(
+        self, ctx: ExportContext, adjusted_arrays: dict[str, FloatArray] | None
+    ) -> list[TimesliceResult]:
+        """Timeslices over the whole phase, ignoring the request-start bound.
+
+        The measurement start cuts only the summary: the time series keeps the
+        startup transient visible.
+        """
+        mask = self._mask_for_export_context(replace(ctx, min_request_start_ns=None))
+        if mask is None or not mask.any():
+            return []
+        if adjusted_arrays is None and self._network_rtt_ns:
+            adjusted_arrays = compute_network_adjusted_arrays(
+                self._column_store, self._network_rtt_ns
+            )
+        sweeps = compute_sweep_curves(self._column_store, mask=mask)
+        return self._compute_timeslices(
+            sweeps, mask=mask, adjusted_arrays=adjusted_arrays
+        )
+
     async def export_results(self, ctx: ExportContext) -> AccumulatorMetricsSummary:
         """Export final metrics results for the requested phase/window."""
         return self._summarize_for_export_context(ctx, include_timeslices=True)
+
+    async def export_window_results(
+        self, ctx: ExportContext
+    ) -> AccumulatorMetricsSummary:
+        """Export one suffix window.
+
+        Timeslices and metrics anchored to a run-global reference (the replay
+        send-lag family) remain whole-run artifacts: re-anchoring them per
+        window would hide drift that started before the window.
+        """
+        return self._summarize_for_export_context(
+            ctx, include_timeslices=False, include_run_scoped=False
+        )
 
     def _inject_sweep_metrics(
         self,

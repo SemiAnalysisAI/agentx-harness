@@ -81,6 +81,17 @@ class ScenarioSpec(AIPerfBaseModel):
             "min_benchmark_duration_seconds floor). None disables auto-fill."
         ),
     )
+    default_measurement_start_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Value auto-filled into --measurement-start when the user leaves it "
+            "unset: the summaries start this many seconds into profiling, after "
+            "the startup transient, and the run is extended to keep "
+            "--benchmark-duration measured seconds. Explicit user values, "
+            "including 0, are honored. None disables auto-fill."
+        ),
+    )
     default_trajectory_start_min_ratio: float | None = Field(
         default=None,
         ge=0.0,
