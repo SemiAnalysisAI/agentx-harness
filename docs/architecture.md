@@ -414,3 +414,10 @@ sequenceDiagram
         F->>M: log_metric(live.<name>, delta)
     end
 ```
+
+
+Session-scoped DAG aborts use the existing `CancelCredits` worker message.
+The credit router tracks each in-flight credit's logical session separately
+from sticky worker placement, and coalesces session and phase cancellations
+until acknowledgement. This keeps neighboring sessions on a shared worker
+running and preserves normal credit-return slot accounting.

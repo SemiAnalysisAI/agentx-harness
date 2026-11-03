@@ -923,3 +923,28 @@ class TestURLSelectionStrategy:
 
         sent_credit = mock_router.send_credit.call_args.kwargs["credit"]
         assert sent_credit.url_index is None
+
+
+@pytest.mark.asyncio
+async def test_abort_session_cancels_wire_credit_without_releasing_slots(
+    credit_issuer: CreditIssuer, mock_router: MagicMock, mock_concurrency: MagicMock
+) -> None:
+    """Delegate cancellation without releasing another session's slots early."""
+    mock_router.cancel_session_credits = AsyncMock()
+
+    await credit_issuer.abort_session("orphan-session")
+
+    mock_router.cancel_session_credits.assert_awaited_once_with("orphan-session")
+    mock_concurrency.release_session_slot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_abort_session_send_failure_does_not_interrupt_other_aborts(
+    credit_issuer: CreditIssuer, mock_router: MagicMock
+) -> None:
+    """A failed cancellation send must not break the orphan cleanup loop."""
+    mock_router.cancel_session_credits = AsyncMock(side_effect=RuntimeError("offline"))
+
+    await credit_issuer.abort_session("orphan-session")
+
+    mock_router.cancel_session_credits.assert_awaited_once_with("orphan-session")

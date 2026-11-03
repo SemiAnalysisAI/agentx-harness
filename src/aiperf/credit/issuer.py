@@ -608,21 +608,16 @@ class CreditIssuer:
         return await self.issue_credit(turn)
 
     async def abort_session(self, x_correlation_id: str) -> None:
-        """Abort an in-flight session (FORK/SPAWN parent or orphan).
+        """Cancel a session's live requests while retaining credit-return accounting.
 
-        Currently a no-op: the credit-return slot-release path covers every
-        reachable case under the current orchestrator. This method exists so
-        the orchestrator's ``hasattr(self._issuer, "abort_session")`` guard
-        resolves; under ``AIPERF_DAG_FAIL_FAST=true`` the orchestrator calls
-        this when a child errors and the parent / orphan siblings must be torn
-        down.
-
-        If implemented in the future, the contract is:
-
-        - Cancel any in-flight credit for ``x_correlation_id`` (via the router).
-        - Release the session slot (do NOT release sibling sessions' slots).
-        - Be idempotent -- orchestrator calls it once per session, but errors
-          mid-tear-down may re-enter.
-        - Be exception-safe -- orchestrator does not retry.
+        The orchestrator calls this for an aborted parent and its orphan
+        siblings. Each normal credit return still owns its slot release, so
+        cancellation must not release slots eagerly. A failed send must not
+        prevent the orchestrator from attempting to stop the other siblings.
         """
-        return None
+        try:
+            await self._credit_router.cancel_session_credits(x_correlation_id)
+        except Exception as exc:
+            _logger.warning(
+                f"Failed to cancel active credits for session {x_correlation_id}: {exc}"
+            )

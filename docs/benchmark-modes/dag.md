@@ -402,3 +402,15 @@ With neither `--num-conversations` nor `--request-count` supplied, AIPerf logs `
 - [Multi-Turn Conversations](../tutorials/multi-turn.md) — linear multi-turn replay.
 - [Architecture](../architecture.md) — sub-agent orchestrator and credit plumbing.
 - [Conversation Context Mode](../reference/conversation-context-mode.md) — background on how history accumulates.
+
+
+### Cancelling an aborted tree's in-flight requests
+
+With `AIPERF_DAG_FAIL_FAST=true`, a child error also requests cancellation of
+in-flight parent and orphan-sibling credits. Cancellation selects the logical
+session id, so FORK siblings sharing a worker are not cancelled together unless
+they are part of that aborted tree. Session and phase aborts coalesce repeated
+cancellation requests until the worker returns the credit. Normal credit-return
+accounting releases slots; sending a cancellation does not release them early.
+A cancellation transport failure is logged, and cleanup continues for the other
+siblings.
