@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from msgspec.structs import replace as _struct_replace
@@ -42,6 +43,20 @@ if TYPE_CHECKING:
 
 
 _logger = AIPerfLogger(__name__)
+
+
+@dataclass(slots=True)
+class _RootSession:
+    """Phase-owned root accounting, independent of request credit lifetime."""
+
+    owns_legacy_slot: bool
+    """Whether this issuer, rather than the tree registry, releases the slot."""
+    unsent_turns: int = 0
+    """Remaining authored root turns, excluding already issued requests and children."""
+    terminal_counted: bool = False
+    """Whether an authored final return already accounted this logical session."""
+    aborted_group: set[str] | None = None
+    """Related sessions that must all return before an aborted legacy slot is freed."""
 
 
 class CreditIssuer:
@@ -126,6 +141,8 @@ class CreditIssuer:
             else None
         )
         self._issuing_stopped = False
+        self._aborted_sessions: set[str] = set()
+        self._root_sessions: dict[str, _RootSession] = {}
         self._max_tokens_override: int | None = None
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
@@ -138,6 +155,8 @@ class CreditIssuer:
 
     def _turn_admission_result(self, turn: TurnToSend) -> TurnAdmission:
         """Run the optional final admission check."""
+        if self.is_session_aborted(turn.x_correlation_id):
+            return TurnAdmission.REJECT
         callback = getattr(self, "_turn_admission", None)
         if callback is None:
             return TurnAdmission.ADMIT
@@ -236,6 +255,11 @@ class CreditIssuer:
         # not gate its own admission via can_start_new_session). A rootless lane
         # reaches no terminal root turn, so it must NOT be counted here.
         if root_pending and session_turns > 0:
+            if root_correlation_id is not None:
+                self._root_sessions[root_correlation_id] = _RootSession(
+                    owns_legacy_slot=self._session_tree_registry is None,
+                    unsent_turns=session_turns,
+                )
             self._progress.account_lane_session(session_turns)
         return True
 
@@ -247,6 +271,10 @@ class CreditIssuer:
         non-agentic). A root session start is always depth 0, so the tree root
         id is the root's own ``x_correlation_id``.
         """
+        self._root_sessions[turn.effective_root_correlation_id] = _RootSession(
+            owns_legacy_slot=self._session_tree_registry is None,
+            unsent_turns=turn.num_turns - turn.turn_index,
+        )
         if self._session_tree_registry is not None:
             self._session_tree_registry.open_tree(
                 turn.effective_root_correlation_id, self._phase_key, root_pending=True
@@ -302,12 +330,14 @@ class CreditIssuer:
             6. Create and send Credit
             7. If final credit: freeze counts + set event
         """
+        if self.is_session_aborted(turn.x_correlation_id):
+            return False
         gate = getattr(self, "replay_gate", ReplayIssueGate(None))
         return await gate.submit(turn, lambda: self._issue_credit_ready(turn))
 
     async def _issue_credit_ready(self, turn: TurnToSend) -> bool:
         """Issue a turn whose recorded predecessor frontier is complete."""
-        if self._issuing_stopped:
+        if self._session_issuance_stopped(turn.x_correlation_id):
             return False
 
         # A session start is turn 0 OR an agentic mid-trace resume (flagged via
@@ -340,7 +370,7 @@ class CreditIssuer:
         needs_session_slot = is_session_start and not is_child
         if needs_session_slot:
             acquired = await self._concurrency_manager.acquire_session_slot(
-                self._phase_key, self._stop_checker.can_start_new_session
+                self._phase_key, can_proceed_fn
             )
             if not acquired:
                 return False
@@ -400,7 +430,10 @@ class CreditIssuer:
             )
 
         # Check stop condition FIRST - distinguishes False from None
-        if not can_proceed_fn():
+        if (
+            self._session_issuance_stopped(turn.x_correlation_id)
+            or not can_proceed_fn()
+        ):
             return False
 
         needs_session_slot = is_session_start and not is_child
@@ -442,6 +475,10 @@ class CreditIssuer:
         if self._max_tokens_override is not None:
             turn = _struct_replace(turn, max_tokens_override=self._max_tokens_override)
         credit_index, is_final_credit = self._progress.increment_sent(turn)
+        if turn.agent_depth == 0:
+            state = self._root_sessions.get(turn.effective_root_correlation_id)
+            if state is not None:
+                state.unsent_turns -= 1
 
         cancel_after_ns = self._cancellation_policy.next_cancellation_delay_ns(
             turn, self._phase
@@ -525,6 +562,8 @@ class CreditIssuer:
         attempt would send the first sibling and permanently truncate every
         other sibling spawned in the same gather.
         """
+        if self.is_session_aborted(turn.x_correlation_id):
+            return ChildDispatchResult.REJECTED
         gate = getattr(self, "replay_gate", ReplayIssueGate(None))
         return await gate.submit(
             turn,
@@ -535,9 +574,15 @@ class CreditIssuer:
 
     async def _dispatch_child_turn_ready(self, turn: TurnToSend) -> ChildDispatchResult:
         """Dispatch a child after its recorded predecessor frontier completes."""
-        if self._issuing_stopped:
+        if self._session_issuance_stopped(turn.x_correlation_id):
             return ChildDispatchResult.REJECTED
-        can_proceed_fn = self._stop_checker.can_send_child_turn
+
+        def can_proceed_fn() -> bool:
+            return (
+                not self.is_session_aborted(turn.x_correlation_id)
+                and self._stop_checker.can_send_child_turn()
+            )
+
         if not can_proceed_fn():
             return ChildDispatchResult.REJECTED
         # Children inherit the parent's session slot; wait for prefill
@@ -607,22 +652,85 @@ class CreditIssuer:
         )
         return await self.issue_credit(turn)
 
+    def is_session_aborted(self, x_correlation_id: str) -> bool:
+        """Return whether this phase permanently refuses the logical session."""
+        return x_correlation_id in getattr(self, "_aborted_sessions", ())
+
+    def _session_issuance_stopped(self, x_correlation_id: str) -> bool:
+        """Combine phase termination with logical-session admission."""
+        return self._issuing_stopped or self.is_session_aborted(x_correlation_id)
+
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Query router ownership without confusing logical abort with completion."""
+        check = getattr(self._credit_router, "has_session_credits", None)
+        return check is not None and check(x_correlation_id) is True
+
+    def mark_sessions_aborted(self, x_correlation_ids: set[str]) -> None:
+        """Close admission for an entire abort group before any cancellation awaits."""
+        self._aborted_sessions.update(x_correlation_ids)
+        for root, state in self._root_sessions.items():
+            if root in x_correlation_ids:
+                state.aborted_group = (state.aborted_group or set()) | x_correlation_ids
+
+    def root_terminal_counted(self, root_correlation_id: str) -> bool:
+        """Avoid counting multiple authored terminal credits for an aborting root."""
+        state = self._root_sessions.get(root_correlation_id)
+        return state is not None and state.terminal_counted
+
+    def on_root_final_return(self, root_correlation_id: str) -> None:
+        """Record a counted final return and release only issuer-owned capacity."""
+        state = self._root_sessions.get(root_correlation_id)
+        if state is None:
+            return
+        state.terminal_counted = True
+        if state.aborted_group is not None:
+            self.settle_aborted_root_sessions()
+            return
+        self._root_sessions.pop(root_correlation_id)
+        if state.owns_legacy_slot:
+            self._concurrency_manager.release_session_slot(self._phase_key)
+
+    def settle_aborted_root_sessions(self) -> None:
+        """Finish logical root accounting once its entire abort group is off wire."""
+        ready = [
+            root
+            for root, state in self._root_sessions.items()
+            if state.aborted_group is not None
+            and not any(self.has_session_credits(cid) for cid in state.aborted_group)
+        ]
+        for root in ready:
+            state = self._root_sessions.pop(root)
+            if not state.terminal_counted:
+                self._progress.cancel_session(unsent_turns=state.unsent_turns)
+            if state.owns_legacy_slot:
+                self._concurrency_manager.release_session_slot(self._phase_key)
+
+    def release_remaining_legacy_slots(self) -> int:
+        """Release this phase's legacy roots once and report their token count."""
+        released = 0
+        for root, state in list(self._root_sessions.items()):
+            if not state.owns_legacy_slot:
+                continue
+            self._root_sessions.pop(root)
+            if state.aborted_group is not None and not state.terminal_counted:
+                self._progress.cancel_session(unsent_turns=state.unsent_turns)
+            self._concurrency_manager.release_session_slot(self._phase_key)
+            released += 1
+
+        return released
+
     async def abort_session(self, x_correlation_id: str) -> None:
-        """Abort an in-flight session (FORK/SPAWN parent or orphan).
+        """Cancel a session's live requests while retaining credit-return accounting.
 
-        Currently a no-op: the credit-return slot-release path covers every
-        reachable case under the current orchestrator. This method exists so
-        the orchestrator's ``hasattr(self._issuer, "abort_session")`` guard
-        resolves; under ``AIPERF_DAG_FAIL_FAST=true`` the orchestrator calls
-        this when a child errors and the parent / orphan siblings must be torn
-        down.
-
-        If implemented in the future, the contract is:
-
-        - Cancel any in-flight credit for ``x_correlation_id`` (via the router).
-        - Release the session slot (do NOT release sibling sessions' slots).
-        - Be idempotent -- orchestrator calls it once per session, but errors
-          mid-tear-down may re-enter.
-        - Be exception-safe -- orchestrator does not retry.
+        The orchestrator calls this for an aborted parent and its orphan
+        siblings. Each normal credit return still owns its slot release, so
+        cancellation must not release slots eagerly. A failed send must not
+        prevent the orchestrator from attempting to stop the other siblings.
         """
-        return None
+        self.mark_sessions_aborted({x_correlation_id})
+        try:
+            await self._credit_router.cancel_session_credits(x_correlation_id)
+        except Exception as exc:
+            _logger.warning(
+                f"Failed to cancel active credits for session {x_correlation_id}: {exc}"
+            )

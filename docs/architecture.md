@@ -212,6 +212,27 @@ The Timing Manager uses a **credit-based flow control system** to control when r
 - Scales to large numbers of workers without bottlenecks
 - Efficient message routing minimizes overhead
 
+### Session-scoped DAG cancellation
+
+Session-scoped DAG aborts use the existing `CancelCredits` worker message.
+The credit router tracks each in-flight credit's logical session separately
+from sticky worker placement, and coalesces session and phase cancellations
+until acknowledgement. This keeps neighboring sessions on a shared worker
+running and preserves normal credit-return slot accounting.
+
+
+For phases without a tree registry, the issuer records each root's slot ownership.
+An aborted group keeps that capacity until its last actual request returns,
+or until phase teardown at the grace cutoff. A root that never returns an
+authored final turn is counted once as a cancelled logical session, without
+adding a synthetic HTTP request or return. Authored final returns and cutoff
+cleanup use the same ownership ledger to avoid releasing a slot twice.
+
+When an abort settles, the issuer retires the root turns that were never
+issued from the sampled session plan. If that satisfies the session quota,
+it signals sending completion without waiting for the duration cutoff.
+Actual request sends and returns, including descendants, remain unchanged.
+
 ### Data Flow & Messaging
 
 This section describes the end-to-end message flow during a benchmark run, showing how data moves between components through the ZMQ message bus.

@@ -347,6 +347,26 @@ class CreditCounter:
             self._requests_completed + self._requests_cancelled
         ) >= self._final_requests_sent
 
+    def cancel_session(self, *, unsent_turns: int = 0) -> bool:
+        """Retire an aborted root plan without inventing request sends or returns.
+
+        Return whether retiring the remaining root turns satisfies the session
+        target. Actual wire counters, including descendants, are unchanged.
+        """
+        if (
+            not 0
+            <= unsent_turns
+            <= self._total_session_turns - self._root_requests_sent
+        ):
+            raise ValueError("Unsent root turns exceed the outstanding session plan")
+        self._total_session_turns -= unsent_turns
+        self._cancelled_sessions += 1
+        return (
+            self._config.expected_num_sessions is not None
+            and self._sent_sessions >= self._config.expected_num_sessions
+            and self._root_requests_sent >= self._total_session_turns
+        )
+
     def increment_prefill_released(self) -> None:
         """Increment prefill released count (on TTFT or return without TTFT)."""
         self._prefills_released += 1

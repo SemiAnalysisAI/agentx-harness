@@ -91,6 +91,10 @@ class WorkerLoad:
     total_errors_reported: int = 0
     in_flight_credits: int = 0
     active_credit_ids: set[int] = field(default_factory=set)
+    active_credit_sessions: dict[int, str] = field(default_factory=dict)
+    """Logical session ownership, separate from a shared FORK routing key."""
+    cancellation_requested_ids: set[int] = field(default_factory=set)
+    """Cancellation requests awaiting credit return, preventing repeated task cancellation."""
     active_sessions: int = 0  # Sticky sessions assigned to this worker
     active_session_ids: set[str] = field(default_factory=set)
     last_sent_at_ns: int = (
@@ -128,6 +132,14 @@ class CreditRouterProtocol(Protocol):
         Args:
             timeout: Seconds to wait for the first worker before giving up.
         """
+        ...
+
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Return whether the session still owns any active credits."""
+        ...
+
+    async def cancel_session_credits(self, x_correlation_id: str) -> None:
+        """Cancel live credits owned by one logical session without releasing slots."""
         ...
 
     async def cancel_all_credits(self) -> None:
@@ -473,9 +485,50 @@ class StickyCreditRouter(CommunicationMixin):
                     load.active_sessions -= 1
                     load.active_session_ids.discard(own_key)
 
-        self._track_credit_sent(worker_id, credit.id)
+        self._track_credit_sent(worker_id, credit.id, credit.x_correlation_id)
 
         await self._router_client.send_to(worker_id, credit)
+
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Check active logical ownership after returned credits have been retired."""
+        return any(
+            x_correlation_id in worker.active_credit_sessions.values()
+            for worker in self._workers_cache
+        )
+
+    async def cancel_session_credits(self, x_correlation_id: str) -> None:
+        """Cancel one session's credits, including children sharing a parent worker."""
+        to_cancel = {
+            worker.worker_id: {
+                credit_id
+                for credit_id, session_id in worker.active_credit_sessions.items()
+                if session_id == x_correlation_id
+            }
+            for worker in self._workers_cache
+        }
+        for worker_id, credit_ids in to_cancel.items():
+            if credit_ids:
+                await self._cancel_worker_credits(worker_id, credit_ids)
+
+    async def _cancel_worker_credits(self, worker_id: str, credit_ids: set[int]) -> int:
+        """Coalesce session/phase cancellation until the worker returns each credit."""
+        worker = self._workers.get(worker_id)
+        if worker is None:
+            return 0
+        pending = (
+            credit_ids & worker.active_credit_ids
+        ) - worker.cancellation_requested_ids
+        if not pending:
+            return 0
+        worker.cancellation_requested_ids.update(pending)
+        try:
+            await self._router_client.send_to(
+                worker_id, CancelCredits(credit_ids=pending)
+            )
+        except BaseException:
+            worker.cancellation_requested_ids.difference_update(pending)
+            raise
+        return len(pending)
 
     async def cancel_all_credits(self) -> None:
         """Send cancellation requests to all workers with in-flight credits."""
@@ -501,11 +554,9 @@ class StickyCreditRouter(CommunicationMixin):
                     f"Sending CancelCredits to worker {worker_id} for {len(credit_ids)} credits"
                 )
 
-            await self._router_client.send_to(
-                worker_id,
-                CancelCredits(credit_ids=credit_ids),
+            total_cancelled_credits += await self._cancel_worker_credits(
+                worker_id, credit_ids
             )
-            total_cancelled_credits += len(credit_ids)
 
         if total_cancelled_credits > 0:
             self.info(
@@ -706,7 +757,9 @@ class StickyCreditRouter(CommunicationMixin):
             else:
                 self._min_load = 0
 
-    def _track_credit_sent(self, worker_id: str, credit_id: int) -> None:
+    def _track_credit_sent(
+        self, worker_id: str, credit_id: int, x_correlation_id: str | None = None
+    ) -> None:
         """Update worker load: increment in_flight_credits. Lock-free."""
         if worker_load := self._workers.get(worker_id):
             old_load = worker_load.in_flight_credits
@@ -715,6 +768,8 @@ class StickyCreditRouter(CommunicationMixin):
             worker_load.virtual_sent_credits += 1
             worker_load.in_flight_credits += 1
             worker_load.active_credit_ids.add(credit_id)
+            if x_correlation_id is not None:
+                worker_load.active_credit_sessions[credit_id] = x_correlation_id
             worker_load.last_sent_at_ns = time.perf_counter_ns()
 
             new_load = worker_load.in_flight_credits
@@ -736,6 +791,8 @@ class StickyCreditRouter(CommunicationMixin):
         """Update worker load: decrement in_flight_credits. Lock-free."""
         if worker_load := self._workers.get(worker_id):
             worker_load.active_credit_ids.discard(credit_id)
+            worker_load.active_credit_sessions.pop(credit_id, None)
+            worker_load.cancellation_requested_ids.discard(credit_id)
 
             if cancelled:
                 worker_load.total_cancelled_credits += 1
