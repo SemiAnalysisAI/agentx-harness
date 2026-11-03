@@ -1808,7 +1808,8 @@ class BranchOrchestrator:
         if x_correlation_id in self._aborted_pending_returns:
             self._aborted_pending_returns.discard(x_correlation_id)
             self._tree_descendant_done(x_correlation_id)
-            self._notify_drain()
+            self._issuer.settle_aborted_root_sessions()
+        self._notify_drain()
         return True
 
     async def _handle_child_errored_fail_fast(
@@ -1840,6 +1841,9 @@ class BranchOrchestrator:
                 self._tree_descendant_done(cid)
                 if self._session_tree_registry is not None:
                     self._session_tree_registry.on_root_terminal(cid)
+        settle_roots = getattr(self._issuer, "settle_aborted_root_sessions", None)
+        if settle_roots is not None:
+            settle_roots()
         self.stats.parents_failed_due_to_child_error += 1
         if hasattr(self._issuer, "abort_session"):
             for cid in aborted - {child_corr}:

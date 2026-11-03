@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from msgspec.structs import replace as _struct_replace
@@ -42,6 +43,18 @@ if TYPE_CHECKING:
 
 
 _logger = AIPerfLogger(__name__)
+
+
+@dataclass(slots=True)
+class _RootSession:
+    """Phase-owned root accounting, independent of request credit lifetime."""
+
+    owns_legacy_slot: bool
+    """Whether this issuer, rather than the tree registry, releases the slot."""
+    terminal_counted: bool = False
+    """Whether an authored final return already accounted this logical session."""
+    aborted_group: set[str] | None = None
+    """Related sessions that must all return before an aborted legacy slot is freed."""
 
 
 class CreditIssuer:
@@ -127,6 +140,7 @@ class CreditIssuer:
         )
         self._issuing_stopped = False
         self._aborted_sessions: set[str] = set()
+        self._root_sessions: dict[str, _RootSession] = {}
         self._max_tokens_override: int | None = None
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
@@ -239,6 +253,10 @@ class CreditIssuer:
         # not gate its own admission via can_start_new_session). A rootless lane
         # reaches no terminal root turn, so it must NOT be counted here.
         if root_pending and session_turns > 0:
+            if root_correlation_id is not None:
+                self._root_sessions[root_correlation_id] = _RootSession(
+                    owns_legacy_slot=self._session_tree_registry is None
+                )
             self._progress.account_lane_session(session_turns)
         return True
 
@@ -250,6 +268,9 @@ class CreditIssuer:
         non-agentic). A root session start is always depth 0, so the tree root
         id is the root's own ``x_correlation_id``.
         """
+        self._root_sessions[turn.effective_root_correlation_id] = _RootSession(
+            owns_legacy_slot=self._session_tree_registry is None
+        )
         if self._session_tree_registry is not None:
             self._session_tree_registry.open_tree(
                 turn.effective_root_correlation_id, self._phase_key, root_pending=True
@@ -639,6 +660,56 @@ class CreditIssuer:
     def mark_sessions_aborted(self, x_correlation_ids: set[str]) -> None:
         """Close admission for an entire abort group before any cancellation awaits."""
         self._aborted_sessions.update(x_correlation_ids)
+        for root, state in self._root_sessions.items():
+            if root in x_correlation_ids:
+                state.aborted_group = (state.aborted_group or set()) | x_correlation_ids
+
+    def root_terminal_counted(self, root_correlation_id: str) -> bool:
+        """Avoid counting multiple authored terminal credits for an aborting root."""
+        state = self._root_sessions.get(root_correlation_id)
+        return state is not None and state.terminal_counted
+
+    def on_root_final_return(self, root_correlation_id: str) -> None:
+        """Record a counted final return and release only issuer-owned capacity."""
+        state = self._root_sessions.get(root_correlation_id)
+        if state is None:
+            return
+        state.terminal_counted = True
+        if state.aborted_group is not None:
+            self.settle_aborted_root_sessions()
+            return
+        self._root_sessions.pop(root_correlation_id)
+        if state.owns_legacy_slot:
+            self._concurrency_manager.release_session_slot(self._phase_key)
+
+    def settle_aborted_root_sessions(self) -> None:
+        """Finish logical root accounting once its entire abort group is off wire."""
+        ready = [
+            root
+            for root, state in self._root_sessions.items()
+            if state.aborted_group is not None
+            and not any(self.has_session_credits(cid) for cid in state.aborted_group)
+        ]
+        for root in ready:
+            state = self._root_sessions.pop(root)
+            if not state.terminal_counted:
+                self._progress.cancel_session()
+            if state.owns_legacy_slot:
+                self._concurrency_manager.release_session_slot(self._phase_key)
+
+    def release_remaining_legacy_slots(self) -> int:
+        """Release this phase's legacy roots once and report their token count."""
+        released = 0
+        for root, state in list(self._root_sessions.items()):
+            if not state.owns_legacy_slot:
+                continue
+            self._root_sessions.pop(root)
+            if state.aborted_group is not None and not state.terminal_counted:
+                self._progress.cancel_session()
+            self._concurrency_manager.release_session_slot(self._phase_key)
+            released += 1
+
+        return released
 
     async def abort_session(self, x_correlation_id: str) -> None:
         """Cancel a session's live requests while retaining credit-return accounting.

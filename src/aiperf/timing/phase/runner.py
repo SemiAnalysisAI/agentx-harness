@@ -428,6 +428,9 @@ class PhaseRunner(TaskManagerMixin):
         if self._progress_task:
             self._progress_task.cancel()
 
+        issuer = getattr(self, "_credit_issuer", None)
+        if issuer is not None:
+            issuer.release_remaining_legacy_slots()
         if self._on_phase_complete:
             self._on_phase_complete()
 
@@ -517,6 +520,7 @@ class PhaseRunner(TaskManagerMixin):
             lifecycle=self._lifecycle,
             stop_checker=self._stop_checker,
             strategy=strategy,
+            credit_issuer=self._credit_issuer,
         )
         if self._branch_orchestrator is not None:
             self._callback_handler.set_branch_orchestrator(self._branch_orchestrator)
@@ -545,6 +549,8 @@ class PhaseRunner(TaskManagerMixin):
         (a second call finds no open trees) and a no-op when tree accounting is
         not engaged (registry None -> dag_jsonl / normal modes unaffected).
         """
+        if not self._config.seamless or self._lifecycle.is_complete:
+            self._credit_issuer.release_remaining_legacy_slots()
         if self._session_tree_registry is None:
             return
         released = self._session_tree_registry.release_all(self._phase_key)
@@ -1167,9 +1173,18 @@ class PhaseRunner(TaskManagerMixin):
 
     def _release_stuck_slots(self) -> None:
         """Release concurrency slots for credits that will never return."""
+        issuer = getattr(self, "_credit_issuer", None)
+        owned_released = (
+            issuer.release_remaining_legacy_slots() if issuer is not None else 0
+        )
+        registry = getattr(self, "_session_tree_registry", None)
+        tree_released = (
+            registry.release_all(self._phase_key) if registry is not None else 0
+        )
         session_released, prefill_released = (
             self._concurrency_manager.release_stuck_slots(self._phase_key)
         )
+        session_released += owned_released + tree_released
         if session_released or prefill_released:
             self.warning(
                 f"Released stuck slots for phase {self._config.phase}: "

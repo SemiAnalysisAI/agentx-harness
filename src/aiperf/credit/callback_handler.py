@@ -24,6 +24,7 @@ from aiperf.common.scenario.context_overflow import is_context_overflow_response
 from aiperf.timing.concurrency import PhaseRuntimeKey
 
 if TYPE_CHECKING:
+    from aiperf.credit.issuer import CreditIssuer
     from aiperf.credit.messages import CreditReturn, FirstToken
     from aiperf.credit.structs import Credit
     from aiperf.timing.branch_orchestrator import BranchOrchestrator
@@ -50,6 +51,8 @@ class PhaseCallbackContext:
     stop_checker: StopConditionChecker
     strategy: TimingStrategyProtocol
     concurrency_manager: ConcurrencyManager
+    credit_issuer: CreditIssuer | None = None
+    """Root session ownership for scoped release in phases without a tree registry."""
     handle_credit_result: Callable[[CreditReturn], Awaitable[None]] | None = None
     handle_first_token: Callable[[FirstToken], Awaitable[None]] | None = None
 
@@ -228,6 +231,7 @@ class CreditCallbackHandler:
         lifecycle: PhaseLifecycle,
         stop_checker: StopConditionChecker,
         strategy: TimingStrategyProtocol,
+        credit_issuer: CreditIssuer | None = None,
     ) -> None:
         """Register phase for callback handling.
 
@@ -250,6 +254,7 @@ class CreditCallbackHandler:
             stop_checker=stop_checker,
             strategy=strategy,
             concurrency_manager=self._concurrency_manager,
+            credit_issuer=credit_issuer,
             handle_credit_result=handle_credit_result
             if inspect.iscoroutinefunction(handle_credit_result)
             else None,
@@ -364,8 +369,16 @@ class CreditCallbackHandler:
         # ``BranchOrchestrator``. Their returns are signalled via the
         # ``on_child_*`` hooks below; passing ``is_child=True`` keeps
         # ``requests_completed`` / ``requests_cancelled`` root-only.
+        count_terminal = credit.is_final_turn
+        if credit.agent_depth == 0 and handler.credit_issuer is not None:
+            count_terminal = (
+                count_terminal
+                and not handler.credit_issuer.root_terminal_counted(
+                    credit.effective_root_correlation_id
+                )
+            )
         is_final_returned = handler.progress.increment_returned(
-            credit.is_final_turn,
+            count_terminal,
             credit_return.cancelled,
             errored=credit_return.error is not None,
             is_child=credit.agent_depth > 0,
@@ -640,7 +653,9 @@ class CreditCallbackHandler:
         # the slot only once every descendant has also drained.
         if credit.is_final_turn and credit.agent_depth == 0:
             root_corr = credit.effective_root_correlation_id
-            if not (tree_engaged and self._session_tree_registry.has_tree(root_corr)):
+            if handler.credit_issuer is not None:
+                handler.credit_issuer.on_root_final_return(root_corr)
+            elif not (tree_engaged and self._session_tree_registry.has_tree(root_corr)):
                 concurrency.release_session_slot(phase)
 
         # On phase end, release slots for sessions still in flight.
@@ -648,7 +663,7 @@ class CreditCallbackHandler:
         # Under per-tree accounting the registry owns every session slot, so the
         # runner releases any still-open trees at phase cleanup (release_all);
         # releasing here would race the registry and over-release.
-        if is_final_returned and not tree_engaged:
+        if is_final_returned and not tree_engaged and handler.credit_issuer is None:
             in_flight = handler.progress.in_flight_sessions
             if in_flight > 0:
                 _logger.debug(

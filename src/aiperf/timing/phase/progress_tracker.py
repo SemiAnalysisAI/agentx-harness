@@ -151,6 +151,10 @@ class PhaseProgressTracker:
         """
         self._counter.increment_prefill_released()
 
+    def cancel_session(self) -> None:
+        """Close one aborted logical session, leaving actual request counts intact."""
+        self._counter.cancel_session()
+
     def account_lane_session(self, session_turns: int) -> None:
         """Count a deferred-lane session that acquires its slot directly.
 

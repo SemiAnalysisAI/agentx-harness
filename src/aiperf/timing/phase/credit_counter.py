@@ -347,6 +347,10 @@ class CreditCounter:
             self._requests_completed + self._requests_cancelled
         ) >= self._final_requests_sent
 
+    def cancel_session(self) -> None:
+        """Account a logical root abort without inventing a request return."""
+        self._cancelled_sessions += 1
+
     def increment_prefill_released(self) -> None:
         """Increment prefill released count (on TTFT or return without TTFT)."""
         self._prefills_released += 1

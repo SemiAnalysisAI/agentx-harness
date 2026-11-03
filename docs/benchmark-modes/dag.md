@@ -417,3 +417,11 @@ continuations and dispatches waiting for prefill capacity. Normal credit-return
 accounting releases slots; sending a cancellation does not release them early.
 A cancellation transport failure is logged, and cleanup continues for the other
 siblings.
+
+
+For phases without a tree registry, the issuer records each root's slot ownership.
+An aborted group keeps that capacity until its last actual request returns,
+or until phase teardown at the grace cutoff. A root that never returns an
+authored final turn is counted once as a cancelled logical session, without
+adding a synthetic HTTP request or return. Authored final returns and cutoff
+cleanup use the same ownership ledger to avoid releasing a slot twice.

@@ -421,3 +421,11 @@ The credit router tracks each in-flight credit's logical session separately
 from sticky worker placement, and coalesces session and phase cancellations
 until acknowledgement. This keeps neighboring sessions on a shared worker
 running and preserves normal credit-return slot accounting.
+
+
+For phases without a tree registry, the issuer records each root's slot ownership.
+An aborted group keeps that capacity until its last actual request returns,
+or until phase teardown at the grace cutoff. A root that never returns an
+authored final turn is counted once as a cancelled logical session, without
+adding a synthetic HTTP request or return. Authored final returns and cutoff
+cleanup use the same ownership ledger to avoid releasing a slot twice.
