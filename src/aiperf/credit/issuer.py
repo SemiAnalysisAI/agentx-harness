@@ -51,6 +51,8 @@ class _RootSession:
 
     owns_legacy_slot: bool
     """Whether this issuer, rather than the tree registry, releases the slot."""
+    unsent_turns: int = 0
+    """Remaining authored root turns, excluding already issued requests and children."""
     terminal_counted: bool = False
     """Whether an authored final return already accounted this logical session."""
     aborted_group: set[str] | None = None
@@ -255,7 +257,8 @@ class CreditIssuer:
         if root_pending and session_turns > 0:
             if root_correlation_id is not None:
                 self._root_sessions[root_correlation_id] = _RootSession(
-                    owns_legacy_slot=self._session_tree_registry is None
+                    owns_legacy_slot=self._session_tree_registry is None,
+                    unsent_turns=session_turns,
                 )
             self._progress.account_lane_session(session_turns)
         return True
@@ -269,7 +272,8 @@ class CreditIssuer:
         id is the root's own ``x_correlation_id``.
         """
         self._root_sessions[turn.effective_root_correlation_id] = _RootSession(
-            owns_legacy_slot=self._session_tree_registry is None
+            owns_legacy_slot=self._session_tree_registry is None,
+            unsent_turns=turn.num_turns - turn.turn_index,
         )
         if self._session_tree_registry is not None:
             self._session_tree_registry.open_tree(
@@ -471,6 +475,10 @@ class CreditIssuer:
         if self._max_tokens_override is not None:
             turn = _struct_replace(turn, max_tokens_override=self._max_tokens_override)
         credit_index, is_final_credit = self._progress.increment_sent(turn)
+        if turn.agent_depth == 0:
+            state = self._root_sessions.get(turn.effective_root_correlation_id)
+            if state is not None:
+                state.unsent_turns -= 1
 
         cancel_after_ns = self._cancellation_policy.next_cancellation_delay_ns(
             turn, self._phase
@@ -693,7 +701,7 @@ class CreditIssuer:
         for root in ready:
             state = self._root_sessions.pop(root)
             if not state.terminal_counted:
-                self._progress.cancel_session()
+                self._progress.cancel_session(unsent_turns=state.unsent_turns)
             if state.owns_legacy_slot:
                 self._concurrency_manager.release_session_slot(self._phase_key)
 
@@ -705,7 +713,7 @@ class CreditIssuer:
                 continue
             self._root_sessions.pop(root)
             if state.aborted_group is not None and not state.terminal_counted:
-                self._progress.cancel_session()
+                self._progress.cancel_session(unsent_turns=state.unsent_turns)
             self._concurrency_manager.release_session_slot(self._phase_key)
             released += 1
 

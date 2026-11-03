@@ -151,9 +151,16 @@ class PhaseProgressTracker:
         """
         self._counter.increment_prefill_released()
 
-    def cancel_session(self) -> None:
-        """Close one aborted logical session, leaving actual request counts intact."""
-        self._counter.cancel_session()
+    def cancel_session(self, *, unsent_turns: int = 0) -> None:
+        """Retire an aborted root's unsent plan and signal session-target completion.
+
+        Request counters remain actual wire counts. Freeze them only when the
+        session quota is satisfied, using the same sending-complete event as
+        normal final issuance; pending branch work still guards returned events.
+        """
+        if self._counter.cancel_session(unsent_turns=unsent_turns):
+            self.freeze_sent_counts()
+            self.all_credits_sent_event.set()
 
     def account_lane_session(self, session_turns: int) -> None:
         """Count a deferred-lane session that acquires its slot directly.

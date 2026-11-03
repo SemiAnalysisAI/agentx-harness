@@ -424,4 +424,8 @@ An aborted group keeps that capacity until its last actual request returns,
 or until phase teardown at the grace cutoff. A root that never returns an
 authored final turn is counted once as a cancelled logical session, without
 adding a synthetic HTTP request or return. Authored final returns and cutoff
-cleanup use the same ownership ledger to avoid releasing a slot twice.
+cleanup use the same ownership ledger to avoid releasing a slot twice. Unsent
+root turns are retired from the sampled session plan when an abort settles, so
+a session-limited phase can signal sending completion without waiting for its
+duration limit or inventing wire traffic. Descendant requests remain governed
+by actual credit-return accounting.

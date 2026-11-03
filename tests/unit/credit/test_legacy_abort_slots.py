@@ -28,6 +28,7 @@ async def prepare_legacy(
     *,
     with_orphan: bool = True,
     tree_registry: bool = False,
+    expected_sessions: int | None = None,
 ) -> SimpleNamespace:
     """Acquire real capacity and count real root/child credits through the issuer."""
     f = flow
@@ -40,6 +41,7 @@ async def prepare_legacy(
             timing_mode=TimingMode.REQUEST_RATE,
             concurrency=1,
             total_expected_requests=20,
+            expected_num_sessions=expected_sessions,
         )
     )
     registry = SessionTreeRegistry(cm) if tree_registry else None
@@ -261,3 +263,45 @@ async def test_force_drain_then_phase_cleanup_releases_each_slot_once(
     assert await f.real_cm.acquire_session_slot(CreditPhase.PROFILING, lambda: True)
     assert not f.real_cm.session_slot_available(CreditPhase.PROFILING)
     f.real_cm.release_session_slot(CreditPhase.PROFILING)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_sessions", [pytest.param(1,id="sole-root"),pytest.param(2,id="two-roots-already-issued")])  # fmt: skip
+async def test_abort_retires_unsent_plan_and_signals_session_quota_without_another_send(
+    abort_flow: SimpleNamespace, expected_sessions: int
+) -> None:
+    """The last child abort itself must unblock phase sending, without duration expiry."""
+    f = await prepare_legacy(
+        abort_flow,
+        root_final=False,
+        with_orphan=False,
+        expected_sessions=expected_sessions,
+    )
+    await returned(f, f.root)
+    if expected_sessions == 2:
+        # Admit a second root before the failure; no later issue can accidentally
+        # supply the sending-complete event missing from abort settlement.
+        f.real_cm.configure_for_phase(
+            CreditPhase.PROFILING, concurrency=2, prefill_concurrency=8
+        )
+        await f.issuer.issue_credit(
+            TurnToSend(
+                conversation_id="other",
+                x_correlation_id="other",
+                turn_index=0,
+                num_turns=1,
+            )
+        )
+        other = f.router.send_credit.await_args.kwargs["credit"]
+        await returned(f, other)
+    assert not f.real_progress.all_credits_sent_event.is_set()
+    assert not f.real_progress.all_credits_returned_event.is_set()
+    sent_before = f.real_progress.counter.requests_sent
+    await returned(f, f.children["failed"], error="intentional child failure")
+    assert f.real_progress.all_credits_sent_event.is_set()
+    assert f.real_progress.all_credits_returned_event.is_set()
+    assert f.real_progress.counter.requests_sent == sent_before == expected_sessions + 1
+    assert f.real_progress.counter.requests_completed == sent_before
+    assert f.real_progress.counter.requests_cancelled == 0
+    assert f.real_progress.counter.cancelled_sessions == 1
+    assert f.real_progress.in_flight_sessions == 0
