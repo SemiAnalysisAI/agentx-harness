@@ -12,7 +12,7 @@ import aiofiles
 import orjson
 
 from aiperf.common.environment import Environment
-from aiperf.common.finite import scrub_non_finite
+from aiperf.common.finite import scrub_non_finite_for_orjson
 from aiperf.common.hooks import on_init, on_start, on_stop
 from aiperf.common.mixins.aiperf_lifecycle_mixin import AIPerfLifecycleMixin
 from aiperf.common.types import BaseModelT
@@ -125,7 +125,7 @@ class BufferedJSONLWriterMixin(AIPerfLifecycleMixin, Generic[BaseModelT]):
             # scrub_non_finite enforces "null on disk = absent" across the
             # JSONL so per-record NaN/inf doesn't masquerade as missing.
             json_bytes = orjson.dumps(
-                scrub_non_finite(
+                scrub_non_finite_for_orjson(
                     record.model_dump(
                         exclude_none=True,
                         mode="json",

@@ -221,3 +221,25 @@ def nan_safe_std(values: Any, ddof: int = 1) -> float | None:
     mean = sum(finite) / len(finite)
     sq = sum((v - mean) ** 2 for v in finite)
     return math.sqrt(sq / (len(finite) - ddof))
+
+
+def scrub_non_finite_for_orjson(obj: Any) -> Any:
+    """:func:`scrub_non_finite` for a payload that goes straight to ``orjson.dumps``.
+
+    orjson already serializes NaN/inf as ``null``, so replacing them with
+    ``None`` first changes nothing on the wire; exact ``float``/``int`` values
+    and lists of them (per-record ITL/ICL lists hold thousands) are returned
+    as-is. Everything else (numpy scalars, bool, nested containers) takes the
+    full scrub, so the output bytes are identical to
+    ``orjson.dumps(scrub_non_finite(obj))``.
+    """
+    obj_type = type(obj)
+    if obj_type is float or obj_type is int:
+        return obj
+    if obj_type is list:
+        if all(type(v) is float or type(v) is int for v in obj):
+            return obj
+        return [scrub_non_finite_for_orjson(v) for v in obj]
+    if obj_type is dict:
+        return {k: scrub_non_finite_for_orjson(v) for k, v in obj.items()}
+    return scrub_non_finite(obj)
