@@ -437,3 +437,23 @@ async def test_aggregate_sweep_json_scrubs_nan_to_null(tmp_path) -> None:
     assert metrics["mean"] is None
     assert metrics["max"] is None
     assert metrics["std"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        param({"a": 1, "b": 2.5, "c": [1, 2.0, 3]}, id="plain"),
+        param({"a": float("nan"), "b": [1.0, float("inf"), 3], "c": (1, float("-inf"))}, id="non-finite"),
+        param({"a": np.float64(1.5), "b": [np.int64(3), np.float32(2.0), True]}, id="numpy"),
+        param({"a": {"b": {"c": [[], [None, "nan", "x"], {"d": np.bool_(True)}]}}}, id="nested"),
+        param({"ints": list(range(1000)), "mix": [1.0] * 10 + [float("nan")]}, id="long-lists"),
+    ],
+)  # fmt: skip
+def test_scrub_non_finite_for_orjson_matches_full_scrub(payload: dict) -> None:
+    import orjson
+
+    from aiperf.common.finite import scrub_non_finite_for_orjson
+
+    assert orjson.dumps(scrub_non_finite_for_orjson(payload)) == orjson.dumps(
+        scrub_non_finite(payload)
+    )
