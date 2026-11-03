@@ -11,11 +11,59 @@ nested request lists.
 
 from __future__ import annotations
 
+from array import array
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import ConfigDict, Field
+from pydantic import AfterValidator, ConfigDict, Field, PlainSerializer
 
 from aiperf.common.models import AIPerfBaseModel
+
+
+class HashIds(array):
+    """KV-cache block hash IDs packed as int64 instead of boxed Python ints.
+
+    A trace holds ~200k hash IDs; as a ``list[int]`` that is ~7 MB per trace
+    (4 GB for the 393-trace corpus held by the dataset manager), as this array
+    ~1.5 MB. It is a read-only sequence to every consumer (iteration, index,
+    slice, ``len``, membership, ``list(...)``), compares equal to a list with
+    the same values, and serializes back to a plain list.
+    """
+
+    def __new__(cls, values: Any = ()) -> HashIds:
+        return super().__new__(cls, "q", values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, array):
+            return array.__eq__(self, other)
+        if isinstance(other, (list, tuple)):
+            return len(self) == len(other) and all(
+                a == b for a, b in zip(self, other, strict=True)
+            )
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __reduce__(self) -> tuple:
+        return (HashIds, (list(self),))
+
+
+def _pack_hash_ids(values: list[int]) -> list[int] | HashIds:
+    try:
+        return HashIds(values)
+    except OverflowError:
+        # Outside int64: keep the list so the values are untouched.
+        return values
+
+
+HashIdList: TypeAlias = Annotated[
+    list[int],
+    AfterValidator(_pack_hash_ids),
+    PlainSerializer(list, return_type=list[int]),
+]
 
 
 class WekaNormalRequest(AIPerfBaseModel):
@@ -30,7 +78,7 @@ class WekaNormalRequest(AIPerfBaseModel):
     model: str = Field(description="Model identifier for this request.")
     input_length: int = Field(alias="in", description="Input token count.")
     output_length: int = Field(alias="out", description="Output token count.")
-    hash_ids: list[int] = Field(
+    hash_ids: HashIdList = Field(
         default_factory=list, description="KV-cache block hash IDs."
     )
     input_types: list[str] = Field(
@@ -67,7 +115,7 @@ class WekaStreamingRequest(AIPerfBaseModel):
     model: str = Field(description="Model identifier for this request.")
     input_length: int = Field(alias="in", description="Input token count.")
     output_length: int = Field(alias="out", description="Output token count.")
-    hash_ids: list[int] = Field(
+    hash_ids: HashIdList = Field(
         default_factory=list, description="KV-cache block hash IDs."
     )
     input_types: list[str] = Field(
