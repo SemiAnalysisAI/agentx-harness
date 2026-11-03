@@ -440,7 +440,15 @@ class CreditCallbackHandler:
             and credit_return.error is not None
             and is_context_overflow_response(body=credit_return.error)
         )
-        root_terminal = credit.is_final_turn or overflow_terminal
+        is_aborted = getattr(self._branch_orchestrator, "is_session_aborted", None)
+        session_aborted = (
+            is_aborted is not None and is_aborted(credit.x_correlation_id) is True
+        )
+        root_terminal = credit.is_final_turn or overflow_terminal or session_aborted
+        if session_aborted:
+            root_terminal = self._branch_orchestrator.on_aborted_credit_return(
+                credit.x_correlation_id
+            )
 
         # The orchestrator intercept runs FIRST (when not overflow-terminal)
         # and unconditionally (not gated behind ``can_send_any_turn``), because
@@ -457,7 +465,11 @@ class CreditCallbackHandler:
         # dispatch, but WARMUP failure accounting must still run: accelerated
         # cache-pressure warmup enables DAG intercept, and a non-overflow
         # error on a gated root would otherwise skip ``record_warmup_failure``.
-        if self._branch_orchestrator is not None and not overflow_terminal:
+        if (
+            self._branch_orchestrator is not None
+            and not overflow_terminal
+            and not session_aborted
+        ):
             intercepted = await self._branch_orchestrator.intercept(credit)
             if intercepted:
                 await self._handle_warmup_failure(credit, credit_return, handler, phase)
@@ -485,6 +497,11 @@ class CreditCallbackHandler:
             self._session_tree_registry.on_root_terminal(
                 credit.effective_root_correlation_id
             )
+
+        if session_aborted:
+            await self._handle_warmup_failure(credit, credit_return, handler, phase)
+            self._finish_return_processing(handler)
+            return
 
         # Strategy dispatch (queue next turn of the same session). Normally
         # gated behind ``can_send_any_turn``; however, for DAG-spawned

@@ -126,6 +126,7 @@ class CreditIssuer:
             else None
         )
         self._issuing_stopped = False
+        self._aborted_sessions: set[str] = set()
         self._max_tokens_override: int | None = None
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
@@ -138,6 +139,8 @@ class CreditIssuer:
 
     def _turn_admission_result(self, turn: TurnToSend) -> TurnAdmission:
         """Run the optional final admission check."""
+        if self.is_session_aborted(turn.x_correlation_id):
+            return TurnAdmission.REJECT
         callback = getattr(self, "_turn_admission", None)
         if callback is None:
             return TurnAdmission.ADMIT
@@ -302,12 +305,14 @@ class CreditIssuer:
             6. Create and send Credit
             7. If final credit: freeze counts + set event
         """
+        if self.is_session_aborted(turn.x_correlation_id):
+            return False
         gate = getattr(self, "replay_gate", ReplayIssueGate(None))
         return await gate.submit(turn, lambda: self._issue_credit_ready(turn))
 
     async def _issue_credit_ready(self, turn: TurnToSend) -> bool:
         """Issue a turn whose recorded predecessor frontier is complete."""
-        if self._issuing_stopped:
+        if self._session_issuance_stopped(turn.x_correlation_id):
             return False
 
         # A session start is turn 0 OR an agentic mid-trace resume (flagged via
@@ -340,7 +345,7 @@ class CreditIssuer:
         needs_session_slot = is_session_start and not is_child
         if needs_session_slot:
             acquired = await self._concurrency_manager.acquire_session_slot(
-                self._phase_key, self._stop_checker.can_start_new_session
+                self._phase_key, can_proceed_fn
             )
             if not acquired:
                 return False
@@ -400,7 +405,10 @@ class CreditIssuer:
             )
 
         # Check stop condition FIRST - distinguishes False from None
-        if not can_proceed_fn():
+        if (
+            self._session_issuance_stopped(turn.x_correlation_id)
+            or not can_proceed_fn()
+        ):
             return False
 
         needs_session_slot = is_session_start and not is_child
@@ -525,6 +533,8 @@ class CreditIssuer:
         attempt would send the first sibling and permanently truncate every
         other sibling spawned in the same gather.
         """
+        if self.is_session_aborted(turn.x_correlation_id):
+            return ChildDispatchResult.REJECTED
         gate = getattr(self, "replay_gate", ReplayIssueGate(None))
         return await gate.submit(
             turn,
@@ -535,9 +545,15 @@ class CreditIssuer:
 
     async def _dispatch_child_turn_ready(self, turn: TurnToSend) -> ChildDispatchResult:
         """Dispatch a child after its recorded predecessor frontier completes."""
-        if self._issuing_stopped:
+        if self._session_issuance_stopped(turn.x_correlation_id):
             return ChildDispatchResult.REJECTED
-        can_proceed_fn = self._stop_checker.can_send_child_turn
+
+        def can_proceed_fn() -> bool:
+            return (
+                not self.is_session_aborted(turn.x_correlation_id)
+                and self._stop_checker.can_send_child_turn()
+            )
+
         if not can_proceed_fn():
             return ChildDispatchResult.REJECTED
         # Children inherit the parent's session slot; wait for prefill
@@ -607,6 +623,23 @@ class CreditIssuer:
         )
         return await self.issue_credit(turn)
 
+    def is_session_aborted(self, x_correlation_id: str) -> bool:
+        """Return whether this phase permanently refuses the logical session."""
+        return x_correlation_id in getattr(self, "_aborted_sessions", ())
+
+    def _session_issuance_stopped(self, x_correlation_id: str) -> bool:
+        """Combine phase termination with logical-session admission."""
+        return self._issuing_stopped or self.is_session_aborted(x_correlation_id)
+
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Query router ownership without confusing logical abort with completion."""
+        check = getattr(self._credit_router, "has_session_credits", None)
+        return check is not None and check(x_correlation_id) is True
+
+    def mark_sessions_aborted(self, x_correlation_ids: set[str]) -> None:
+        """Close admission for an entire abort group before any cancellation awaits."""
+        self._aborted_sessions.update(x_correlation_ids)
+
     async def abort_session(self, x_correlation_id: str) -> None:
         """Cancel a session's live requests while retaining credit-return accounting.
 
@@ -615,6 +648,7 @@ class CreditIssuer:
         cancellation must not release slots eagerly. A failed send must not
         prevent the orchestrator from attempting to stop the other siblings.
         """
+        self.mark_sessions_aborted({x_correlation_id})
         try:
             await self._credit_router.cancel_session_credits(x_correlation_id)
         except Exception as exc:

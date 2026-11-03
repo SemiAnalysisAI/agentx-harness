@@ -134,6 +134,10 @@ class CreditRouterProtocol(Protocol):
         """
         ...
 
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Return whether the session still owns any active credits."""
+        ...
+
     async def cancel_session_credits(self, x_correlation_id: str) -> None:
         """Cancel live credits owned by one logical session without releasing slots."""
         ...
@@ -484,6 +488,13 @@ class StickyCreditRouter(CommunicationMixin):
         self._track_credit_sent(worker_id, credit.id, credit.x_correlation_id)
 
         await self._router_client.send_to(worker_id, credit)
+
+    def has_session_credits(self, x_correlation_id: str) -> bool:
+        """Check active logical ownership after returned credits have been retired."""
+        return any(
+            x_correlation_id in worker.active_credit_sessions.values()
+            for worker in self._workers_cache
+        )
 
     async def cancel_session_credits(self, x_correlation_id: str) -> None:
         """Cancel one session's credits, including children sharing a parent worker."""

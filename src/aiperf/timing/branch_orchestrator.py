@@ -322,6 +322,7 @@ class BranchOrchestrator:
         # (think-time continuations, snapshot-seeded turns). Stopped
         # explicitly when the phase stops sending; see park_child_turn.
         self._parked_child_turns: set[str] = set()
+        self._aborted_pending_returns: set[str] = set()
         # Drain observer: sync callback fired after state mutations that may
         # drain has_pending_branch_work() to False. Wired by
         # CreditCallbackHandler.set_branch_orchestrator to re-evaluate the
@@ -446,7 +447,11 @@ class BranchOrchestrator:
 
     async def on_credit_issued(self, credit) -> None:
         """Start branches that overlapped their spawning request in the capture."""
-        if self._cleaning_up or credit.agent_depth > 0:
+        if (
+            self._cleaning_up
+            or credit.agent_depth > 0
+            or self.is_session_aborted(credit.x_correlation_id)
+        ):
             return
         if credit.phase == CreditPhase.WARMUP and not self._accelerated_warmup_started:
             return
@@ -477,6 +482,8 @@ class BranchOrchestrator:
             return
         parent_corr = credit.x_correlation_id
         async with self._parent_locks[parent_corr]:
+            if self._cleaning_up or self.is_session_aborted(parent_corr):
+                return
             await self._spawn_children_and_register_gates(
                 credit,
                 overlapping,
@@ -820,6 +827,11 @@ class BranchOrchestrator:
             self._future_joins.setdefault(parent_corr, {})[gated_idx] = pending
         return pending
 
+    def is_session_aborted(self, x_correlation_id: str) -> bool:
+        """Check terminal admission when the issuer supports logical aborts."""
+        check = getattr(self._issuer, "is_session_aborted", None)
+        return check is not None and check(x_correlation_id) is True
+
     async def intercept(self, credit) -> bool:
         """Intercept the credit-return path.
 
@@ -834,6 +846,8 @@ class BranchOrchestrator:
         SPAWN-mode children start on the parent's worker when its entry is
         live, then stay pinned under their own correlation id.
         """
+        if self.is_session_aborted(credit.x_correlation_id):
+            return True
         if self._cleaning_up:
             return False
 
@@ -854,6 +868,8 @@ class BranchOrchestrator:
         parent_corr = credit.x_correlation_id
 
         async with self._parent_locks[parent_corr]:
+            if self.is_session_aborted(parent_corr):
+                return True
             branch_ids = self.get_branch_ids(credit)
             if branch_ids:
                 await self._spawn_children_and_register_gates(credit, branch_ids)
@@ -1525,7 +1541,8 @@ class BranchOrchestrator:
         period expires. ``expire_replay_deadlines`` stops every child still
         parked at that boundary.
         """
-        self._parked_child_turns.add(child_x_correlation_id)
+        if not self.is_session_aborted(child_x_correlation_id):
+            self._parked_child_turns.add(child_x_correlation_id)
 
     def try_claim_parked_child_turn(self, child_x_correlation_id: str) -> bool:
         """Claim a parked child turn as its timer fires.
@@ -1533,6 +1550,9 @@ class BranchOrchestrator:
         Returns False when the child was already stopped at the sending
         cutoff, in which case the turn must not be dispatched.
         """
+        if self.is_session_aborted(child_x_correlation_id):
+            self._parked_child_turns.discard(child_x_correlation_id)
+            return False
         if child_x_correlation_id not in self._parked_child_turns:
             return False
         self._parked_child_turns.discard(child_x_correlation_id)
@@ -1765,48 +1785,65 @@ class BranchOrchestrator:
         else:
             await self._handle_child_done(child_x_correlation_id, entries)
 
+    def _abort_group(self, child_corr: str, entries: list[ChildJoinEntry]) -> set[str]:
+        """Find affected runtime trees, including completed ancestors and nested work."""
+        group = {child_corr, *(entry.parent_correlation_id for entry in entries)}
+        while True:
+            previous = len(group)
+            roots = {self._child_root[cid] for cid in group if cid in self._child_root}
+            group.update(roots)
+            group.update(cid for cid, root in self._child_root.items() if root in roots)
+            for cid, memberships in self._child_to_join.items():
+                parents = {entry.parent_correlation_id for entry in memberships}
+                if cid in group or parents & group:
+                    group.add(cid)
+                    group.update(parents)
+            if len(group) == previous:
+                return group
+
+    def on_aborted_credit_return(self, x_correlation_id: str) -> bool:
+        """Settle the last credit and report whether the session is fully drained."""
+        if self._issuer.has_session_credits(x_correlation_id):
+            return False
+        if x_correlation_id in self._aborted_pending_returns:
+            self._aborted_pending_returns.discard(x_correlation_id)
+            self._tree_descendant_done(x_correlation_id)
+            self._notify_drain()
+        return True
+
     async def _handle_child_errored_fail_fast(
         self, child_corr: str, entries: list[ChildJoinEntry]
     ) -> None:
-        parent = entries[0].parent_correlation_id
-        errored_mode = self._child_modes.pop(child_corr, None)
-        self._child_to_join.pop(child_corr, None)
-        self._tree_descendant_done(child_corr)
-
-        # Collect all tracked children for this parent as potential orphans.
-        orphans = [
-            cid
-            for cid, ents in list(self._child_to_join.items())
-            if ents and ents[0].parent_correlation_id == parent and cid != child_corr
-        ]
-
-        # Drop the parent's active/future joins — parent is going down.
-        self._active_joins.pop(parent, None)
-        self._future_joins.pop(parent, None)
-
-        if (
-            errored_mode == ConversationBranchMode.FORK
-            and self._sticky_router is not None
-        ):
-            self._sticky_router.release_child_routing(parent)
-        if hasattr(self._issuer, "abort_session"):
-            await self._issuer.abort_session(parent)
+        aborted = self._abort_group(child_corr, entries)
+        mark_aborted = getattr(self._issuer, "mark_sessions_aborted", None)
+        if mark_aborted is not None:
+            mark_aborted(aborted)
+        has_credits = getattr(self._issuer, "has_session_credits", lambda _: False)
+        self._aborted_pending_returns.update(
+            cid for cid in aborted if has_credits(cid) is True
+        )
+        self._parked_child_turns.difference_update(aborted)
+        # All ownership and admission changes precede the first wire await.
+        for cid in aborted:
+            memberships = self._child_to_join.pop(cid, [])
+            mode = self._child_modes.pop(cid, None)
+            if mode == ConversationBranchMode.FORK and self._sticky_router is not None:
+                parent = memberships[0].parent_correlation_id if memberships else None
+                if parent is not None:
+                    self._sticky_router.release_child_routing(parent)
+            self._active_joins.pop(cid, None)
+            self._future_joins.pop(cid, None)
+            self._pending_delayed_children.pop(cid, None)
+            self._descendant_counts.pop(cid, None)
+            self._parent_locks.pop(cid, None)
+            if cid not in self._aborted_pending_returns:
+                self._tree_descendant_done(cid)
+                if self._session_tree_registry is not None:
+                    self._session_tree_registry.on_root_terminal(cid)
         self.stats.parents_failed_due_to_child_error += 1
-
-        for orphan in orphans:
-            self._child_to_join.pop(orphan, None)
-            self._tree_descendant_done(orphan)
-            orphan_mode = self._child_modes.pop(orphan, None)
-            if (
-                orphan_mode == ConversationBranchMode.FORK
-                and self._sticky_router is not None
-            ):
-                self._sticky_router.release_child_routing(parent)
-            if hasattr(self._issuer, "abort_session"):
-                await self._issuer.abort_session(orphan)
-
-        self._descendant_counts.pop(parent, None)
-        self._parent_locks.pop(parent, None)
+        if hasattr(self._issuer, "abort_session"):
+            for cid in aborted - {child_corr}:
+                await self._issuer.abort_session(cid)
         self._notify_drain()
 
     def _release_slot(self, parent_x_correlation_id: str) -> None:
@@ -1834,7 +1871,7 @@ class BranchOrchestrator:
 
     def has_pending_branch_work(self) -> bool:
         """Return True if any DAG-dispatched children are still outstanding."""
-        if self._active_joins:
+        if self._aborted_pending_returns or self._active_joins:
             return True
         if any(gates for gates in self._future_joins.values()):
             return True
@@ -1863,6 +1900,7 @@ class BranchOrchestrator:
         self._delayed_dispatch_tasks.clear()
         self._pending_delayed_children.clear()
         self._parked_child_turns.clear()
+        self._aborted_pending_returns.clear()
         s = self.stats
         logger.info(
             "BranchOrchestrator stats: spawned=%d completed=%d errored=%d "
