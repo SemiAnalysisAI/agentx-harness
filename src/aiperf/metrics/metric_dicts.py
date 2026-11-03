@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -151,46 +151,79 @@ class MetricRecordDict(BaseMetricDict[MetricValueTypeT]):
         Returns:
             Dictionary of {tag: MetricValue} for export
         """
-        from aiperf.common.enums import MetricFlags
-
+        plans = _display_plans(registry, show_internal, show_experimental)
         result = {}
         for tag, value in self.items():
-            try:
-                metric_class = registry.get_class(tag)
-            except MetricTypeError:
-                _logger.warning(f"Metric {tag} not found in registry")
+            plan = plans.get(tag)
+            if plan is None:
+                plan = plans[tag] = _build_display_plan(
+                    registry, tag, show_internal, show_experimental
+                )
+            if plan is _SKIP:
                 continue
-
-            if (
-                metric_class.has_flags(MetricFlags.EXPERIMENTAL)
-                and not show_experimental
-            ):
-                continue
-            if metric_class.has_flags(MetricFlags.INTERNAL) and not show_internal:
-                continue
-            if metric_class.has_flags(MetricFlags.NO_INDIVIDUAL_RECORDS):
-                continue
-
-            display_unit = metric_class.display_unit or metric_class.unit
-            if display_unit != metric_class.unit:
+            unit, display_unit, unit_str = plan
+            if display_unit is not unit:
                 try:
                     if isinstance(value, list):
-                        value = [
-                            metric_class.unit.convert_to(display_unit, v) for v in value
-                        ]
+                        value = [unit.convert_to(display_unit, v) for v in value]
                     else:
-                        value = metric_class.unit.convert_to(display_unit, value)
+                        value = unit.convert_to(display_unit, value)
                 except MetricUnitError as e:
                     _logger.warning(
-                        f"Error converting {tag} from {metric_class.unit} to {display_unit}: {e}"
+                        f"Error converting {tag} from {unit} to {display_unit}: {e}"
                     )
 
-            result[tag] = MetricValue(
-                value=value,
-                unit=str(display_unit),
-            )
+            result[tag] = MetricValue(value=value, unit=unit_str)
 
         return result
+
+
+_SKIP = object()
+_DisplayPlan = tuple[Any, Any, str]
+_display_plan_cache: dict[tuple[Any, bool, bool], dict[MetricTagT, Any]] = {}
+
+
+def _display_plans(
+    registry: "type[MetricRegistry]", show_internal: bool, show_experimental: bool
+) -> dict[MetricTagT, Any]:
+    """Per-tag display decisions, resolved once per (registry, visibility) pair.
+
+    The flag checks and unit lookups are pure functions of the metric class,
+    so resolving them per record (hundreds of thousands of times per run)
+    only burned records-manager CPU.
+    """
+    key = (registry, show_internal, show_experimental)
+    plans = _display_plan_cache.get(key)
+    if plans is None:
+        plans = _display_plan_cache[key] = {}
+    return plans
+
+
+def _build_display_plan(
+    registry: "type[MetricRegistry]",
+    tag: MetricTagT,
+    show_internal: bool,
+    show_experimental: bool,
+) -> Any:
+    from aiperf.common.enums import MetricFlags
+
+    try:
+        metric_class = registry.get_class(tag)
+    except MetricTypeError:
+        _logger.warning(f"Metric {tag} not found in registry")
+        return _SKIP
+    if metric_class.has_flags(MetricFlags.EXPERIMENTAL) and not show_experimental:
+        return _SKIP
+    if metric_class.has_flags(MetricFlags.INTERNAL) and not show_internal:
+        return _SKIP
+    if metric_class.has_flags(MetricFlags.NO_INDIVIDUAL_RECORDS):
+        return _SKIP
+    unit = metric_class.unit
+    display_unit = metric_class.display_unit or unit
+    # Keep the original equality semantics: identical units skip conversion.
+    if display_unit == unit:
+        display_unit = unit
+    return (unit, display_unit, str(display_unit))
 
 
 class MetricResultsDict(BaseMetricDict[MetricDictValueTypeT]):
