@@ -73,12 +73,21 @@ class RaggedSeries:
         self.extend(idx, values)
 
     def get_values_for_mask(
-        self, record_mask: NDArray[np.bool_]
+        self, record_mask: NDArray[np.bool_] | NDArray[np.integer]
     ) -> NDArray[np.float64]:
-        """Return values whose record is selected by the boolean mask."""
+        """Return values whose record is selected, in storage order.
+
+        ``record_mask`` is either a boolean mask over records or the record
+        indices themselves (how timeslices select records); both yield the
+        same values in the same order.
+        """
         if len(self._record_indices) == 0:
             return np.zeros(0, dtype=np.float64)
-        value_mask = record_mask[self._record_indices.data]
+        rec_idx = self._record_indices.data
+        if record_mask.dtype == np.bool_:
+            value_mask = record_mask[rec_idx]
+        else:
+            value_mask = np.isin(rec_idx, record_mask)
         return self._values.data[value_mask]
 
     def grouped_cumsum(self) -> NDArray[np.float64]:
