@@ -800,7 +800,9 @@ class MetricsAccumulator(BaseMetricsProcessor):
 
     async def export_results(self, ctx: ExportContext) -> AccumulatorMetricsSummary:
         """Export final metrics results for the requested phase/window."""
-        return self._summarize_for_export_context(ctx, include_timeslices=True)
+        return self._summarize_for_export_context(
+            ctx, include_timeslices=ctx.include_timeslices
+        )
 
     def _inject_sweep_metrics(
         self,
