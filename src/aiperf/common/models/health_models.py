@@ -47,6 +47,11 @@ class ProcessHealth(AIPerfBaseModel):
     memory_usage: int = Field(
         ..., ge=0, description="The current memory usage of the process in bytes (rss)"
     )
+    memory_anon: int | None = Field(
+        default=None,
+        ge=0,
+        description="Anonymous (private, non file-backed) resident memory in bytes; Linux only",
+    )
     io_counters: IOCounters | tuple | None = Field(
         default=None,
         description="The current I/O counters of the process (read_count, write_count, read_bytes, write_bytes, read_chars, write_chars)",

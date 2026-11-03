@@ -4,6 +4,7 @@ import time
 
 import psutil
 
+from aiperf.common.constants import IS_LINUX
 from aiperf.common.mixins.base_mixin import BaseMixin
 from aiperf.common.models import CPUTimes, CtxSwitches, ProcessHealth
 
@@ -40,9 +41,25 @@ class ProcessHealthMixin(BaseMixin):
             uptime=time.time() - self._create_time,
             cpu_usage=self._process.cpu_percent(),
             memory_usage=self._process.memory_info().rss,
+            memory_anon=_rss_anon_bytes(),
             io_counters=self._process.io_counters() if hasattr(self._process, "io_counters") else None,
             cpu_times=cpu_times,
             num_ctx_switches=CtxSwitches(*self._process.num_ctx_switches()),
             num_threads=self._process.num_threads(),
         )  # fmt: skip
         return self._process_health
+
+
+def _rss_anon_bytes() -> int | None:
+    """Anonymous RSS from /proc/self/status (Linux), so file-backed mmap pages
+    such as the dataset cache are not mistaken for private memory."""
+    if not IS_LINUX:
+        return None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
