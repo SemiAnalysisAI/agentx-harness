@@ -65,9 +65,14 @@ AGENTX = INFERENCEX_AGENTX_MVP.model_copy(
             "SERVICE": {"PROFILE_CONFIGURE_TIMEOUT": 1800},
             "UI": {"REALTIME_METRICS_ENABLED": True},
             # 1.0.x keeps 1.0.9's request headers: no X-Session-Affinity.
+            # Pooled connections idle through the warmup cache-pressure pause
+            # (900 s) and the 300 s profiling idle cap; the 300 s default
+            # expired them, so every lane reconnected at once and the closed
+            # sockets' TIME_WAIT ate the ~28k ephemeral ports to one frontend.
             "HTTP": {
                 "TCP_USER_TIMEOUT": 900000,
                 "X_SESSION_AFFINITY_FROM_CORRELATION_ID": False,
+                "KEEPALIVE_TIMEOUT": 3600,
             },
             # 1.0.x keeps the pre-watchdog behavior: one long request at low
             # concurrency can legitimately run past the 600s default.
