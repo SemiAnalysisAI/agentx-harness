@@ -176,6 +176,10 @@ AIPerf automatically:
 
 **Time filtering:** Statistics in JSON/CSV exports exclude the warmup period, showing only metrics from the profiling phase. The JSONL file contains all scrapes (including warmup) for complete time-series analysis.
 
+This also applies to AgentX's automatically created warmup phase: both its start
+and end baseline scrapes are tagged as warmup, so their counters do not enter the
+profiling totals.
+
 **Format selection:** By default, JSON, CSV, and Parquet formats are generated (JSONL is opt-in to avoid large files). To opt out of Parquet, or to include JSONL for time-series analysis:
 ```bash
 # Disable Parquet (JSON + CSV only)
@@ -659,4 +663,3 @@ with open('server_metrics_export.json') as f:
 latency = data['metrics']['vllm:e2e_request_latency_seconds']['series'][0]['stats']
 assert latency['p99_estimate'] < 5.0, f"P99 latency too high: {latency['p99_estimate']}"
 ```
-
