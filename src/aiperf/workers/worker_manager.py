@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from pydantic import Field
 
 from aiperf.common.base_component_service import BaseComponentService
-from aiperf.common.constants import NANOS_PER_SECOND
+from aiperf.common.constants import BYTES_PER_MIB, NANOS_PER_SECOND
 from aiperf.common.enums import MessageType, WorkerStatus
 from aiperf.common.environment import Environment
 from aiperf.common.hooks import background_task, on_message, on_start
@@ -20,6 +20,10 @@ from aiperf.plugin.enums import ServiceType
 
 if TYPE_CHECKING:
     from aiperf.config.resolution.plan import BenchmarkRun
+
+
+MEMORY_LOG_INTERVAL_S = 300.0
+"""Seconds between worker memory summary log lines."""
 
 
 class WorkerStatusInfo(WorkerStats):
@@ -56,6 +60,7 @@ class WorkerManager(BaseComponentService):
 
         self.trace("WorkerManager.__init__")
         self.worker_infos: dict[str, WorkerStatusInfo] = {}
+        self._last_memory_log_ns = time.time_ns()
 
         self.cpu_count = multiprocessing.cpu_count()
         self.debug(lambda: f"Detected {self.cpu_count} CPU cores/threads")
@@ -179,6 +184,33 @@ class WorkerManager(BaseComponentService):
         for _, info in self.worker_infos.items():
             if (time.time_ns() - (info.last_update_ns or 0)) / NANOS_PER_SECOND > Environment.WORKER.STALE_TIME:  # fmt: skip
                 info.status = WorkerStatus.STALE
+        self._log_memory_summary()
+
+    def _log_memory_summary(self) -> None:
+        """Log worker RSS (and anonymous RSS on Linux) every few minutes so a
+        long run's memory trend is in aiperf.log without a profiler."""
+        now_ns = time.time_ns()
+        if (
+            now_ns - self._last_memory_log_ns
+        ) / NANOS_PER_SECOND < MEMORY_LOG_INTERVAL_S:
+            return
+        self._last_memory_log_ns = now_ns
+        healths = [info.health for info in self.worker_infos.values()]
+        if not healths:
+            return
+        rss = sorted(h.memory_usage for h in healths)
+        anon = sorted(h.memory_anon for h in healths if h.memory_anon is not None)
+        mib = 1 / BYTES_PER_MIB
+        line = (
+            f"Worker memory ({len(rss)} workers): rss min/median/max "
+            f"{rss[0] * mib:.0f}/{rss[len(rss) // 2] * mib:.0f}/{rss[-1] * mib:.0f} MiB"
+        )
+        if anon:
+            line += (
+                f", anon min/median/max "
+                f"{anon[0] * mib:.0f}/{anon[len(anon) // 2] * mib:.0f}/{anon[-1] * mib:.0f} MiB"
+            )
+        self.info(line)
 
     @background_task(
         immediate=False, interval=Environment.WORKER.STATUS_SUMMARY_INTERVAL
