@@ -35,6 +35,8 @@ from aiperf.common.messages import (
     ConversationResponseMessage,
     ConversationTurnRequestMessage,
     ConversationTurnResponseMessage,
+    DatasetConfigStatusRequest,
+    DatasetConfigStatusResponse,
     DatasetConfigurationFailedNotification,
     DatasetConfiguredNotification,
     ProfileConfigureCommand,
@@ -54,7 +56,7 @@ from aiperf.config.artifacts import OutputDefaults
 from aiperf.config.dataset import FileDataset, PublicDataset
 from aiperf.dataset import mmap_cache
 from aiperf.dataset.memory_map_utils import turn_from_payload_turn
-from aiperf.dataset.utils import encode_image
+from aiperf.dataset.utils import encode_image, normalize_image_format
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import (
     ComposerType,
@@ -133,6 +135,16 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         # writes under the same key the lookup would have used.
         self._cache_key_for_run: str | None = None
         self._cache_hit_used: bool = False
+        # Last DatasetConfiguredNotification published this run, if any.
+        # DatasetConfiguredNotification is a one-shot PUB/SUB broadcast with
+        # no replay; a subscriber that finishes subscribing after it was
+        # published never receives it. Cached here so DATASET_CONFIG_STATUS_REQUEST
+        # (sent by a RecordProcessor/RecordsManager that hasn't seen the
+        # notification yet) can hand back the already-published config
+        # instead of the requester blocking until CONFIGURATION_TIMEOUT.
+        self._last_dataset_configured_notification: (
+            DatasetConfiguredNotification | None
+        ) = None
 
     def _is_kubernetes_run(self) -> bool:
         """Return whether the optional KUBERNETES service-run plugin is active."""
@@ -270,11 +282,14 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         per-turn payloads are verbatim or synthesized at runtime and would be
         huge (and for weka, meaningless) in inputs.json. Uses the loader's
         DETECTED type so auto-detected traces (e.g. a bare BurstGPT CSV) are
-        skipped too. Same predicate the mmap cache uses
-        (``mmap_cache.is_trace_or_verbatim_dataset``), but the cache gate keys
-        off the pre-load CONFIG type: an explicitly-typed trace is both cached
-        and skipped, while an auto-detected trace is skipped-but-uncached (a
-        re-tokenize perf miss, never a correctness issue).
+        skipped too. Most formats share the mmap cache predicate
+        (``mmap_cache.is_trace_or_verbatim_dataset``), but Baseten is a
+        deliberate skip-only special case: its large recorded prompts make
+        ``inputs.json`` prohibitively expensive, while it remains outside the
+        mmap cache. The cache gate keys off the pre-load CONFIG type, so other
+        explicitly-typed traces are cached and skipped while auto-detected
+        traces are skipped-but-uncached (a re-tokenize perf miss, never a
+        correctness issue).
         """
         default_dataset = self.run.cfg.get_default_dataset()
         public_dataset = (
@@ -282,8 +297,11 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
             if isinstance(default_dataset, PublicDataset)
             else None
         )
-        return mmap_cache.is_trace_or_verbatim_dataset(
-            self._detected_dataset_type, public_dataset
+        return (
+            self._detected_dataset_type == CustomDatasetType.BASETEN_TRACE
+            or mmap_cache.is_trace_or_verbatim_dataset(
+                self._detected_dataset_type, public_dataset
+            )
         )
 
     def _lookup_under_lock(self) -> mmap_cache.CacheHit | None:
@@ -391,6 +409,7 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
 
                 def _decode_and_encode() -> str:
                     img = PILImage.open(BytesIO(data))
+                    normalize_image_format(img)
                     if img.format is None:
                         raise RuntimeError(
                             f"Failed to determine image format for URL '{url}'"
@@ -695,6 +714,53 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
                 "dataset cache directory."
             )
 
+    def _reject_system_prompt_for_raw_payload(self, has_raw_payload: bool) -> None:
+        """Refuse a verbatim system prompt when the dataset authors its own payloads.
+
+        ``inference_client`` ships ``Turn.raw_payload`` verbatim and never calls
+        ``format_payload``, which is the only place a conversation-level
+        ``system_message`` becomes wire bytes. The prompt would therefore be
+        composed, stored, and silently never sent -- measuring prefix-cache hit
+        rate and TTFT against a system prompt the server never saw.
+
+        Two call sites compute ``has_raw_payload`` from what they have:
+
+        - The cache-miss path passes ``any(turn.raw_payload)`` over the loaded
+          conversations. ``any`` rather than ``all``: a dataset where only some
+          conversations carry ``raw_payload`` falls back to the CONVERSATION
+          mmap format and never reaches ``_select_mmap_format``'s
+          PAYLOAD_BYTES guard, but its raw turns are still dispatched verbatim.
+          Must run BEFORE ``_preformat_payloads`` -- payloads synthesized there
+          go through ``format_payload`` with ``system_message`` attached, so
+          checking afterwards cannot tell an authored ``raw_payload`` from a
+          pre-formatted one and would reject a run that works.
+        - The cache-hit path passes ``manifest.all_turns_source_loaded_payloads``.
+          Conversations are never loaded on a HIT, so this is the only signal
+          available; it is ``all`` rather than ``any``, but a mixed dataset
+          cannot be populated with a system prompt in the first place because
+          the miss path rejects it before ``mmap_cache.populate``.
+
+        ``get_system_prompt()`` (--system-prompt / --system-prompt-file) is the
+        only carrier checked because it is the only one that can coexist with
+        authored payloads. The other source of ``conversation.system_message``,
+        ``prefix_prompts.shared_system_length`` (--shared-system-prompt-length),
+        is a ``SyntheticDataset``-only field: every loader that emits
+        ``raw_payload`` is file-backed, and the CLI converter rejects the flag
+        on file/public datasets (``_FILE_DATASET_INCOMPATIBLE_TRIGGERS``).
+        """
+        if self.run.cfg.get_system_prompt() is None or not has_raw_payload:
+            return
+        raise ValueError(
+            "--system-prompt/--system-prompt-file is incompatible with a dataset "
+            "whose turns carry their own raw_payload (raw_payload, inputs_json, "
+            "and mooncake_trace in payload mode). Those payloads are sent to the "
+            "server byte-for-byte, bypassing the payload formatting that puts the "
+            "system message on the wire, so the prompt would be silently dropped. "
+            "Either author the system message directly into the trace payloads, or "
+            "use a dataset type that produces structured turns (e.g. single_turn / "
+            "multi_turn / dag_jsonl)."
+        )
+
     def _select_mmap_format(self, conversations: list[Conversation]) -> MemoryMapFormat:
         """Pick the dataset mmap format and refuse PAYLOAD_BYTES for body-mutators.
 
@@ -794,6 +860,12 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         manifest, falls back to a MISS (``_cache_hit_used`` stays False).
         """
         self._reject_body_mutators_for_payload_bytes(hit.manifest.mmap_format)
+        # Conversations are never loaded on a HIT, so the composition-path
+        # guard in _configure_dataset never runs; re-check from the manifest
+        # before adopting the cached bytes.
+        self._reject_system_prompt_for_raw_payload(
+            hit.manifest.all_turns_source_loaded_payloads
+        )
 
         run_data_path, run_index_path = self._run_mmap_paths()
         await asyncio.to_thread(
@@ -850,13 +922,13 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
             f"unique conversations: {len(self.dataset_metadata.conversations)}, "
             f"unique turn count: {self.dataset_metadata.total_turn_count}"
         )
-        await self.publish(
-            DatasetConfiguredNotification(
-                service_id=self.service_id,
-                metadata=self.dataset_metadata,
-                client_metadata=client_metadata,
-            )
+        notification = DatasetConfiguredNotification(
+            service_id=self.service_id,
+            metadata=self.dataset_metadata,
+            client_metadata=client_metadata,
         )
+        self._last_dataset_configured_notification = notification
+        await self.publish(notification)
 
     def _populate_cache_after_run(self) -> None:
         """Write the just-finalized run's mmap files into the cache."""
@@ -933,6 +1005,17 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
             for turn in conv.turns
         )
 
+        # Same pre-preformat window as the capture above, for the same reason:
+        # once _preformat_payloads runs, a synthesized raw_payload (which does
+        # carry the system message) is indistinguishable from an authored one.
+        self._reject_system_prompt_for_raw_payload(
+            any(
+                turn.raw_payload is not None
+                for conv in conversations
+                for turn in conv.turns
+            )
+        )
+
         endpoint_meta: EndpointMetadata = plugins.get_endpoint_metadata(
             self.run.cfg.endpoint.type
         )
@@ -992,12 +1075,29 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         # Note: dataset_configured event is set in _configure_dataset_client_and_free_memory()
         # after the dataset client is initialized, to avoid a race condition where fallback
         # requests arrive before the client is ready.
-        await self.publish(
-            DatasetConfiguredNotification(
-                service_id=self.service_id,
-                metadata=self.dataset_metadata,
-                client_metadata=client_metadata,
-            )
+        notification = DatasetConfiguredNotification(
+            service_id=self.service_id,
+            metadata=self.dataset_metadata,
+            client_metadata=client_metadata,
+        )
+        self._last_dataset_configured_notification = notification
+        await self.publish(notification)
+
+    @on_request(MessageType.DATASET_CONFIG_STATUS_REQUEST)
+    async def _handle_dataset_config_status_request(
+        self, message: DatasetConfigStatusRequest
+    ) -> DatasetConfigStatusResponse:
+        """Late-join catch-up: hand back the already-published
+        DatasetConfiguredNotification, if any, to a requester that hasn't
+        received the one-shot PUB/SUB broadcast.
+        """
+        self.debug(
+            lambda: f"Handling dataset config status request from {message.service_id}"
+        )
+        return DatasetConfigStatusResponse(
+            service_id=self.service_id,
+            request_id=message.request_id,
+            notification=self._last_dataset_configured_notification,
         )
 
     @on_request(MessageType.CONVERSATION_REQUEST)

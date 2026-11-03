@@ -95,6 +95,17 @@ class UserSession(AIPerfBaseModel):
         "find any children to pin yet — orchestrator dispatches them on "
         "the credit-return path AFTER this terminal eviction runs).",
     )
+    previous_response_id: str | None = Field(
+        default=None,
+        description="Response ID from the previous turn (e.g. 'resp_<hash>') "
+        "used for stateful chaining in the Responses API.",
+    )
+    system_prompt_in_stored_history: bool = Field(
+        default=False,
+        description="Whether the stored history behind previous_response_id "
+        "contains the system prompt as an input item. Set together with "
+        "previous_response_id so the two always describe the same response.",
+    )
 
     def advance_turn(self, turn_index: int) -> Turn:
         """Append the next turn onto ``turn_list`` and return it.
@@ -124,6 +135,13 @@ class UserSession(AIPerfBaseModel):
             )
 
         turn = self.conversation.turns[turn_index]
+        # A context reset must always break the server-side chain: chaining onto a
+        # previous_response_id would retain history the reset is meant to discard.
+        # Clearing is the safe direction (falls back to sending full history).
+        if turn.reset_context:
+            self.previous_response_id = None
+            self.system_prompt_in_stored_history = False
+
         if self.context_mode == ConversationContextMode.MESSAGE_ARRAY_WITH_RESPONSES:
             self.turn_list = [turn]
         else:
@@ -161,6 +179,21 @@ class UserSession(AIPerfBaseModel):
         Store the response for the turn.
         """
         self.turn_list.append(response_turn)
+
+    def store_response_id(
+        self, response_id: str | None, *, system_prompt_in_history: bool = False
+    ) -> None:
+        """Store the response ID from the server for stateful chaining.
+
+        ``system_prompt_in_history`` records whether that response's stored
+        history carries the system prompt as an input item. Only successful
+        responses are stored, so a failed request leaves both values on the
+        last good response.
+        """
+        self.previous_response_id = response_id
+        self.system_prompt_in_stored_history = (
+            response_id is not None and system_prompt_in_history
+        )
 
 
 class UserSessionManager:
@@ -326,6 +359,12 @@ class UserSessionManager:
         assistant responses) into the child so that the request-builder
         prepends the full parent context before the child's own messages.
 
+        The parent's ``previous_response_id`` is copied too so a FORK child
+        continues the server-side Responses chain instead of replaying
+        history: replay drops filtered outputs (e.g. reasoning items) that
+        only survive server-side, so a child that lost the chain would lack
+        equivalent parent context.
+
         No-op (with a debug-friendly silent return) if either session is
         already evicted — the FORK-pin refcount usually keeps the parent
         resident, but late-arriving children may race past eviction. The
@@ -337,6 +376,8 @@ class UserSessionManager:
         if parent is None or child is None:
             return
         child.turn_list = list(parent.turn_list)
+        child.previous_response_id = parent.previous_response_id
+        child.system_prompt_in_stored_history = parent.system_prompt_in_stored_history
 
     def release_fork_child(self, x_correlation_id: str) -> None:
         """Decrement the FORK-pin refcount on the session, floored at 0.

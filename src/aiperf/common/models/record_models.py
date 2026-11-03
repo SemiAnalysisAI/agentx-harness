@@ -22,6 +22,7 @@ from pydantic import (
     field_validator,
     model_serializer,
 )
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 from pydantic.functional_validators import AfterValidator
 
 from aiperf.common.aiperf_logger import AIPerfLogger
@@ -51,6 +52,9 @@ _logger = AIPerfLogger(__name__)
 _SSE_COMMENT_FIELD_NAME = "comment"
 _SSE_DATA_FIELD_NAME = "data"
 _SSE_DATA_PREFIX = "data:"
+# ASCII padding only: str.strip() would also eat U+0085/U+2028/U+2029 and
+# \x0b-\x0c/\x1c-\x1f, which are data, not SSE whitespace.
+_SSE_PADDING = " \t"
 
 
 class MetricResult(JsonMetricResult):
@@ -212,8 +216,11 @@ class MetricRecordMetadata(AIPerfBaseModel):
     source_kind: str | None = Field(
         default=None,
         description=(
-            "Loader-specific source classification for this request, when "
-            "provided by the dataset loader."
+            "Loader-specific label for the request's origin, when provided by "
+            "the dataset loader: the Weka reconstruction kind (weka_main, "
+            "weka_flat) or the SPEED-Bench row's benchmark category (coding, "
+            "math, low_entropy). Lets a consumer group records by their source "
+            "without re-reading the input dataset."
         ),
     )
     credit_issued_ns: int | None = Field(
@@ -450,7 +457,7 @@ class ProfileResults(AIPerfBaseModel):
     """The results of a profile run."""
 
     records: list[MetricResult] | None = Field(
-        ..., description="The records of the profile results"
+        default=None, description="The records of the profile results"
     )
     warmup_records: list[MetricResult] | None = Field(
         default=None,
@@ -661,19 +668,20 @@ class TextResponse:
             return None
 
 
-@dataclass(slots=True)
+# Nested stdlib dataclasses ignore byte encoding settings; use Pydantic here.
+# Reject extra fields so response unions cannot select the wrong dataclass.
+@pydantic_dataclass(
+    slots=True,
+    config=ConfigDict(extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"),
+)
 class BinaryResponse:
     """Raw binary response from an inference client for non-text content types."""
-
-    # Reject extra fields so Pydantic's union discrimination (e.g. in
-    # RequestRecord.responses) doesn't match the wrong dataclass type.
-    __pydantic_config__ = ConfigDict(extra="forbid")
 
     perf_ns: int
     """The performance timestamp of the response in nanoseconds (perf_counter_ns)."""
 
     raw_bytes: bytes
-    """The raw binary body of the response."""
+    """The original response bytes; JSON encodes them as URL-safe base64."""
 
     content_type: str | None = None
     """The content type of the response. e.g. 'video/mp4', 'application/octet-stream'."""
@@ -737,14 +745,17 @@ class SSEMessage:
                 packets=[
                     SSEField(
                         name=_SSE_DATA_FIELD_NAME,
-                        value=raw_message[len(_SSE_DATA_PREFIX) :].strip(),
+                        value=raw_message[len(_SSE_DATA_PREFIX) :].strip(_SSE_PADDING),
                     )
                 ],
             )
 
         message = cls(perf_ns=perf_ns)
-        for line in raw_message.splitlines():
-            if not (line := line.strip()):
+        # SSE fields end at CR/LF; Unicode line separators belong to the data.
+        if "\r" in raw_message:
+            raw_message = raw_message.replace("\r\n", "\n").replace("\r", "\n")
+        for line in raw_message.split("\n"):
+            if not (line := line.strip(_SSE_PADDING)):
                 continue
 
             prev_value = message.packets[-1].value if message.packets else None
@@ -767,7 +778,9 @@ class SSEMessage:
             parts = line.split(":", 1)
             if len(parts) < 2:
                 # Fields without a colon have no value, so the whole line is the field name
-                message.packets.append(SSEField(name=parts[0].strip(), value=None))
+                message.packets.append(
+                    SSEField(name=parts[0].strip(_SSE_PADDING), value=None)
+                )
                 continue
 
             field_name, value = parts
@@ -776,11 +789,14 @@ class SSEMessage:
                 # Field name is empty, so this is a comment
                 field_name = _SSE_COMMENT_FIELD_NAME
 
-            # Spec says strip only one leading space; we strip() all whitespace
+            # Spec says strip only one leading space; we strip all ASCII padding
             # to normalize inconsistent servers for downstream exact comparisons
             # (e.g. "[DONE]", "error").
             message.packets.append(
-                SSEField(name=field_name.strip(), value=value.strip())
+                SSEField(
+                    name=field_name.strip(_SSE_PADDING),
+                    value=value.strip(_SSE_PADDING),
+                )
             )
 
         return message
@@ -918,8 +934,11 @@ class RecordContext(AIPerfBaseModel):
     source_kind: str | None = Field(
         default=None,
         description=(
-            "Loader-specific source classification for this request, when "
-            "provided by the dataset loader."
+            "Loader-specific label for the request's origin, when provided by "
+            "the dataset loader: the Weka reconstruction kind (weka_main, "
+            "weka_flat) or the SPEED-Bench row's benchmark category (coding, "
+            "math, low_entropy). Lets a consumer group records by their source "
+            "without re-reading the input dataset."
         ),
     )
     x_request_id: str = Field(
@@ -1073,6 +1092,17 @@ class RequestInfo(RecordContext):
         ge=0,
         description="Index of the URL to use when multiple --url values are configured. "
         "None means use the default (first) URL. Used for round-robin load balancing.",
+    )
+    previous_response_id: str | None = Field(
+        default=None,
+        description="Response ID from the previous turn (e.g. 'resp_<hash>') "
+        "used for stateful chaining in the Responses API.",
+    )
+    system_prompt_in_stored_history: bool = Field(
+        default=False,
+        description="Whether the stored server-side history behind "
+        "previous_response_id already contains the system prompt as an input "
+        "item. Only meaningful when previous_response_id is set.",
     )
 
 
@@ -1437,6 +1467,29 @@ def find_last_non_empty_usage(responses: list[ParsedResponse]) -> Usage | None:
     return None
 
 
+def first_content_chunk_completion_tokens(
+    responses: list[ParsedResponse],
+) -> int | None:
+    """Return the cumulative ``completion_tokens`` reported on the first content
+    chunk (the chunk whose arrival defines TTFT).
+
+    Requires per-chunk (``continuous_usage_stats``) usage: it walks forward to the
+    first response carrying content (``data`` is not None) and reads its usage's
+    ``completion_tokens``. This is deliberately the raw completion count
+    (reasoning included), matching ``OutputSequenceLengthMetric`` -- OSL is
+    ``output + reasoning`` = ``completion_tokens`` -- so inter-token latency
+    subtracts operands in the same unit. Because per-chunk usage is cumulative,
+    that value is the number of tokens delivered through the first content chunk.
+    Returns ``None`` when no content chunk carries usage (e.g. the server only
+    reports the final total), so callers fall back to assuming one token in the
+    first chunk.
+    """
+    for response in responses:
+        if response.data and response.usage:
+            return response.usage.completion_tokens
+    return None
+
+
 @dataclass(slots=True)
 class ParsedResponse:
     """Parsed response from a inference client."""
@@ -1477,8 +1530,8 @@ class ParsedResponse:
     """Additional metadata from the response useful for analysis (rate limits, content filters, etc.)."""
 
     spec_decode_stats: dict[str, Any] | None = None
-    """Raw per-choice speculative-decoding payload captured from the wire (e.g.
-    vLLM's ``choices[].speculative_decoding_stats``), or None when absent. Left
+    """Raw speculative-decoding payload captured from the response root (e.g.
+    vLLM's ``metrics.speculative_decoding``), or None when absent. Left
     uninterpreted here; a ``SpecDecodeAdapterProtocol`` converts it into the
     engine-neutral ``SpecDecodeAcceptanceRecord`` at record-assembly time."""
 
@@ -1501,6 +1554,16 @@ class TokenCounts:
 
     reasoning: int | None = None
     """The number of reasoning tokens. None if token count could not be calculated or the model does not support reasoning."""
+
+    first_content_chunk_tokens: int | None = None
+    """The number of tokens delivered in the first content chunk -- the chunk whose
+    arrival defines TTFT -- taken from the server's per-chunk usage (cumulative
+    ``completion_tokens`` at that chunk). Inter-token latency subtracts this from the
+    decode-token count rather than assuming exactly one token arrived first, which
+    corrects the TPS/user inflation a server produces when it bundles multiple tokens
+    into the first streamed chunk (e.g. TRT-LLM ``stream-interval``). ``None`` unless
+    ``--per-chunk-usage`` is set and the server reports per-chunk usage; inter-token
+    latency then falls back to assuming one token in the first chunk."""
 
 
 @dataclass(slots=True)
@@ -1547,9 +1610,16 @@ class ParsedResponseRecord:
     """Engine-neutral per-request speculative-decoding acceptance record, filled
     by a ``SpecDecodeAdapterProtocol`` when the response carried spec-decode
     stats. ``None`` when: spec decode is off or the request had no verify steps
-    (no payload); the request produced multiple sequences (``n > 1``, which is
-    suppressed); no registered adapter recognized the payload; or the payload
-    was malformed and the adapter rejected it."""
+    (no payload, or a zero-step payload the parser drops); the request produced
+    multiple sequences (``n > 1``, which is suppressed); no registered adapter
+    recognized the payload; or the payload was malformed and the adapter
+    rejected it."""
+
+    spec_decode_zero_step: bool = False
+    """True when the engine reported spec-decode stats for this request but it
+    ran no verify step (``num_spec_steps == 0``). Its record is dropped, so
+    ``spec_decode_acceptance`` is None; this flag lets the run count such
+    requests separately from runs where spec decode is off."""
 
     @cached_property
     def final_usage(self) -> Usage | None:

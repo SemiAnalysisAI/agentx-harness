@@ -88,9 +88,9 @@ def make_weka_run(
     required -- a MagicMock no longer satisfies the loader's reads.
 
     ``block_size`` has no FileDataset home in v2 (only synthetic prompts carry
-    it), so it is forwarded to the loader via ``default_block_size`` by callers,
-    not through config. It is accepted here for signature compatibility but
-    ignored at the config layer.
+    it); weka traces declare their own ``block_size``, which the loader honors
+    over the plugin ``default_block_size``. It is accepted here for signature
+    compatibility but ignored at the config layer.
     """
     from aiperf.config import BenchmarkConfig, BenchmarkRun
 
@@ -393,7 +393,7 @@ def create_test_video(tmp_path):
             # Use ffmpeg to create video
             (
                 ffmpeg.input(f"{temp_frame_dir}/frame_%03d.png", framerate=1)
-                .output(str(dest_path), vcodec="libx264", pix_fmt="yuv420p", t=1)
+                .output(str(dest_path), vcodec="libvpx-vp9", pix_fmt="yuv420p", t=1)
                 .overwrite_output()
                 .run(quiet=True)
             )
@@ -403,10 +403,11 @@ def create_test_video(tmp_path):
             Path(temp_frame_dir).rmdir()
 
         except (ImportError, Exception):
-            # Fallback: create a minimal valid MP4 file
-            # This is a minimal MP4 with just headers (won't play but is valid for testing)
+            # Fallback: a minimal MP4 header stub with no encoded frames — it
+            # won't play, and loader tests only need a file that base64-encodes.
+            # Branded vp09 to match the libvpx-vp9 path above, not H.264.
             minimal_mp4 = bytes.fromhex(
-                "000000186674797069736f6d0000020069736f6d69736f32617663310000"
+                "000000186674797069736f6d0000020069736f6d69736f32767030390000"
                 "0008667265650000002c6d6461740000001c6d6f6f7600000000006d7668"
                 "6400000000000000000000000000000001000000"
             )

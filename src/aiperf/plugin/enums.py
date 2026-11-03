@@ -59,15 +59,15 @@ ComposerType = plugins.create_enum(PluginType.DATASET_COMPOSER, "ComposerType", 
 
 CustomDatasetTypeStr: TypeAlias = str
 CustomDatasetType = plugins.create_enum(PluginType.CUSTOM_DATASET_LOADER, "CustomDatasetType", module=__name__)
-"""Dynamic enum for custom dataset loader. Example: CustomDatasetType.BAILIAN_TRACE, CustomDatasetType.SPEED_BENCH_THROUGHPUT_16K, CustomDatasetType.WEKA_TRACE"""
+"""Dynamic enum for custom dataset loader. Example: CustomDatasetType.BAILIAN_TRACE, CustomDatasetType.SAGEMAKER_DATA_CAPTURE, CustomDatasetType.WEKA_TRACE"""
 
 PublicDatasetTypeStr: TypeAlias = str
 PublicDatasetType = plugins.create_enum(PluginType.PUBLIC_DATASET_LOADER, "PublicDatasetType", module=__name__)
-"""Dynamic enum for public dataset loader. Example: PublicDatasetType.AIMO, PublicDatasetType.SEMIANALYSIS_CC_TRACES_WEKA_062126_256K, PublicDatasetType.WEKA_HF"""
+"""Dynamic enum for public dataset loader. Example: PublicDatasetType.AIMO, PublicDatasetType.SPEC_AL_MTBENCH, PublicDatasetType.WEKA_HF"""
 
 EndpointTypeStr: TypeAlias = str
 EndpointType = plugins.create_enum(PluginType.ENDPOINT, "EndpointType", module=__name__)
-"""Dynamic enum for endpoint. Example: EndpointType.CHAT, EndpointType.IMAGE_RETRIEVAL, EndpointType.VIDEO_GENERATION"""
+"""Dynamic enum for endpoint. Example: EndpointType.AUDIO_TRANSCRIPTION, EndpointType.IMAGE_GENERATION, EndpointType.VIDEO_GENERATION"""
 
 TransportTypeStr: TypeAlias = str
 TransportType = plugins.create_enum(PluginType.TRANSPORT, "TransportType", module=__name__)
@@ -95,7 +95,7 @@ AnalyzerType = plugins.create_enum(PluginType.ANALYZER, "AnalyzerType", module=_
 
 SpecDecodeAdapterTypeStr: TypeAlias = str
 SpecDecodeAdapterType = plugins.create_enum(PluginType.SPEC_DECODE_ADAPTER, "SpecDecodeAdapterType", module=__name__)
-"""Dynamic enum for spec decode adapter. Example: SpecDecodeAdapterType.VLLM"""
+"""Dynamic enum for spec decode adapter. Example: SpecDecodeAdapterType.TENSORRT_LLM, SpecDecodeAdapterType.VLLM"""
 
 AccuracyGraderTypeStr: TypeAlias = str
 AccuracyGraderType = plugins.create_enum(PluginType.ACCURACY_GRADER, "AccuracyGraderType", module=__name__)

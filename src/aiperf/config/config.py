@@ -543,66 +543,176 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
 
     @model_validator(mode="after")
     def validate_cache_bust_compatibility(self) -> Self:
-        """Refuse cache-bust on incompatible timing modes / endpoint types.
+        """Refuse cache-bust when endpoint metadata does not support it.
 
-        Marker minting only fires in the agentic-replay strategy and only the
-        chat / responses endpoint formatters consume the system-message field
-        that hosts the marker. Any other combination silently drops the marker
-        and would produce a benchmark that looks normal but exercises no cache-
-        busting at all — refuse loudly at config time.
-
-        Pure validation: this RAISES only, never mutates (per the v2 resolver
-        convention that cross-cutting config mutation belongs in a
-        ConfigResolver / scenario step, not a model_validator).
-
-        Deferral cases (the lockdown does NOT fire — the agentic timing mode is
-        resolved later, not at config-construction time):
-
-        * a config carrying a ``scenario`` is governed by that scenario's own
-          invariant locks (``apply_scenario`` stamps the agentic ``timing_mode``
-          onto the profiling phases and enforces ``require_cache_bust``)
-          POST-construction via field assignment, which does not re-trigger this
-          validator (e.g. inferencex-agentx-mvp = agentic timing + chat endpoint
-          + first_turn_prefix is valid once the scenario applies);
-        * no profiling phase carries an EXPLICIT ``timing_mode`` override. The
-          effective mode is then derived at runtime from the phase type (or set
-          by the agentic-replay engine itself), so the agentic-ness is not yet
-          knowable here. The lockdown only fires once a phase has explicitly
-          declared a (non-agentic) timing mode that is incompatible with the
-          requested cache-bust.
+        Cache-bust markers are minted by every timing strategy and injected by
+        the worker into structured endpoint turns. Endpoint plugins opt in via
+        ``supports_cache_bust`` metadata; timing mode is not a restriction.
         """
         from aiperf.common.enums import CacheBustTarget
-        from aiperf.plugin.enums import EndpointType, TimingMode
-
-        if self.scenario is not None:
-            return self
+        from aiperf.plugin import plugins
 
         if self.get_cache_bust_target() == CacheBustTarget.NONE:
             return self
 
-        profiling_phases = self.get_profiling_phases()
-        explicit_timing_modes = [
-            phase.timing_mode
-            for phase in profiling_phases
-            if phase.timing_mode is not None
-        ]
-        if not explicit_timing_modes:
+        endpoint_metadata = plugins.get_endpoint_metadata(self.endpoint.type)
+        if not endpoint_metadata.supports_cache_bust:
+            raise ValueError(
+                "cache-bust is not supported by endpoint "
+                f"{self.endpoint.type}; select an endpoint whose plugin metadata "
+                "sets supports_cache_bust=true"
+            )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_system_prompt_compatibility(self) -> Self:
+        """Reject a verbatim system prompt that would conflict or be silently dropped.
+
+        A custom system prompt is the content-valued replacement for
+        ``prefix_prompts.shared_system_length``: both fill
+        ``Conversation.system_message``. It therefore inherits that field's
+        exclusivity with the prefix pool rather than defining its own rule.
+
+        Endpoints opt into receiving a system message via the
+        ``consumes_system_message`` plugin metadata flag. On the others the text
+        would never reach the wire, so the benchmark would silently measure
+        something other than what was asked for.
+        """
+        from aiperf.plugin import plugins
+        from aiperf.plugin.enums import PluginType
+
+        if self.get_system_prompt() is None:
             return self
-        if TimingMode.AGENTIC_REPLAY not in explicit_timing_modes:
+
+        prefix_prompts = getattr(self.get_default_dataset(), "prefix_prompts", None)
+        if prefix_prompts is not None:
+            if prefix_prompts.shared_system_length is not None:
+                raise ValueError(
+                    "--system-prompt/--system-prompt-file and "
+                    "--shared-system-prompt-length are mutually exclusive: both fill "
+                    "the system message. Use the first for verbatim text, the second "
+                    "for synthetic filler of a target token length."
+                )
+            if prefix_prompts.pool_size or prefix_prompts.length:
+                raise ValueError(
+                    "--system-prompt/--system-prompt-file and "
+                    "--num-prefix-prompts/--prefix-prompt-length are mutually "
+                    "exclusive, matching --shared-system-prompt-length, which fills "
+                    "the same system-message slot."
+                )
+
+        endpoint_metadata = plugins.get_endpoint_metadata(self.endpoint.type)
+        if not endpoint_metadata.consumes_system_message:
+            supported = ", ".join(
+                sorted(
+                    entry.name
+                    for entry, _ in plugins.iter_all(PluginType.ENDPOINT)
+                    if plugins.get_endpoint_metadata(entry.name).consumes_system_message
+                )
+            )
             raise ValueError(
-                "cache-bust requires the agentic_replay timing mode "
-                "(set today by --scenario inferencex-agentx-mvp); the profiling "
-                "phase(s) are not agentic_replay. Cache-bust marker minting is "
-                "only implemented for agentic_replay."
+                f"--system-prompt/--system-prompt-file is not supported by endpoint "
+                f"type '{self.endpoint.type}' (no system role), so the text would "
+                f"never reach the wire. Supported endpoint types: {supported}."
             )
 
-        if self.endpoint.type not in {EndpointType.CHAT, EndpointType.RESPONSES}:
-            raise ValueError(
-                f"cache-bust requires --endpoint-type chat or responses; "
-                f"got {self.endpoint.type}. Other endpoint formatters do not "
-                f"consume the system message field that hosts the marker."
-            )
+        return self
 
+    @model_validator(mode="after")
+    def validate_warmup_isolation_not_agentic_replay(self) -> Self:
+        """Reject WARMUP_ISOLATION_* targets when timing mode resolves to AGENTIC_REPLAY.
+
+        ``_inject_marker_at_first_user`` mutates Turn objects in-place inside
+        ``session.turn_list``. In agentic replay the same session object spans
+        the WARMUP→PROFILING boundary (the session is never evicted at phase
+        transition), so a Turn mutated with ``[warmup]`` during WARMUP carries
+        that mutation into PROFILING — even though the PROFILING credit has
+        ``cache_bust_marker=None`` and ``_apply_cache_bust`` returns early.
+
+        Resolution logic mirrors ``validate_agentic_cache_warmup``: resolve the
+        scenario's declared timing_mode when a scenario is present (scenario
+        stamps phases post-construction); otherwise inspect the phases directly.
+        """
+        from aiperf.common.enums import CacheBustTarget
+        from aiperf.plugin.enums import TimingMode
+        from aiperf.timing.config import _is_agentic_replay
+
+        target = self.get_cache_bust_target()
+        _WARMUP_ISOLATION = (
+            CacheBustTarget.WARMUP_ISOLATION_SYSTEM,
+            CacheBustTarget.WARMUP_ISOLATION_FIRST_TURN,
+        )
+        if target not in _WARMUP_ISOLATION:
+            return self
+
+        profiling_phases = self.get_profiling_phases()
+        is_agentic = False
+        if self.scenario is not None:
+            from aiperf.common.scenario.registry import get_scenario
+
+            is_agentic = (
+                get_scenario(self.scenario).timing_mode == TimingMode.AGENTIC_REPLAY
+            )
+        else:
+            is_agentic = _is_agentic_replay(profiling_phases)
+
+        if is_agentic:
+            raise ValueError(
+                "cache_bust targets warmup_isolation_system and "
+                "warmup_isolation_first_turn are not compatible with agentic_replay "
+                "timing mode: Turn objects mutated during warmup persist into profiling "
+                "sessions. Use cache_bust=none for agentic_replay workloads or one of "
+                "the RID-based targets (system_prefix, first_turn_prefix, etc.) for "
+                "per-trajectory isolation."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_warmup_isolation_system_requires_shared_system_prompt(self) -> Self:
+        """Reject warmup_isolation_system when no system message is statically present.
+
+        ``warmup_isolation_system`` injects ``[warmup]`` into the system message slot
+        during warmup. When no system message exists in the dataset config the marker
+        silently falls through to the user turn, making it indistinguishable from
+        ``warmup_isolation_first_turn``.
+
+        A verbatim ``--system-prompt``/``--system-prompt-file`` satisfies this
+        requirement exactly as ``shared_system_length`` does: both statically
+        guarantee a system message, so the marker has a real slot to land in.
+
+        This check is scoped to synthetic datasets where system-message presence is
+        statically known. File and trace datasets may carry system messages inside
+        their content, which cannot be inspected at config time.
+        """
+        from aiperf.common.enums import CacheBustTarget, DatasetType
+
+        if self.get_cache_bust_target() != CacheBustTarget.WARMUP_ISOLATION_SYSTEM:
+            return self
+
+        dataset = self.get_default_dataset()
+        if dataset.type != DatasetType.SYNTHETIC:
+            return self
+
+        if self.get_system_prompt() is not None:
+            return self
+
+        prefix_prompts = getattr(dataset, "prefix_prompts", None)
+        has_shared_system = (
+            prefix_prompts is not None
+            and getattr(prefix_prompts, "shared_system_length", None) is not None
+        )
+        if not has_shared_system:
+            raise ValueError(
+                "cache_bust=warmup_isolation_system requires a shared system prompt, "
+                "but no shared_system_length or verbatim system prompt is configured "
+                "on the synthetic dataset. "
+                "The marker would silently fall through to the user turn, making it "
+                "indistinguishable from warmup_isolation_first_turn. "
+                "Either set prefix_prompts.shared_system_length (--shared-system-prompt-length), "
+                "pass --system-prompt/--system-prompt-file, "
+                "or switch to cache_bust=warmup_isolation_first_turn."
+            )
         return self
 
     @model_validator(mode="after")
@@ -965,20 +1075,33 @@ class AIPerfConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _plot_implies_auto_plot(self) -> Self:
-        """When ``plot:`` is set and the user didn't explicitly set
-        ``artifacts.auto_plot``, flip it to True. Explicit ``auto_plot: false``
-        wins; we just log an info-level breadcrumb so the silence doesn't
-        surprise users.
+        """Resolve the tri-state ``artifacts.auto_plot`` to a concrete bool.
+
+        ``None`` means the user did not decide, so a ``plot:`` section implies
+        True. An explicit False wins; we log an info-level breadcrumb so the
+        silence doesn't surprise users.
+
+        Tri-state rather than ``model_fields_set``: the Kubernetes apiserver
+        materializes CRD ``default:`` values on write, so a defaulted-to-False
+        field is indistinguishable from a user-authored one and would silently
+        suppress plots for every AIPerfJob carrying a ``plot:`` section.
         """
-        if self.plot is None:
-            return self
-        if "auto_plot" in self.benchmark.artifacts.model_fields_set:
-            if self.benchmark.artifacts.auto_plot is False:
+        artifacts = self.benchmark.artifacts
+        authored = "auto_plot" in artifacts.model_fields_set
+        if self.plot is not None:
+            if artifacts.auto_plot is None:
+                artifacts.auto_plot = True
+            elif artifacts.auto_plot is False:
                 _logger.info(
                     "plot section present but artifacts.auto_plot=false "
                     "explicitly; plots will not auto-render. Use ``aiperf plot "
                     "<artifact_dir>`` after the run to generate them."
                 )
-            return self
-        self.benchmark.artifacts.auto_plot = True
+        if artifacts.auto_plot is None:
+            artifacts.auto_plot = False
+        if not authored:
+            # Resolving is not authoring: keep the field out of
+            # ``model_fields_set`` so ``exclude_unset`` dumps (the Kubernetes
+            # ConfigMap payload) do not invent a value the user never wrote.
+            artifacts.model_fields_set.discard("auto_plot")
         return self

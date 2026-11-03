@@ -1194,6 +1194,78 @@ class TestTimesliceRaggedIndex:
         )
         assert self._dump(indexed) == self._dump(reference)
 
+    @pytest.mark.asyncio
+    async def test_ragged_values_ingested_after_snapshot_are_excluded(
+        self, mock_run
+    ) -> None:
+        mock_run.cfg.artifacts.slice_duration = 1.0
+        accumulator = MetricsAccumulator(mock_run)
+        await self._ingest(accumulator)
+        reference = await accumulator.export_results(ExportContext())
+
+        backend = accumulator._column_store.ragged(InterChunkLatencyMetric.tag)
+        build_index = MetricsAccumulator._build_slice_ragged_index
+
+        def build_index_after_late_ingest(self, record_bin, n_bins):
+            backend.extend(len(record_bin) + 3, [1e9, 2e9])
+            return build_index(self, record_bin, n_bins)
+
+        with patch.object(
+            MetricsAccumulator,
+            "_build_slice_ragged_index",
+            autospec=True,
+            side_effect=build_index_after_late_ingest,
+        ):
+            indexed = await accumulator.export_results(ExportContext())
+
+        assert indexed.timeslices
+        assert [t.model_dump(mode="json") for t in indexed.timeslices] == [
+            t.model_dump(mode="json") for t in reference.timeslices or []
+        ]
+
+    @pytest.mark.asyncio
+    async def test_summary_overlapping_timeslice_export_keeps_its_own_values(
+        self, mock_run
+    ) -> None:
+        mock_run.cfg.artifacts.slice_duration = 1.0
+        accumulator = MetricsAccumulator(mock_run)
+        await self._ingest(accumulator)
+        warmup = ExportContext(phase=CreditPhase.WARMUP)
+        profiling = ExportContext(phase=CreditPhase.PROFILING)
+        expected_warmup = self._dump(await accumulator.export_results(warmup))
+        expected_profiling = self._dump(
+            accumulator._summarize_for_export_context(
+                profiling, include_timeslices=False
+            )
+        )
+
+        compute_results = MetricsAccumulator._compute_results
+        pending = [profiling]
+        overlapped: list[AccumulatorMetricsSummary] = []
+
+        def summarize_mid_slice(self, *args, **kwargs):
+            # The realtime summary runs on the event loop while the export's
+            # slice loop runs in a worker thread.
+            if kwargs.get("is_timeslice") and pending:
+                overlapped.append(
+                    self._summarize_for_export_context(
+                        pending.pop(), include_timeslices=False
+                    )
+                )
+            return compute_results(self, *args, **kwargs)
+
+        with patch.object(
+            MetricsAccumulator,
+            "_compute_results",
+            autospec=True,
+            side_effect=summarize_mid_slice,
+        ):
+            exported = await accumulator.export_results(warmup)
+
+        assert overlapped
+        assert self._dump(exported) == expected_warmup
+        assert self._dump(overlapped[0]) == expected_profiling
+
 
 class TestMetricsSummary:
     def test_to_json(self) -> None:

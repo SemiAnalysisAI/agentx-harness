@@ -10,6 +10,10 @@ from pydantic import ValidationError
 from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.models import SpecDecodeAcceptanceRecord
 from aiperf.common.models.record_models import find_last_non_empty_usage
+from aiperf.spec_decode._shared import (
+    find_spec_decode_payload,
+    inflate_dense_histogram,
+)
 
 if TYPE_CHECKING:
     from aiperf.common.models import ParsedResponse
@@ -18,12 +22,27 @@ _logger = AIPerfLogger(__name__)
 
 ENGINE = "vllm"
 
-# Keys that identify a payload as vLLM's ``speculative_decoding_stats`` shape.
+# Keys that identify a payload as vLLM's ``speculative_decoding`` shape.
 # ``can_adapt`` checks for these so that, once other engines populate the same
 # raw slot, this adapter claims only its own payloads (auto-detection) rather
-# than greedily matching on mere presence. Both are always emitted by vLLM,
-# including the zero-step case (``acceptance_histogram`` is ``{}`` but present).
-_VLLM_SIGNATURE_KEYS = ("acceptance_histogram", "num_spec_steps")
+# than greedily matching on mere presence. All three are always emitted by vLLM,
+# including the zero-step case (``acceptance_histogram`` is all-zero but present).
+#
+# ``mean_acceptance_length`` is the discriminating key and must stay here.
+# TensorRT-LLM emits ``acceptance_histogram`` and ``num_spec_steps`` too, so a
+# signature without a vLLM-unique key matches a TRT-LLM payload. That happened:
+# this adapter claimed every TRT-LLM payload, ``adapt`` raised ``KeyError`` on
+# the missing key, and the records were lost -- under first-match detection the
+# TRT-LLM adapter was never even tried. TRT-LLM does not report mean acceptance
+# length at all; its per-choice ``avg_decoded_tokens_per_iter`` averages over
+# every decoding iteration, not just drafting steps. Requiring the key costs
+# nothing: ``adapt`` already reads it unguarded, so a payload lacking it could
+# never produce a record.
+_VLLM_SIGNATURE_KEYS = (
+    "acceptance_histogram",
+    "num_spec_steps",
+    "mean_acceptance_length",
+)
 
 
 def _is_vllm_payload(payload: Any) -> bool:
@@ -32,29 +51,16 @@ def _is_vllm_payload(payload: Any) -> bool:
     )
 
 
-def _find_spec_decode_payload(
-    responses: list[ParsedResponse],
-) -> dict[str, Any] | None:
-    """Return the last non-empty ``spec_decode_stats`` payload across responses.
-
-    vLLM attaches the payload to a single choice: the finish-reason chunk in
-    streaming, or the sole choice non-streaming. Walking from the end mirrors
-    ``find_last_non_empty_usage`` and tolerates either layout.
-    """
-    for response in reversed(responses):
-        stats = response.spec_decode_stats
-        if stats:
-            return stats
-    return None
-
-
 class VLLMSpecDecodeAdapter:
-    """Fills the acceptance record from vLLM's ``speculative_decoding_stats``.
+    """Fills the acceptance record from vLLM's ``metrics.speculative_decoding``.
 
-    Reads the per-choice ``speculative_decoding_stats`` object emitted by vLLM
-    when the server runs with ``--per-request-spec-decode-stats``. Present on
-    chat and completions, streaming and non-streaming. The object's histogram
-    keys are JSON strings, so they are int-cast into the neutral record.
+    Reads the response-root ``metrics.speculative_decoding`` object emitted by
+    vLLM when the server runs with ``--per-request-spec-decode-metrics``
+    (``summary`` or ``detailed``). Present on chat and completions, streaming and
+    non-streaming. Its ``acceptance_histogram`` is a dense ``list[int]`` (index j
+    holds the number of steps that accepted exactly j draft tokens), inflated
+    into the neutral record's sparse ``{j: count}`` map with zero-count buckets
+    dropped.
 
     The field names and shape track vLLM PR
     https://github.com/vllm-project/vllm/pull/48915; its per-request
@@ -63,20 +69,21 @@ class VLLMSpecDecodeAdapter:
 
     @classmethod
     def can_adapt(cls, responses: list[ParsedResponse]) -> bool:
-        return _is_vllm_payload(_find_spec_decode_payload(responses))
+        return _is_vllm_payload(find_spec_decode_payload(responses))
 
     @classmethod
     def adapt(
         cls, responses: list[ParsedResponse]
     ) -> SpecDecodeAcceptanceRecord | None:
-        payload = _find_spec_decode_payload(responses)
+        payload = find_spec_decode_payload(responses)
         if payload is None:
             return None
 
         try:
-            histogram = {
-                int(j): count for j, count in payload["acceptance_histogram"].items()
-            }
+            num_spec_tokens = payload.get("num_spec_tokens")
+            histogram = inflate_dense_histogram(
+                payload["acceptance_histogram"], num_spec_tokens
+            )
             usage = find_last_non_empty_usage(responses)
             return SpecDecodeAcceptanceRecord(
                 engine=ENGINE,
@@ -86,7 +93,7 @@ class VLLMSpecDecodeAdapter:
                 num_accepted_draft_tokens=payload["num_accepted_draft_tokens"],
                 num_draft_tokens=payload["num_draft_tokens"],
                 num_spec_steps=payload["num_spec_steps"],
-                num_spec_tokens=payload.get("num_spec_tokens"),
+                num_spec_tokens=num_spec_tokens,
                 completion_tokens=usage.completion_tokens if usage else None,
                 per_step_accepted=payload.get("per_step_accepted"),
                 per_step_drafted=payload.get("per_step_drafted"),

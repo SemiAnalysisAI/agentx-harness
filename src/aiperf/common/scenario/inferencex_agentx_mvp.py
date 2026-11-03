@@ -64,7 +64,14 @@ AGENTX = INFERENCEX_AGENTX_MVP.model_copy(
             "DATASET": {"CONFIGURATION_TIMEOUT": 1800},
             "SERVICE": {"PROFILE_CONFIGURE_TIMEOUT": 1800},
             "UI": {"REALTIME_METRICS_ENABLED": True},
-            "HTTP": {"TCP_USER_TIMEOUT": 900000},
+            # 1.0.x keeps 1.0.9's request headers: no X-Session-Affinity.
+            "HTTP": {
+                "TCP_USER_TIMEOUT": 900000,
+                "X_SESSION_AFFINITY_FROM_CORRELATION_ID": False,
+            },
+            # 1.0.x keeps the pre-watchdog behavior: one long request at low
+            # concurrency can legitimately run past the 600s default.
+            "RECORD": {"PROGRESS_STALL_TIMEOUT": 0},
         },
     }
 )

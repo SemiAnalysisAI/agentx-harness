@@ -18,6 +18,7 @@ from aiperf.common.models import (
     Turn,
 )
 from aiperf.common.types import JsonObject
+from aiperf.common.utils import is_truthy_flag
 from aiperf.endpoints import _openai_responses_replay as _replay
 from aiperf.endpoints.base_endpoint import BaseEndpoint
 
@@ -179,25 +180,80 @@ class ResponsesEndpoint(BaseEndpoint):
 
     def format_payload(self, request_info: RequestInfo) -> dict[str, Any]:
         """Format OpenAI Responses API request payload from RequestInfo."""
+        payload, _ = self._build_payload(request_info)
+        self.trace(lambda: f"Formatted payload: {payload}")
+        return payload
+
+    def _build_payload(self, request_info: RequestInfo) -> tuple[dict[str, Any], bool]:
+        """Build the wire payload and report whether the system prompt was
+        merged into an input item that actually ships.
+
+        The flag is read off the final payload, after endpoint ``extra`` and
+        per-turn ``extra_body`` are applied, because either may replace
+        ``input`` and discard the merged item.
+        """
         if not request_info.turns:
             raise ValueError("Responses endpoint requires at least one turn.")
 
         turns = request_info.turns
         model_endpoint = request_info.model_endpoint
 
-        # Responses API doesn't nest the system prompt into ``input``; it
-        # lives in top-level ``instructions``. The per-conversation
-        # ``user_context_message`` is prepended as a leading user item.
-        input_items: list[dict[str, Any]] = []
-        if request_info.user_context_message:
-            input_items.append(
-                {
-                    "type": "message",
-                    "role": self.DEFAULT_TURN_ROLE,
-                    "content": request_info.user_context_message,
-                }
+        # Responses API carries the system prompt in top-level ``instructions``
+        # rather than in ``input``. The per-conversation ``user_context_message``
+        # is a leading user item. Branch on the outgoing id, not the session's:
+        # an override to ``None`` breaks the chain, so the server has no history
+        # to replay and the full conversation must ship as in a stateless run.
+        if self._outgoing_previous_response_id(request_info):
+            # Stateful chaining: previous_response_id points to server-side history.
+            self._warn_chaining_isl_once()
+            rendered = self.build_messages([turns[-1]])
+            context_items: list[dict[str, Any]] = []
+        else:
+            rendered = self.build_messages(turns)
+            context_items = (
+                [
+                    {
+                        "type": "message",
+                        "role": self.DEFAULT_TURN_ROLE,
+                        "content": request_info.user_context_message,
+                    }
+                ]
+                if request_info.user_context_message
+                else []
             )
-        input_items.extend(self.build_messages(turns))
+        instructions, merge_prefix = self._system_prompt_carrier(request_info, rendered)
+
+        # A dataset that authored its own leading ``role: system`` input item
+        # collides with ``instructions``: both ship, and the server sees two
+        # system prompts. Merge into the authored item and drop
+        # ``instructions``, matching ``ChatEndpoint._format_messages`` -- the
+        # de-dup invariant is endpoint-wide, and repeated system roles are
+        # mishandled by many OpenAI-compatible servers.
+        #
+        # The merged item is placed AHEAD of ``user_context_message`` so the
+        # system prompt stays the leading wire bytes, as it does for chat and
+        # as ``SYSTEM_PREFIX`` cache-bust assumes. The alternative -- folding
+        # the authored item's text into ``instructions`` and dropping it from
+        # ``input`` -- would keep the "system lives in instructions" contract
+        # unconditional, but flattens list-part content to text and discards
+        # any extra fields on the authored item; the dataset's explicit wire
+        # shape wins here.
+        leading_system: list[dict[str, Any]] = []
+        if merge_prefix is not None:
+            # Copy rather than mutate: ``rendered`` aliases the turn's
+            # raw_messages, reused across credits in a session.
+            merged = dict(rendered[0])
+            merged["content"] = self._prepend_system_text(
+                merge_prefix, merged.get("content")
+            )
+            leading_system = [merged]
+            rendered = rendered[1:]
+
+        input_items: list[dict[str, Any]] = [
+            *leading_system,
+            *context_items,
+            *rendered,
+        ]
 
         # Conversation-level fields walk turns from the end so FORK-mode
         # children whose final turn lacks model/tools still inherit the parent's
@@ -211,8 +267,11 @@ class ResponsesEndpoint(BaseEndpoint):
             "model": model_name or model_endpoint.primary_model_name,
             "stream": model_endpoint.endpoint.streaming,
         }
+        if request_info.previous_response_id:
+            payload["previous_response_id"] = request_info.previous_response_id
+
         for key, value in (
-            ("instructions", request_info.system_message or None),
+            ("instructions", instructions),
             ("max_output_tokens", max_tokens),
             ("tools", self._latest_turn_attr(turns, "raw_tools")),
         ):
@@ -226,8 +285,158 @@ class ResponsesEndpoint(BaseEndpoint):
 
         self._maybe_enable_usage_stream_options(payload, model_endpoint)
 
-        self.trace(lambda: f"Formatted payload: {payload}")
-        return payload
+        merged_shipped = merge_prefix is not None and payload["input"] is input_items
+        return payload, merged_shipped
+
+    @staticmethod
+    def _outgoing_previous_response_id(request_info: RequestInfo) -> str | None:
+        """The ``previous_response_id`` the payload will actually carry.
+
+        Endpoint ``extra`` and the dispatching turn's ``extra_body`` are applied
+        after the payload is built and win over the session's value, including
+        an explicit ``None`` that breaks the chain.
+        """
+        outgoing = request_info.previous_response_id
+        for overrides in (
+            dict(request_info.model_endpoint.endpoint.extra or {}),
+            request_info.turns[-1].extra_body or {},
+        ):
+            if "previous_response_id" in overrides:
+                outgoing = overrides["previous_response_id"]
+        return outgoing
+
+    def _system_prompt_already_stored(self, request_info: RequestInfo) -> bool:
+        """Whether the chain this request continues already holds the prompt.
+
+        The session flag describes the session's last stored response, so it
+        only applies when the outgoing ``previous_response_id`` is still that
+        response; an override to another response or to ``None`` does not
+        inherit it.
+        """
+        return bool(
+            request_info.previous_response_id
+            and request_info.system_prompt_in_stored_history
+            and self._outgoing_previous_response_id(request_info)
+            == request_info.previous_response_id
+        )
+
+    def _system_prompt_carrier(
+        self, request_info: RequestInfo, rendered: list[dict[str, Any]]
+    ) -> tuple[str | None, str | None]:
+        """Decide how this request carries ``system_message``.
+
+        Returns ``(instructions, merge_prefix)``: at most one is set, and
+        ``merge_prefix`` means "prepend to the authored leading system item".
+        When the chained response's stored history already holds the prompt
+        as an input item, neither is set: top-level ``instructions`` is not
+        carried across ``previous_response_id``, but stored input items are,
+        so sending it again would double the prompt.
+        """
+        system_message = request_info.system_message or None
+        if system_message is None or self._system_prompt_already_stored(request_info):
+            return None, None
+        if (
+            rendered
+            and isinstance(rendered[0], dict)
+            and rendered[0].get("role") == "system"
+        ):
+            return None, system_message
+        return system_message, None
+
+    def stored_history_has_system_prompt(self, request_info: RequestInfo) -> bool:
+        """Whether the stored history of the response to ``request_info``
+        contains the system prompt.
+
+        The worker records this next to the response ID on success only, so
+        the flag always describes the response being chained onto. It holds
+        when the request still chains onto a history that carried the prompt,
+        or when the merged input item survived onto the wire; prompts sent as
+        ``instructions`` are not stored. Both are read from the built payload
+        so explicit overrides of ``input`` or ``previous_response_id`` are
+        reflected rather than inferred from the turns.
+        """
+        if not request_info.system_message:
+            return False
+        _, merged_shipped = self._build_payload(request_info)
+        return self._system_prompt_already_stored(request_info) or merged_shipped
+
+    _warned_chaining_isl: bool = False
+
+    def _warn_chaining_isl_once(self) -> None:
+        """Warn once that chained turns only send the newest turn on the wire.
+
+        With ``previous_response_id`` the prior history lives server-side, so
+        client-side Input Sequence Length (the default) reflects only the newest
+        turn and undercounts the prompt the server actually prefills. Server-side
+        token counts (``use_server_token_count``) report the true prompt size.
+        """
+        if (
+            self._warned_chaining_isl
+            or self.model_endpoint.endpoint.use_server_token_count
+        ):
+            return
+        self._warned_chaining_isl = True
+        self.warning(
+            "Stateful Responses chaining is active (previous_response_id): only "
+            "the newest turn is sent on the wire, so client-side Input Sequence "
+            "Length undercounts the server-side prompt for chained turns. Enable "
+            "--use-server-token-count for accurate multi-turn ISL."
+        )
+
+    def extract_response_id(self, record: RequestRecord) -> str | None:
+        """Extract the server-generated response ID (``resp_<hash>``) for stateful
+        chaining, but only when storage was requested for this run.
+
+        ``store`` is a *request* parameter, not a standard field of the Responses
+        object: the OpenAI spec does not list it on the response, and real
+        servers (e.g. vLLM's agentic-api) accept it on the request but never
+        serialize it back onto ``response.created`` / ``response.completed``.
+        Gating on the echoed response ``store`` therefore never fires against
+        those servers and silently disables chaining. We instead chain when
+        storage was requested via ``--extra-inputs store:true`` (endpoint
+        ``extra``); a server that *does* echo ``store: true`` is honored too.
+        When neither is set we return ``None`` so the caller falls back to
+        sending the full history.
+
+        The response object lives under ``response`` for streaming lifecycle
+        events (``response.created`` / ``response.completed`` / ...) and at the
+        top level for a non-streaming response body.
+
+        A request that returns HTTP 200 but fails does not set
+        ``RequestRecord.error``. Streaming signals this via a
+        ``response.failed`` / ``response.incomplete`` event; a non-streaming
+        body signals it via top-level ``status``. In either case the advertised
+        id belongs to an aborted response, so chaining onto it would corrupt the
+        next turn and we return ``None`` regardless of the advertised id.
+        """
+        store_requested = self._store_requested()
+        resp_id: str | None = None
+        for response in record.responses:
+            json_obj = response.get_json()
+            if not isinstance(json_obj, dict):
+                continue
+            if _replay.is_failure_event(json_obj):
+                return None
+            nested = json_obj.get("response")
+            source = nested if isinstance(nested, dict) else json_obj
+            if _replay.is_failure_status(source):
+                return None
+            candidate = source.get("id")
+            if not (isinstance(candidate, str) and candidate):
+                continue
+            if store_requested or source.get("store"):
+                resp_id = candidate
+        return resp_id
+
+    def _store_requested(self) -> bool:
+        """Whether the run requested server-side storage via endpoint ``extra``.
+
+        ``EndpointInfo.extra`` is a list of ``(key, value)`` pairs; ``store`` may
+        arrive as a bool or a string depending on how ``--extra-inputs`` was
+        supplied.
+        """
+        store = dict(self.model_endpoint.endpoint.extra or []).get("store")
+        return is_truthy_flag(store)
 
     @staticmethod
     def _maybe_enable_usage_stream_options(
@@ -450,7 +659,8 @@ class ResponsesEndpoint(BaseEndpoint):
         tokens:
 
         - ``message`` items contribute their ``output_text`` parts.
-        - ``reasoning`` items contribute their ``summary_text`` parts.
+        - ``reasoning`` items contribute their ``reasoning_text`` parts, or
+          their ``summary_text`` parts when there are none.
         - ``function_call`` items contribute ``name`` + ``arguments`` -
           the model generated those tokens, and the server's
           ``usage.completion_tokens`` already counts them, so client-side
@@ -514,25 +724,39 @@ class ResponsesEndpoint(BaseEndpoint):
         """
         item_type = item.get("type")
         if item_type == "reasoning":
-            ResponsesEndpoint._collect_reasoning_summary(item, reasoning_parts)
+            ResponsesEndpoint._collect_reasoning(item, reasoning_parts)
         elif item_type == "message":
             ResponsesEndpoint._collect_message_content(item, text_parts)
         elif item_type == "function_call":
             ResponsesEndpoint._collect_function_call(item, tool_call_parts)
 
     @staticmethod
-    def _collect_reasoning_summary(
-        item: dict[str, Any], reasoning_parts: list[str]
-    ) -> None:
-        """Append non-empty ``summary_text`` strings from a reasoning item."""
-        summary = item.get("summary")
-        if not isinstance(summary, list):
-            return
-        for part in summary:
-            if isinstance(part, dict) and part.get("type") == "summary_text":
-                text = part.get("text")
-                if text:
-                    reasoning_parts.append(text)
+    def _collect_reasoning(item: dict[str, Any], reasoning_parts: list[str]) -> None:
+        """Append a reasoning item's text: its ``reasoning_text`` content parts,
+        else its ``summary_text`` parts.
+
+        ``reasoning_text`` is the full reasoning, matching the streaming
+        ``response.reasoning_text.delta`` events; servers such as vLLM serving
+        gpt-oss return it with an empty ``summary``. A summary condenses the
+        same reasoning, so taking both would count it twice.
+        """
+        reasoning_parts.extend(
+            ResponsesEndpoint._part_texts(item.get("content"), "reasoning_text")
+            or ResponsesEndpoint._part_texts(item.get("summary"), "summary_text")
+        )
+
+    @staticmethod
+    def _part_texts(parts: Any, part_type: str) -> list[str]:
+        if not isinstance(parts, list):
+            return []
+        return [
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("type") == part_type
+            and isinstance(part.get("text"), str)
+            and part["text"]
+        ]
 
     @staticmethod
     def _collect_message_content(item: dict[str, Any], text_parts: list[str]) -> None:

@@ -51,8 +51,9 @@ class SpecDecodeAcceptanceRecord(AIPerfBaseModel):
     )
     acceptance_histogram: dict[NonNegativeInt, NonNegativeInt] = Field(
         description="Sparse map from accepted draft count j to the number of "
-        "verification steps that accepted exactly j draft tokens. Keys are "
-        "integers (int-cast from the string JSON object keys on the wire); "
+        "verification steps that accepted exactly j draft tokens. Engine "
+        "adapters populate it (e.g. vLLM inflates its dense on-the-wire "
+        "list[int], dropping zero-count buckets); keys are integers and "
         "zero-count buckets are omitted. Excludes the bonus token.",
     )
     num_accepted_draft_tokens: int = Field(
@@ -130,6 +131,11 @@ class SpecDecodeAcceptanceRecord(AIPerfBaseModel):
             raise ValueError(
                 f"num_accepted_draft_tokens ({self.num_accepted_draft_tokens}) "
                 f"exceeds num_draft_tokens ({self.num_draft_tokens})"
+            )
+        if self.num_spec_steps == 0 and self.num_draft_tokens > 0:
+            raise ValueError(
+                f"num_draft_tokens is {self.num_draft_tokens}, but num_spec_steps "
+                "is 0: every proposed draft is verified in some step"
             )
         self._check_per_step_invariants()
         return self

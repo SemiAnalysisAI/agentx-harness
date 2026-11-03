@@ -19,7 +19,7 @@ A mock server for integration testing and performance benchmarking of LLM applic
 - [**Error Injection**](#error-injection): Reproducible fault testing with configurable error rates
 - [**Deterministic Responses**](#token-generation): Hash-based generation for identical outputs
 - [**Fast Mode**](#quick-start): Zero-latency mode (`--fast`) for integration testing
-- [**Corpus**](#corpus): Pre-tokenized corpus loaded from aiperf's shakespeare.txt for deterministic output
+- [**Corpus**](#tokenizer-options): Pre-tokenized corpus loaded from aiperf's shakespeare.txt for deterministic output
 - [**Request Recording**](#request-recording): Per-request ISL + requested OSL capture with JSONL output and a shutdown summary
 
 ### Supported Endpoints
@@ -29,6 +29,7 @@ A mock server for integration testing and performance benchmarking of LLM applic
 | Endpoint | Description |
 |----------|-------------|
 | [`/v1/chat/completions`](#chat-completions) | OpenAI chat completions (streaming supported) |
+| `/v1/responses` | OpenAI Responses API (non-streaming; `max_output_tokens` recorded as `max_completion_tokens` in JSONL) |
 | `/v1/messages` | Anthropic Messages API (streaming, thinking, tool_use, disjoint cache accounting; requires `anthropic-version` header and `max_tokens`) |
 | [`/v1/completions`](#text-completions) | OpenAI text completions (streaming supported) |
 | [`/v1/embeddings`](#embeddings) | OpenAI embeddings (768-dim) |
@@ -138,6 +139,25 @@ Configuration via CLI arguments or environment variables (`MOCK_SERVER_` prefix)
 |--------|---------|-------------|
 | `--error-rate` | `0.0` | Error injection rate (0-100%) |
 | `--random-seed` | `None` | Seed for reproducible errors |
+
+### Speculative Decoding
+
+Emits a per-request speculative-decoding acceptance payload on chat and
+completions responses (streaming and non-streaming), so AIPerf's spec-decode
+adapters and metrics can be exercised without a GPU. Off by default, so
+responses are unchanged unless enabled.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--spec-decode-enabled` | `false` | Emit the acceptance payload |
+| `--spec-decode-flavor` | `vllm` | Wire format: `vllm` (response-root `metrics.speculative_decoding`) or `trtllm` (per-choice `speculative_decoding`, TensorRT-LLM field names) |
+| `--spec-decode-num-spec-tokens` | `3` | Draft budget per step, emitted as `num_spec_tokens` |
+| `--spec-decode-acceptance-rate` | `0.5` | Target fraction of drafted tokens accepted (0.0-1.0) |
+
+The emitted counts are derived from each response's own `completion_tokens`, so
+acceptance and usage stay consistent. As with every option, these can also be
+set through `MOCK_SERVER_`-prefixed environment variables, e.g.
+`MOCK_SERVER_SPEC_DECODE_ENABLED=true`.
 
 ### GPU Telemetry
 
@@ -405,7 +425,7 @@ Multiple endpoints simulate different LLM backends:
 
 ### Latency Models
 
-**LLM Endpoints** (`/v1/chat/completions`, `/v1/completions`, `/v1/custom-multimodal`):
+**LLM Endpoints** (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/custom-multimodal`):
 - Streaming: TTFT delay before first token, ITL between subsequent tokens
 - Non-streaming: TTFT + (ITL × token_count)
 
@@ -581,8 +601,8 @@ flowchart LR
 | Field | Meaning |
 |---|---|
 | `isl` | Real tokenized length of the assembled prompt (always populated). |
-| `requested_osl` | Resolved OSL cap: `max_completion_tokens or max_tokens` for chat, `max_tokens` for completions, `parameters.max_new_tokens` for TGI. `null` for embeddings/ranking/image retrieval. |
-| `max_tokens` / `max_completion_tokens` | The raw fields the client sent — useful to see which API name-space they used. TGI's `max_new_tokens` is recorded under `max_tokens` so the schema stays uniform. |
+| `requested_osl` | Resolved OSL cap: `max_completion_tokens or max_tokens` for chat, `max_output_tokens` for responses, `max_tokens` for completions, `parameters.max_new_tokens` for TGI. `null` for embeddings/ranking/image retrieval. |
+| `max_tokens` / `max_completion_tokens` | The raw fields the client sent — useful to see which API name-space they used. TGI's `max_new_tokens` is recorded under `max_tokens`; the Responses API's `max_output_tokens` is recorded under `max_completion_tokens`. Both keep the JSONL schema uniform across endpoint types. |
 | `min_tokens` | Floor on generated tokens (vllm/SGLang). |
 | `ignore_eos` | If `true`, server generates exactly `max_tokens`. |
 | `reasoning_effort` | `low`/`medium`/`high` for reasoning models — adds a reasoning budget on top of the main output. |

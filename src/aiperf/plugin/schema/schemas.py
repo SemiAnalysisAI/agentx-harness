@@ -256,6 +256,13 @@ class EndpointMetadata(BaseModel):
     produces_tokens: bool = Field(
         ..., description="Whether endpoint produces token-based output."
     )
+    supports_cache_bust: bool = Field(
+        default=False,
+        description=(
+            "Whether the endpoint formatter can apply a cache-bust marker to "
+            "the structured request payload."
+        ),
+    )
     supports_audio: bool = Field(
         default=False, description="Whether endpoint accepts audio input."
     )
@@ -484,6 +491,15 @@ class PublicDatasetLoaderMetadata(BaseModel):
     has_timing_data: bool = Field(
         default=False,
         description="Whether the loader emits timestamps suitable for fixed-schedule replay.",
+    )
+    category: str | None = Field(
+        default=None,
+        description=(
+            "Filter dataset rows to a specific category value. Used by loaders "
+            "that expose per-category subsets as separate selectable datasets "
+            "(e.g. SPEED-Bench). Mirrors the field of the same name on "
+            "CustomDatasetLoaderMetadata."
+        ),
     )
     prompt_template: str | None = Field(
         default=None,

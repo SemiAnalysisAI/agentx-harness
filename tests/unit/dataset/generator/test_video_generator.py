@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import soundfile as sf
 from PIL import Image
@@ -224,7 +225,7 @@ class TestVideoGenerator:
     @pytest.mark.parametrize(
         "video_format,codec,expected_movflags",
         [
-            (VideoFormat.MP4, "libx264", "faststart"),
+            (VideoFormat.MP4, "libvpx-vp9", "faststart"),
             (VideoFormat.WEBM, "libvpx-vp9", None),
         ],
     )
@@ -377,7 +378,7 @@ class TestVideoGeneratorAudio:
         "video_format,expected_codec",
         [
             (VideoFormat.WEBM, VideoAudioCodec.LIBVORBIS),
-            (VideoFormat.MP4, VideoAudioCodec.AAC),
+            (VideoFormat.MP4, VideoAudioCodec.LIBOPUS),
         ],
     )
     def test_resolve_audio_codec_auto_select(self, video_format, expected_codec):
@@ -388,7 +389,7 @@ class TestVideoGeneratorAudio:
             duration=0.5,
             fps=2,
             format=video_format,
-            codec="libvpx-vp9" if video_format == VideoFormat.WEBM else "libx264",
+            codec="libvpx-vp9",
             synth_type=VideoSynthType.MOVING_SHAPES,
             audio=VideoAudioConfig(channels=1, codec=None),
         )
@@ -414,7 +415,8 @@ class TestVideoGeneratorAudio:
             generator._resolve_audio_codec()
 
     @pytest.mark.parametrize(
-        "explicit_codec", [VideoAudioCodec.LIBOPUS, VideoAudioCodec.AAC]
+        "explicit_codec",
+        [VideoAudioCodec.LIBOPUS, VideoAudioCodec.LIBVORBIS, VideoAudioCodec.AAC],
     )
     def test_resolve_audio_codec_explicit_override(self, explicit_codec):
         """Explicit codec beats auto-select."""
@@ -619,6 +621,25 @@ class TestVideoAudioBitDepth:
         data, sr = sf.read(io.BytesIO(wav_bytes))
         assert len(data) > 0
         assert sr == 44100  # default sample rate
+
+    @pytest.mark.parametrize("bit_depth", [8, 16, 24, 32])
+    def test_video_audio_bit_depth_preserves_signal_amplitude(
+        self, base_config: VideoConfig, bit_depth: int
+    ) -> None:
+        """Each video audio depth preserves amplitude relative to int32."""
+        base_config.audio = VideoAudioConfig(channels=1, depth=32)
+        reference, _ = sf.read(
+            io.BytesIO(VideoGenerator(base_config)._generate_audio_data())
+        )
+        base_config.audio.depth = bit_depth
+        actual, _ = sf.read(
+            io.BytesIO(VideoGenerator(base_config)._generate_audio_data())
+        )
+
+        actual_rms = np.sqrt(np.mean(actual**2))
+        reference_rms = np.sqrt(np.mean(reference**2))
+        assert actual_rms == pytest.approx(reference_rms, rel=1e-3)
+        assert actual_rms == pytest.approx(0.3, rel=0.1)
 
     def test_video_audio_8bit_is_unsigned(self):
         """8-bit video audio values are in unsigned range (0-255 centered at 128).

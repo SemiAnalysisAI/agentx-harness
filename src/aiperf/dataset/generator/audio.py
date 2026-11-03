@@ -82,6 +82,12 @@ class AudioGenerator(BaseGenerator):
         self._format_rng = rng.derive("dataset.audio.format")
         self._data_rng = rng.derive("dataset.audio.data")
 
+        # Duration (seconds) sampled by the most recent ``generate()`` call.
+        # The composer hoists it onto ``Turn.audio_duration_seconds`` so ASR
+        # metrics (RTFx) work for synthetic audio, mirroring what ASR dataset
+        # loaders set (see ``hf_asr``).
+        self.last_audio_duration_seconds: float = 0.0
+
     def _validate_sampling_rate(
         self, sampling_rate_hz: int, audio_format: AudioFormat
     ) -> None:
@@ -144,6 +150,7 @@ class AudioGenerator(BaseGenerator):
         audio_length = self._duration_rng.sample_normal(
             length_mean, length_stddev, lower=0.01
         )
+        self.last_audio_duration_seconds = audio_length
 
         # Randomly select sampling rate and bit depth
         sampling_rate_hz = int(
@@ -161,11 +168,10 @@ class AudioGenerator(BaseGenerator):
             self._data_rng, num_samples, self.config.channels
         )
 
-        # Scale to the appropriate bit depth range
-        # Note: For 8-bit, we use int16 input and let soundfile convert to PCM_U8
+        # soundfile scales integer samples by their dtype, including int32
+        # input for PCM_24 and int16 input for PCM_U8.
         numpy_type, _ = SUPPORTED_BIT_DEPTHS[bit_depth]
-        scale_depth = 16 if bit_depth == 8 else bit_depth
-        max_val = 2 ** (scale_depth - 1) - 1
+        max_val = np.iinfo(numpy_type).max
         audio_data = (signal * max_val).astype(numpy_type)
 
         # Write audio using soundfile

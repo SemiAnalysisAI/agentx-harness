@@ -7,7 +7,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+from aiperf.common.constants import SYSTEM_PROMPT_JOIN_SEP
 from aiperf.common.enums import MediaType
+from aiperf.common.environment import Environment
 from aiperf.common.mixins import AIPerfLoggerMixin
 from aiperf.common.models import (
     BaseResponseData,
@@ -85,6 +87,14 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         record._parsed_responses_cache = parsed_responses
         return parsed_responses
 
+    def extract_response_id(self, record: RequestRecord) -> str | None:
+        """Extract server-generated response ID for stateful session chaining.
+
+        Default returns None (stateless). Subclasses implementing stateful protocols
+        (e.g. ResponsesEndpoint) override this.
+        """
+        return None
+
     def process_responses(
         self,
         record: RequestRecord,
@@ -106,30 +116,48 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
 
     @staticmethod
     def extract_spec_decode_stats(json_obj: dict[str, Any]) -> dict[str, Any] | None:
-        """Capture the raw ``choices[0]`` speculative-decoding payload, if any.
+        """Capture the raw speculative-decoding payload, wherever the engine put it.
 
-        vLLM attaches ``speculative_decoding_stats`` per choice (the finish-reason
-        chunk in streaming). Captured verbatim and uninterpreted so a
-        ``SpecDecodeAdapterProtocol`` owns the engine-specific interpretation
-        downstream; None when absent.
+        Two placements are recognized, because the engines genuinely differ:
+
+        - **Response root** ``metrics.speculative_decoding`` (vLLM), on the body
+          non-streaming or on the trailing usage chunk (empty ``choices``)
+          streaming, when the server runs with
+          ``--per-request-spec-decode-metrics``.
+        - **Per choice** ``choices[0].speculative_decoding`` (TensorRT-LLM), on
+          the body non-streaming or on the terminal chunk's choice (the one
+          carrying ``finish_reason``) streaming, when the server sets
+          ``per_request_spec_decode_stats``.
+
+        Root wins when both somehow appear. Captured verbatim and uninterpreted
+        so a ``SpecDecodeAdapterProtocol`` owns the engine-specific
+        interpretation downstream; None when absent.
 
         A response with more than one choice is an ``n > 1`` non-streaming
-        request; its record is suppressed (None) because a single per-request
-        record can't attribute request-level usage to one sequence -- reporting
-        one choice's acceptance alongside all choices' token count would be a
-        mixed, misleading record. (``n > 1`` streaming is suppressed in the
-        parser, where each sequence's stats arrive on separate chunks.)
+        request; its per-choice payload is suppressed because a single
+        per-request record cannot attribute request-level usage to one sequence
+        -- reporting one choice's acceptance alongside all choices' token count
+        would be a mixed, misleading record. (``n > 1`` streaming is suppressed
+        in the parser from the request's own ``n``, since each sequence's stats
+        arrive on separate chunks and a sequence that never drafted sends none.)
+        The root placement needs no such guard: vLLM populates it only for
+        single-sequence requests, leaving it ``null`` otherwise.
         """
+        metrics = json_obj.get("metrics")
+        if isinstance(metrics, dict):
+            stats = metrics.get("speculative_decoding")
+            if isinstance(stats, dict):
+                return stats
+
         choices = json_obj.get("choices")
         if (
             not isinstance(choices, list)
-            or not choices
+            or len(choices) != 1
             or not isinstance(choices[0], dict)
         ):
             return None
-        if len(choices) > 1:
-            return None
-        return choices[0].get("speculative_decoding_stats")
+        stats = choices[0].get("speculative_decoding")
+        return stats if isinstance(stats, dict) else None
 
     def build_assistant_turn(self, record: RequestRecord) -> Turn | None:
         """Build a Turn representing the assistant response for context replay.
@@ -139,16 +167,16 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         that inherit the parent's history - see what the model actually said.
 
         The default implementation captures plain text plus the ``content``
-        field of any ``ReasoningResponseData``. When a response carries only
-        ``reasoning`` (some servers and the mock return everything in that
-        field with empty ``content`` - e.g. Qwen3-style outputs), the
-        reasoning text is used as a fallback so FORK-mode DAG children
-        still inherit a non-empty parent context. Endpoints whose responses
-        carry structured fields beyond plain text (e.g. chat ``tool_calls``
-        / ``function_call``) should override this to preserve those fields
-        verbatim by returning a Turn whose ``raw_messages`` re-renders as
-        the same assistant message - that way ``build_messages`` extends
-        them back into the wire body unchanged.
+        field of any ``ReasoningResponseData``, dropping ``reasoning`` the
+        way chat templates drop prior-turn thinking. When the whole reply
+        carries only ``reasoning`` (a turn truncated mid-thinking, or the
+        mock server's Qwen3-style output), the reasoning text is used as a
+        fallback so FORK-mode DAG children still inherit a non-empty parent
+        context. Endpoints whose responses carry structured fields beyond
+        plain text (e.g. chat ``tool_calls`` / ``function_call``) should
+        override this to preserve those fields verbatim by returning a Turn
+        whose ``raw_messages`` re-renders as the same assistant message - that
+        way ``build_messages`` extends them back into the wire body unchanged.
 
         Returns ``None`` when the record has no replayable assistant content
         (error response, empty body, etc.).
@@ -162,21 +190,22 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         parsed_responses: list[ParsedResponse],
     ) -> Turn | None:
         """Build the default text-only assistant turn from parsed responses."""
-        output_texts: list[str] = []
+        answer_texts: list[str] = []
+        reasoning_texts: list[str] = []
         for response in parsed_responses:
             if not response.data:
                 continue
             if isinstance(response.data, ReasoningResponseData):
                 if response.data.content:
-                    output_texts.append(response.data.content)
-                elif response.data.reasoning:
-                    # Reasoning-only fallback: without this, FORK children
-                    # of a Qwen3-style/mock-server response would inherit
-                    # a parent context with no captured assistant turn.
-                    output_texts.append(response.data.reasoning)
+                    answer_texts.append(response.data.content)
+                if response.data.reasoning:
+                    reasoning_texts.append(response.data.reasoning)
             else:
-                output_texts.append(response.data.get_text())
-        resp_text = "".join(output_texts)
+                answer_texts.append(response.data.get_text())
+        # Decided once per reply, not per parsed response: a streamed reply
+        # splits reasoning and answer across chunks, and replaying both glues
+        # the thinking into the answer.
+        resp_text = "".join(answer_texts) or "".join(reasoning_texts)
         if not resp_text:
             return None
         return Turn(role="assistant", texts=[Text(contents=[resp_text])])
@@ -316,7 +345,8 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         part type names (e.g. ``text`` -> ``input_text`` for Responses API).
         """
         if (
-            len(turn.texts) == 1
+            not Environment.ENDPOINT.FORCE_CONTENT_PARTS
+            and len(turn.texts) == 1
             and len(turn.texts[0].contents) == 1
             and not turn.images
             and not turn.audios
@@ -352,6 +382,48 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
                 if not content:
                     continue
                 parts.append(render_fn(content))
+
+    def _prepend_system_text(self, prefix: str, content: Any) -> Any:
+        """Return ``content`` with ``prefix`` prepended, preserving its shape.
+
+        System-message content is normally a plain string, but the chat and
+        Responses schemas also permit a list of content parts; a raw-payload
+        dataset may author either. Both branches join with
+        ``SYSTEM_PROMPT_JOIN_SEP`` so the two shapes tokenize identically --
+        servers that concatenate content parts would otherwise see the verbatim
+        prompt run into the dataset's own text with no separator.
+
+        The list branch renders through ``_render_text_part`` so each caller
+        contributes its own part shape (``text`` for chat, ``input_text`` for
+        Responses) without a shape table here. A single dict is treated as a
+        one-part list. ``MessagesEndpoint`` does not use this helper: Anthropic's
+        ``system`` is already a block list, so it prepends the prompt as its
+        own block with no separator.
+
+        Content of any other shape (a number, a nested structure the schema
+        does not allow) cannot be preserved; it is dropped with a warning so a
+        malformed dataset is visible rather than silently rewritten. Empty
+        string content carries nothing to preserve and is not warned about.
+
+        Returns a new object in both cases -- callers pass content that aliases
+        reusable turn state.
+        """
+        if isinstance(content, dict):
+            content = [content]
+        if isinstance(content, list):
+            return [
+                self._render_text_part(prefix + SYSTEM_PROMPT_JOIN_SEP),
+                *content,
+            ]
+        if isinstance(content, str):
+            return f"{prefix}{SYSTEM_PROMPT_JOIN_SEP}{content}" if content else prefix
+        if content is not None:
+            self.warning(
+                f"Dropping authored system content of unsupported type "
+                f"{type(content).__name__} while merging the verbatim system "
+                "prompt; expected str, dict, or list of content parts."
+            )
+        return prefix
 
     # --- Content-part hooks: override per endpoint to change type names ------
 
@@ -435,18 +507,27 @@ class BaseEndpoint(AIPerfLoggerMixin, ABC):
         """Make a TextResponseData object from a string or return None if the text is empty."""
         return TextResponseData(text=text) if text else None
 
-    def auto_detect_and_extract(self, json_obj: dict) -> BaseResponseData | None:
+    def auto_detect_and_extract(self, json_obj: Any) -> BaseResponseData | None:
         """Optional utility: Auto-detect response type and extract relevant data.
 
         Tries to extract data in this order: embeddings, rankings, text.
         Endpoints can use this as a fallback or for flexible response handling.
 
+        A JSON body is not necessarily an object: a top-level array (e.g. a
+        reranker returning ``[{"index": 0, "score": 0.98}, ...]``) is valid
+        JSON and reaches this method as a ``list``. Such values are routed
+        through ``convert_to_response_data`` instead of the ``dict``-only
+        probes below, which would raise ``AttributeError``.
+
         Args:
-            json_obj: JSON response object
+            json_obj: JSON response body
 
         Returns:
             Typed response data object or None if not found
         """
+        if not isinstance(json_obj, dict):
+            return self.convert_to_response_data(json_obj)
+
         if data := self.try_extract_embeddings(json_obj):
             return data
 
