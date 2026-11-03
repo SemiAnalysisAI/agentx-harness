@@ -347,6 +347,32 @@ Counters are mode-agnostic (the same shape applies to FORK-only, SPAWN-only, and
 
 - `AIPERF_DAG_FAIL_FAST` (default `false`): when `true`, a DAG child error aborts its affected runtime tree, including nested descendants. Their active requests are cancelled and subsequent turns are refused; unrelated roots continue. This does not raise a whole-run failure or terminate the phase. Default `false`: the orchestrator counts the error in `BranchStats.children_errored`, releases the join slot, drains pending siblings, and continues the run.
 
+### Cancelling an aborted tree's in-flight requests
+
+With `AIPERF_DAG_FAIL_FAST=true`, a child error also requests cancellation of
+in-flight parent and orphan-sibling credits, including nested descendants in the
+affected runtime tree. Cancellation selects the logical
+session id, so FORK siblings sharing a worker are not cancelled together unless
+they are part of that aborted tree. Session and phase aborts coalesce repeated
+cancellation requests until the worker returns the credit. Aborted logical
+sessions refuse further credits, including cancelled non-final returns, parked
+continuations and dispatches waiting for prefill capacity. Normal credit-return
+accounting releases slots; sending a cancellation does not release them early.
+A cancellation transport failure is logged, and cleanup continues for the other
+siblings.
+
+
+For phases without a tree registry, the issuer records each root's slot ownership.
+An aborted group keeps that capacity until its last actual request returns,
+or until phase teardown at the grace cutoff. A root that never returns an
+authored final turn is counted once as a cancelled logical session, without
+adding a synthetic HTTP request or return. Authored final returns and cutoff
+cleanup use the same ownership ledger to avoid releasing a slot twice. Unsent
+root turns are retired from the sampled session plan when an abort settles, so
+a session-limited phase can signal sending completion without waiting for its
+duration limit or inventing wire traffic. Descendant requests remain governed
+by actual credit-return accounting.
+
 ## Reference: worked example with multiple roots
 
 A three-root file that exercises FORK fanout from each root:
@@ -402,30 +428,3 @@ With neither `--num-conversations` nor `--request-count` supplied, AIPerf logs `
 - [Multi-Turn Conversations](../tutorials/multi-turn.md) — linear multi-turn replay.
 - [Architecture](../architecture.md) — sub-agent orchestrator and credit plumbing.
 - [Conversation Context Mode](../reference/conversation-context-mode.md) — background on how history accumulates.
-
-
-### Cancelling an aborted tree's in-flight requests
-
-With `AIPERF_DAG_FAIL_FAST=true`, a child error also requests cancellation of
-in-flight parent and orphan-sibling credits, including nested descendants in the
-affected runtime tree. Cancellation selects the logical
-session id, so FORK siblings sharing a worker are not cancelled together unless
-they are part of that aborted tree. Session and phase aborts coalesce repeated
-cancellation requests until the worker returns the credit. Aborted logical
-sessions refuse further credits, including cancelled non-final returns, parked
-continuations and dispatches waiting for prefill capacity. Normal credit-return
-accounting releases slots; sending a cancellation does not release them early.
-A cancellation transport failure is logged, and cleanup continues for the other
-siblings.
-
-
-For phases without a tree registry, the issuer records each root's slot ownership.
-An aborted group keeps that capacity until its last actual request returns,
-or until phase teardown at the grace cutoff. A root that never returns an
-authored final turn is counted once as a cancelled logical session, without
-adding a synthetic HTTP request or return. Authored final returns and cutoff
-cleanup use the same ownership ledger to avoid releasing a slot twice. Unsent
-root turns are retired from the sampled session plan when an abort settles, so
-a session-limited phase can signal sending completion without waiting for its
-duration limit or inventing wire traffic. Descendant requests remain governed
-by actual credit-return accounting.
