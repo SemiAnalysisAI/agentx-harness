@@ -69,6 +69,9 @@ class LoopScheduler:
         # parallel map so the long-standing ``_handles`` tuple contract remains
         # stable for tests and diagnostics.
         self._handle_groups: dict[HandleId, str] = {}
+        # group_id -> its pending handle IDs in registration order (dict used as
+        # an ordered set), so a per-group cap touches only that group's timers.
+        self._group_handles: dict[str, dict[HandleId, None]] = {}
         self._exception_handler: Callable[[asyncio.Task], None] | None = (
             exception_handler
         )
@@ -119,9 +122,7 @@ class LoopScheduler:
         mutable list, then populate it after call_later() returns.
         """
         if handle_container[0] is not None:
-            handle_id = id(handle_container[0])
-            self._handles.pop(handle_id, None)
-            self._handle_groups.pop(handle_id, None)
+            self._untrack_handle(id(handle_container[0]))
         task = self._loop.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._done_callback)
@@ -144,7 +145,18 @@ class LoopScheduler:
         self._handles[handle_id] = (handle, coro)
         if group_id is not None:
             self._handle_groups[handle_id] = group_id
+            self._group_handles.setdefault(group_id, {})[handle_id] = None
         return handle_id
+
+    def _untrack_handle(self, handle_id: HandleId) -> None:
+        self._handles.pop(handle_id, None)
+        group_id = self._handle_groups.pop(handle_id, None)
+        if group_id is not None:
+            members = self._group_handles.get(group_id)
+            if members is not None:
+                members.pop(handle_id, None)
+                if not members:
+                    del self._group_handles[group_id]
 
     def execute_async(self, coro: Coroutine) -> asyncio.Task:
         """Execute coroutine asynchronously (creates a task and returns it immediately).
@@ -288,10 +300,10 @@ class LoopScheduler:
         Returns:
             True if the coroutine was cancelled, False if it was not found.
         """
-        handle_data = self._handles.pop(handle_id, None)
+        handle_data = self._handles.get(handle_id)
         if handle_data is None:
             return False
-        self._handle_groups.pop(handle_id, None)
+        self._untrack_handle(handle_id)
         handle, coro = handle_data
         handle.cancel()
         coro.close()
@@ -307,6 +319,7 @@ class LoopScheduler:
         items = list(self._handles.values())
         self._handles.clear()
         self._handle_groups.clear()
+        self._group_handles.clear()
 
         # Cancel handles first, then close coroutines
         for handle, coro in items:
@@ -375,6 +388,7 @@ class LoopScheduler:
         ]
         self._handles.clear()
         self._handle_groups.clear()
+        self._group_handles.clear()
         for handle, coro, group_id in items:
             target = max(now, handle.when() - shift_sec)
             handle.cancel()
@@ -404,9 +418,8 @@ class LoopScheduler:
         if max_delay_sec < 0:
             raise ValueError("max_delay_sec must be non-negative")
         selected = [
-            (handle_id, handle, coro)
-            for handle_id, (handle, coro) in self._handles.items()
-            if self._handle_groups.get(handle_id) == group_id
+            (handle_id, *self._handles[handle_id])
+            for handle_id in self._group_handles.get(group_id, ())
         ]
         if not selected:
             return 0.0
@@ -422,8 +435,7 @@ class LoopScheduler:
             return 0.0
 
         for handle_id, handle, coro in selected:
-            self._handles.pop(handle_id, None)
-            self._handle_groups.pop(handle_id, None)
+            self._untrack_handle(handle_id)
             target = max(now, handle.when() - shift_sec)
             handle.cancel()
             handle_container = [None]
