@@ -207,6 +207,9 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # a live stream returns, breadth-first ahead of zero-idle follow-ups.
         self._burst_cap_by_lane: dict[int, int] = {}
         self._burst_in_flight: Counter[int] = Counter()
+        # The (x_correlation_id, turn_index) pairs holding each lane's slots,
+        # so a slot that never comes back can be named.
+        self._burst_in_flight_turns: dict[int, set[tuple[str, int]]] = {}
         self._burst_pending_states: dict[int, deque[ConversationState]] = {}
         self._burst_pending_follow_ups: dict[int, deque[Credit]] = {}
         self._root_to_lane: dict[str, int] = {}
@@ -503,7 +506,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._baseline_warmup_admitted += 1
             return TurnAdmission.ADMIT
         if self._cache_warmup_requests_per_lane is None:
-            self._burst_in_flight[lane] += 1
+            self._take_burst_slot(lane, turn)
             return TurnAdmission.ADMIT
         if (
             self._cache_warmup_requests_by_lane[lane]
@@ -517,7 +520,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._quota_handoff_turns[state_key] = turn
             return TurnAdmission.DEFER
         self._cache_warmup_requests_by_lane[lane] += 1
-        self._burst_in_flight[lane] += 1
+        self._take_burst_slot(lane, turn)
         if not self._cache_warmup_request_budget_reached and all(
             self._cache_warmup_requests_by_lane[lane_index]
             >= self._cache_warmup_requests_per_lane
@@ -943,8 +946,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             f"lane {lane}: count={self._cache_warmup_requests_by_lane[lane]} "
             f"cap={self._burst_cap_by_lane.get(lane)} "
             f"in_flight={self._burst_in_flight[lane]} "
+            f"holding={sorted(self._burst_in_flight_turns.get(lane, ()))[:3]} "
             f"pending_states={len(self._burst_pending_states.get(lane) or ())} "
-            f"pending_follow_ups={len(self._burst_pending_follow_ups.get(lane) or ())}"
+            f"pending_follow_ups="
+            f"{[(c.x_correlation_id, c.turn_index) for c in list(self._burst_pending_follow_ups.get(lane) or ())[:3]]}"
             for lane in below[:5]
         )
         self.info(
@@ -982,6 +987,12 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         return (
             per_lane is not None
             and self._cache_warmup_requests_by_lane[lane] >= per_lane
+        )
+
+    def _take_burst_slot(self, lane: int, turn: TurnToSend) -> None:
+        self._burst_in_flight[lane] += 1
+        self._burst_in_flight_turns.setdefault(lane, set()).add(
+            (turn.x_correlation_id, turn.turn_index)
         )
 
     def _burst_lane_for_credit(self, credit: Credit) -> int | None:
@@ -1061,6 +1072,9 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             return
         if self._burst_in_flight[lane] > 0:
             self._burst_in_flight[lane] -= 1
+        self._burst_in_flight_turns.get(lane, set()).discard(
+            (credit.x_correlation_id, credit.turn_index)
+        )
         if self._burst_pending_states.get(lane) or self._burst_pending_follow_ups.get(
             lane
         ):
