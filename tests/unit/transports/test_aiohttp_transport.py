@@ -3,6 +3,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -554,6 +555,7 @@ class TestAioHttpTransportCancellation:
             @asynccontextmanager
             async def mock_request_cm(method, url, **req_kwargs):
                 holder["request_sent"] = True
+                holder["trace_request_ctx"] = req_kwargs.get("trace_request_ctx")
                 if complete_immediately:
                     yield mock_response
                 else:
@@ -568,7 +570,9 @@ class TestAioHttpTransportCancellation:
 
         return capture_session, holder
 
-    async def _fire_request_sent_event(self, trace_config, body_size: int = 100):
+    async def _fire_request_sent_event(
+        self, trace_config, body_size: int = 100, request_ctx=None
+    ):
         """Fire the on_request_chunk_sent trace event to signal request body was sent.
 
         Args:
@@ -578,8 +582,9 @@ class TestAioHttpTransportCancellation:
         if trace_config:
             mock_params = MagicMock()
             mock_params.chunk = b"x" * body_size  # Simulate body chunk
+            trace_ctx = SimpleNamespace(trace_request_ctx=request_ctx)
             for callback in trace_config.on_request_chunk_sent:
-                await callback(None, None, mock_params)
+                await callback(None, trace_ctx, mock_params)
 
     @pytest.mark.asyncio
     async def test_send_request_without_cancellation(
@@ -635,7 +640,9 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
 
             # Fire trace event (request chunk sent - triggers when body is fully sent)
-            await self._fire_request_sent_event(holder["trace_config"])
+            await self._fire_request_sent_event(
+                holder["trace_config"], request_ctx=holder.get("trace_request_ctx")
+            )
 
             record = await task
 
@@ -676,7 +683,9 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
 
             # Fire the trace event (simulating full request sent)
-            await self._fire_request_sent_event(holder["trace_config"])
+            await self._fire_request_sent_event(
+                holder["trace_config"], request_ctx=holder.get("trace_request_ctx")
+            )
 
             # Now wait for the task to complete (it should cancel quickly)
             record = await task
@@ -714,7 +723,9 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
 
             # Fire trace event (request chunk sent)
-            await self._fire_request_sent_event(holder["trace_config"])
+            await self._fire_request_sent_event(
+                holder["trace_config"], request_ctx=holder.get("trace_request_ctx")
+            )
 
             record = await task
 
@@ -767,7 +778,11 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
             await asyncio.sleep(0)
 
-            await self._fire_request_sent_event(holder["trace_config"], body_size=4096)
+            await self._fire_request_sent_event(
+                holder["trace_config"],
+                body_size=4096,
+                request_ctx=holder.get("trace_request_ctx"),
+            )
 
             record = await task
 
@@ -804,7 +819,9 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
 
             # Fire trace event (request chunk sent)
-            await self._fire_request_sent_event(holder["trace_config"])
+            await self._fire_request_sent_event(
+                holder["trace_config"], request_ctx=holder.get("trace_request_ctx")
+            )
 
             record = await task
 
@@ -842,7 +859,9 @@ class TestAioHttpTransportCancellation:
             await asyncio.sleep(0)
 
             # Fire trace event (request chunk sent)
-            await self._fire_request_sent_event(holder["trace_config"])
+            await self._fire_request_sent_event(
+                holder["trace_config"], request_ctx=holder.get("trace_request_ctx")
+            )
 
             record = await task
 
