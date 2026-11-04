@@ -1017,12 +1017,34 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._handoff_credits.pop(credit.x_correlation_id, None)
         else:
             self._handoff_credits[credit.x_correlation_id] = credit
+        self._release_burst_slot(credit)
+
+    def _release_burst_slot(self, credit: Credit) -> None:
+        """Free the lane slot of a returned pressure turn and keep the lane moving.
+
+        Runs for every return. A return the orchestrator intercepts (the
+        parent's next turn is gated on its children) never reaches
+        ``_handle_accelerated_warmup_return``, so the pump is scheduled here
+        whenever the lane still has pending first turns or follow-ups.
+        """
+        lane = self._burst_lane_for_credit(credit)
+        if lane is None:
+            return
+        if self._burst_in_flight[lane] > 0:
+            self._burst_in_flight[lane] -= 1
+        if self._burst_pending_states.get(lane) or self._burst_pending_follow_ups.get(
+            lane
+        ):
+            self.scheduler.schedule_later(0.0, self._pump_burst_lane(lane))
 
     async def _handle_accelerated_warmup_return(self, credit: Credit) -> None:
-        """Issue the next compressed turn or recycle a completed tree."""
+        """Issue the next compressed turn or recycle a completed tree.
+
+        The lane's in-flight slot was already released in
+        ``observe_credit_return`` (which sees every return, including the ones
+        the branch orchestrator intercepts and never routes here).
+        """
         lane = self._burst_lane_for_credit(credit)
-        if lane is not None and self._burst_in_flight[lane] > 0:
-            self._burst_in_flight[lane] -= 1
         if credit.is_final_turn:
             if credit.agent_depth == 0 and not self._has_tree_registry:
                 await self._spawn_from_recycle_or_id(
