@@ -3971,7 +3971,7 @@ async def test_cache_pressure_intercepted_return_still_frees_the_lane_slot():
     await strategy._dispatch_accelerated_trajectory(trajectory, 0)
     assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
 
-    strategy.observe_credit_return(_warmup_return("lane-0-child-live", 3, depth=1))
+    strategy.observe_credit_return(_warmup_return("lane-0-child-live", 1, depth=1))
 
     assert strategy._burst_in_flight[0] == 1
     assert len(strategy._test_scheduled_pumps) == 1
