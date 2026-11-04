@@ -65,16 +65,9 @@ AGENTX = INFERENCEX_AGENTX_MVP.model_copy(
             "SERVICE": {"PROFILE_CONFIGURE_TIMEOUT": 1800},
             "UI": {"REALTIME_METRICS_ENABLED": True},
             # 1.0.x keeps 1.0.9's request headers: no X-Session-Affinity.
-            # Pooled connections idle through the warmup cache-pressure pause
-            # (900 s) and the 300 s profiling idle cap; the 300 s default
-            # closed them from the client side. The Dynamo frontend closes
-            # idle connections on its own, so lanes still reconnect after the
-            # pause; keeping the client side open only leaves any TIME_WAIT
-            # on the server.
             "HTTP": {
                 "TCP_USER_TIMEOUT": 900000,
                 "X_SESSION_AFFINITY_FROM_CORRELATION_ID": False,
-                "KEEPALIVE_TIMEOUT": 3600,
             },
             # 1.0.x keeps the pre-watchdog behavior: one long request at low
             # concurrency can legitimately run past the 600s default.
