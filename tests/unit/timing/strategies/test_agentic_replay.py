@@ -3831,7 +3831,22 @@ async def _burst_strategy(
     issuer.issue_credit = AsyncMock(side_effect=issue)
     issuer.dispatch_child_turn = AsyncMock(side_effect=issue)
     strategy._accelerated_warmup_started = True
+    scheduled: list = []
+    strategy.scheduler.schedule_later = MagicMock(
+        side_effect=lambda delay, coro: scheduled.append(coro)
+    )
+    strategy._test_scheduled_pumps = scheduled
     return strategy, issuer, issued
+
+
+async def _return_credit(strategy: AgenticReplayStrategy, credit: Credit) -> None:
+    """Deliver a warmup return the way the callback handler does: the
+    observe hook (every return) and then the strategy's return handler."""
+    strategy.observe_credit_return(credit)
+    for coro in strategy._test_scheduled_pumps:
+        coro.close()
+    strategy._test_scheduled_pumps.clear()
+    await strategy._handle_accelerated_warmup_return(credit)
 
 
 def _warmup_return(x_correlation_id: str, turn_index: int, *, depth: int = 0) -> Credit:
@@ -3859,20 +3874,16 @@ async def test_cache_pressure_burst_caps_lane_to_streams_live_at_t_star():
     assert strategy._burst_cap_by_lane[0] == 2
     assert strategy._burst_in_flight[0] == 2
 
-    await strategy._handle_accelerated_warmup_return(_warmup_return("lane-0-root", 1))
+    await _return_credit(strategy, _warmup_return("lane-0-root", 1))
     # A freed slot goes to the next pending first turn, not to the root's follow-up.
     assert issued[2:] == [("lane-0-child-new-a", 0)]
     assert strategy._burst_in_flight[0] == 2
 
-    await strategy._handle_accelerated_warmup_return(
-        _warmup_return("lane-0-child-live", 1, depth=1)
-    )
+    await _return_credit(strategy, _warmup_return("lane-0-child-live", 1, depth=1))
     assert issued[3:] == [("lane-0-child-new-b", 0)]
 
     # Every stream has had its first pressure turn; follow-ups resume in return order.
-    await strategy._handle_accelerated_warmup_return(
-        _warmup_return("lane-0-child-new-a", 0, depth=1)
-    )
+    await _return_credit(strategy, _warmup_return("lane-0-child-new-a", 0, depth=1))
     assert issued[4:] == [("lane-0-root", 2)]
     assert strategy._burst_in_flight[0] == 2
 
@@ -3904,7 +3915,7 @@ async def test_cache_pressure_duration_cutoff_persists_pending_first_turns():
 
     await strategy._dispatch_accelerated_trajectory(trajectory, 0)
     assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
-    await strategy._handle_accelerated_warmup_return(_warmup_return("lane-0-root", 1))
+    await _return_credit(strategy, _warmup_return("lane-0-root", 1))
     assert issued[2:] == [("lane-0-child-new-a", 0)]
 
     await strategy._finish_accelerated_warmup()
@@ -3945,3 +3956,22 @@ async def test_warmup_primers_close_their_connection_but_pressure_turns_do_not()
     # not exercised; only the connection flag is under test.)
     assert pressure and all(not t.close_connection for t in pressure)
     assert ("lane-0-root", 1) in {(t.x_correlation_id, t.turn_index) for t in pressure}
+
+
+@pytest.mark.asyncio
+async def test_cache_pressure_intercepted_return_still_frees_the_lane_slot():
+    """A child whose return the orchestrator intercepts never reaches
+    _handle_accelerated_warmup_return; the slot must still be freed and the
+    lane pumped, or a one-slot lane would stall for the rest of the stage."""
+    strategy, _, issued = await _burst_strategy(requests_per_lane=10)
+    trajectory = strategy.conversation_source.trajectories[0]
+    await strategy._dispatch_accelerated_trajectory(trajectory, 0)
+    assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
+
+    strategy.observe_credit_return(_warmup_return("lane-0-child-live", 3, depth=1))
+
+    assert strategy._burst_in_flight[0] == 1
+    assert len(strategy._test_scheduled_pumps) == 1
+    await strategy._test_scheduled_pumps.pop()
+    assert issued[2:] == [("lane-0-child-new-a", 0)]
+    assert strategy._burst_in_flight[0] == 2
