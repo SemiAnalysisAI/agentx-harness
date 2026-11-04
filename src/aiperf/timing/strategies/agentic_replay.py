@@ -58,6 +58,8 @@ next root drawn from the shared dataset sampler
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from collections import Counter, deque
@@ -213,6 +215,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # Slot owner -> lane, recorded at admission so the release never
         # depends on re-resolving the lane from the (mutable) lane maps.
         self._burst_slot_lane: dict[tuple[str, int], int] = {}
+        self._burst_dispatchable_by_lane: dict[int, int] = {}
         self._burst_slot_lane_mismatches = 0
         self._burst_pending_states: dict[int, deque[ConversationState]] = {}
         self._burst_pending_follow_ups: dict[int, deque[Credit]] = {}
@@ -931,6 +934,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             if state.x_correlation_id in self._baseline_correlations
         )
         self._burst_cap_by_lane[lane] = max(1, live_streams)
+        self._burst_dispatchable_by_lane[lane] = len(dispatchable)
         self._burst_pending_states[lane] = deque(dispatchable)
         await self._pump_burst_lane(lane)
 
@@ -963,6 +967,37 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             + (f" (sample: {sample})" if sample else "")
         )
         self.scheduler.schedule_later(60.0, self._log_cache_pressure_progress())
+
+    def _dump_handoff_states(
+        self, states_by_lane: dict[int, list[ConversationState]]
+    ) -> None:
+        """Write the handoff (one line per live stream) when
+        AIPERF_AGENTX_HANDOFF_DUMP names a file; development aid for parity checks."""
+        path = os.environ.get("AIPERF_AGENTX_HANDOFF_DUMP")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            for lane, states in states_by_lane.items():
+                for state in states:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "lane": lane,
+                                "conversation_id": state.conversation_id,
+                                "x_correlation_id": state.x_correlation_id,
+                                "root_correlation_id": state.root_correlation_id,
+                                "next_turn_index": state.next_turn_index,
+                                "agent_depth": state.agent_depth,
+                                "waiting_on_children": state.waiting_on_children,
+                                "cap": self._burst_cap_by_lane.get(lane),
+                                "dispatchable": self._burst_dispatchable_by_lane.get(
+                                    lane
+                                ),
+                                "quota_used": self._cache_warmup_requests_by_lane[lane],
+                            }
+                        )
+                        + "\n"
+                    )
 
     def _burst_state_turn(self, state: ConversationState) -> TurnToSend:
         session = self.conversation_source.session_for_state(state)
@@ -1157,6 +1192,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             return
         self._flush_burst_pending_to_handoff()
         states_by_lane = self._build_handoff_states()
+        self._dump_handoff_states(states_by_lane)
         boundaries_by_lane = {
             lane: self._build_handoff_replay_boundaries(states)
             for lane, states in states_by_lane.items()
