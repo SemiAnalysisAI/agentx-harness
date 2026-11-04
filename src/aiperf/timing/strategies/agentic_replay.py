@@ -200,6 +200,15 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         self._baseline_warmup_turns: set[tuple[str, int]] = set()
         self._accelerated_warmup_started = False
         self._handoff_credits: dict[str, Credit] = {}
+        # Cache-pressure stage concurrency: each lane may only have as many
+        # streams in flight as the trace had live (started, unfinished) at t*,
+        # i.e. the streams stage 1 primed. Streams that had not sent their
+        # first request by t* wait in ``_burst_pending_states`` and start when
+        # a live stream returns, breadth-first ahead of zero-idle follow-ups.
+        self._burst_cap_by_lane: dict[int, int] = {}
+        self._burst_in_flight: Counter[int] = Counter()
+        self._burst_pending_states: dict[int, deque[ConversationState]] = {}
+        self._burst_pending_follow_ups: dict[int, deque[Credit]] = {}
         self._root_to_lane: dict[str, int] = {}
         # Accelerated warmup removes idle delays. Keep each tree's sampled t*
         # so handoff can restore every stream to one flattened dataset clock;
@@ -434,10 +443,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self.scheduler.set_drain_observer(self.enforce_system_idle_cap)
         if self._has_tree_registry:
             self._session_tree_registry.set_drain_callback(self._on_tree_drained)
-        if (
-            self.config.phase == CreditPhase.WARMUP
-            and self._cache_warmup_requests_per_lane is not None
-        ):
+        if self.config.phase == CreditPhase.WARMUP and self._cache_warmup_enabled:
             self.credit_issuer.set_turn_admission(self._admit_cache_warmup_turn)
         if self.config.phase == CreditPhase.PROFILING:
             for trajectory in self.conversation_source.trajectories:
@@ -484,9 +490,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         a root and one or more subagents are all live at ``t*``. Those primers
         are the first warmup stage and do not consume the configured
         cache-pressure quota. The quota applies only to traffic replayed after
-        all mandatory primers return.
+        all mandatory primers return. Every admitted pressure turn also takes
+        one of its lane's in-flight slots (``_burst_in_flight``), in both the
+        count and the duration cache-pressure modes.
         """
-        assert self._cache_warmup_requests_per_lane is not None
         lane = self._cache_warmup_lane(turn)
         is_baseline = (
             turn.x_correlation_id,
@@ -494,6 +501,9 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         ) in self._baseline_warmup_turns
         if is_baseline:
             self._baseline_warmup_admitted += 1
+            return TurnAdmission.ADMIT
+        if self._cache_warmup_requests_per_lane is None:
+            self._burst_in_flight[lane] += 1
             return TurnAdmission.ADMIT
         if (
             self._cache_warmup_requests_by_lane[lane]
@@ -507,6 +517,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._quota_handoff_turns[state_key] = turn
             return TurnAdmission.DEFER
         self._cache_warmup_requests_by_lane[lane] += 1
+        self._burst_in_flight[lane] += 1
         if not self._cache_warmup_request_budget_reached and all(
             self._cache_warmup_requests_by_lane[lane_index]
             >= self._cache_warmup_requests_per_lane
@@ -848,6 +859,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
     async def _finish_accelerated_warmup(self) -> None:
         """Stop new pressure traffic and let all issued requests drain."""
         self.info("WARMUP cache pressure duration reached; draining requests")
+        self._flush_burst_pending_to_handoff()
         self.credit_issuer.replay_gate.pause_releases()
         self.credit_issuer.mark_sending_complete()
 
@@ -904,17 +916,90 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 root_pending=any(state.agent_depth == 0 for state in snapshot.states),
             )
 
-        for state in dispatchable:
-            session = self.conversation_source.session_for_state(state)
-            turn = self._build_turn_for_session(session, state.next_turn_index)
-            turn = _struct_replace(
-                turn,
-                is_session_start=(
-                    state.agent_depth == 0
-                    and state.x_correlation_id not in self._baseline_correlations
-                ),
-            )
+        live_streams = sum(
+            1
+            for state in dispatchable
+            if state.x_correlation_id in self._baseline_correlations
+        )
+        self._burst_cap_by_lane[lane] = max(1, live_streams)
+        self._burst_pending_states[lane] = deque(dispatchable)
+        await self._pump_burst_lane(lane)
+
+    def _burst_state_turn(self, state: ConversationState) -> TurnToSend:
+        session = self.conversation_source.session_for_state(state)
+        turn = self._build_turn_for_session(session, state.next_turn_index)
+        return _struct_replace(
+            turn,
+            is_session_start=(
+                state.agent_depth == 0
+                and state.x_correlation_id not in self._baseline_correlations
+            ),
+        )
+
+    def _accelerated_follow_up_turn(self, credit: Credit) -> TurnToSend:
+        next_meta = self.conversation_source.get_next_turn_metadata(credit)
+        turn = TurnToSend.from_previous_credit(credit, next_meta)
+        return _struct_replace(turn, max_tokens_override=_WARMUP_MAX_TOKENS)
+
+    async def _issue_accelerated_follow_up(self, credit: Credit) -> None:
+        turn = self._accelerated_follow_up_turn(credit)
+        if turn.agent_depth > 0:
+            await self._issue_child_continuation_or_drain(turn)
+        else:
             await self.credit_issuer.issue_credit(turn)
+
+    def _burst_lane_quota_reached(self, lane: int) -> bool:
+        per_lane = self._cache_warmup_requests_per_lane
+        return (
+            per_lane is not None
+            and self._cache_warmup_requests_by_lane[lane] >= per_lane
+        )
+
+    def _burst_lane_for_credit(self, credit: Credit) -> int | None:
+        lane = self._root_to_lane.get(credit.effective_root_correlation_id)
+        if lane is None:
+            lane = self._correlation_to_lane.get(credit.x_correlation_id)
+        return lane
+
+    async def _pump_burst_lane(self, lane: int) -> None:
+        """Issue a lane's pending cache-pressure turns under its live-stream cap.
+
+        Pending first turns of not-yet-started streams go before queued
+        zero-idle follow-ups, so every stream gets its first pressure turn
+        before any stream gets a second one (the same admission order as
+        issuing the whole lane at once). Once the lane's quota is reached the
+        rest is issued regardless of the cap: admission defers each turn into
+        the profiling handoff exactly as before.
+        """
+        states = self._burst_pending_states.get(lane)
+        follow_ups = self._burst_pending_follow_ups.get(lane)
+        cap = self._burst_cap_by_lane.get(lane, 1)
+        while states or follow_ups:
+            if self._burst_in_flight[
+                lane
+            ] >= cap and not self._burst_lane_quota_reached(lane):
+                return
+            if states:
+                await self.credit_issuer.issue_credit(
+                    self._burst_state_turn(states.popleft())
+                )
+            else:
+                await self._issue_accelerated_follow_up(follow_ups.popleft())
+
+    def _flush_burst_pending_to_handoff(self) -> None:
+        """Persist never-issued pending pressure turns for the profiling handoff."""
+        for states in self._burst_pending_states.values():
+            while states:
+                turn = self._burst_state_turn(states.popleft())
+                self._quota_handoff_turns[
+                    (turn.conversation_id, turn.x_correlation_id, turn.turn_index)
+                ] = turn
+        for follow_ups in self._burst_pending_follow_ups.values():
+            while follow_ups:
+                turn = self._accelerated_follow_up_turn(follow_ups.popleft())
+                self._quota_handoff_turns[
+                    (turn.conversation_id, turn.x_correlation_id, turn.turn_index)
+                ] = turn
 
     def observe_credit_return(self, credit: Credit) -> None:
         """Track the next live turn for the warmup-to-profile handoff."""
@@ -935,21 +1020,21 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
 
     async def _handle_accelerated_warmup_return(self, credit: Credit) -> None:
         """Issue the next compressed turn or recycle a completed tree."""
+        lane = self._burst_lane_for_credit(credit)
+        if lane is not None and self._burst_in_flight[lane] > 0:
+            self._burst_in_flight[lane] -= 1
         if credit.is_final_turn:
             if credit.agent_depth == 0 and not self._has_tree_registry:
                 await self._spawn_from_recycle_or_id(
                     credit.conversation_id,
                     finished_correlation_id=credit.x_correlation_id,
                 )
-            return
-
-        next_meta = self.conversation_source.get_next_turn_metadata(credit)
-        turn = TurnToSend.from_previous_credit(credit, next_meta)
-        turn = _struct_replace(turn, max_tokens_override=_WARMUP_MAX_TOKENS)
-        if turn.agent_depth > 0:
-            await self._issue_child_continuation_or_drain(turn)
+        elif lane is None:
+            await self._issue_accelerated_follow_up(credit)
         else:
-            await self.credit_issuer.issue_credit(turn)
+            self._burst_pending_follow_ups.setdefault(lane, deque()).append(credit)
+        if lane is not None:
+            await self._pump_burst_lane(lane)
 
     async def _issue_child_continuation_or_drain(self, turn: TurnToSend) -> None:
         """Dispatch a DAG child continuation, draining terminal refusals.
@@ -999,6 +1084,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         self.cleanup_on_abort()
         if not self._accelerated_warmup_started:
             return
+        self._flush_burst_pending_to_handoff()
         states_by_lane = self._build_handoff_states()
         boundaries_by_lane = {
             lane: self._build_handoff_replay_boundaries(states)
