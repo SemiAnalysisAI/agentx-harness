@@ -210,6 +210,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # The (x_correlation_id, turn_index) pairs holding each lane's slots,
         # so a slot that never comes back can be named.
         self._burst_in_flight_turns: dict[int, set[tuple[str, int]]] = {}
+        # Slot owner -> lane, recorded at admission so the release never
+        # depends on re-resolving the lane from the (mutable) lane maps.
+        self._burst_slot_lane: dict[tuple[str, int], int] = {}
+        self._burst_slot_lane_mismatches = 0
         self._burst_pending_states: dict[int, deque[ConversationState]] = {}
         self._burst_pending_follow_ups: dict[int, deque[Credit]] = {}
         self._root_to_lane: dict[str, int] = {}
@@ -959,7 +963,8 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         )
         self.info(
             f"WARMUP cache pressure progress: {len(lanes) - len(below)}/{len(lanes)} "
-            f"lanes at quota; below quota: {len(below)}"
+            f"lanes at quota; below quota: {len(below)}; "
+            f"slot lane mismatches: {self._burst_slot_lane_mismatches}"
             + (f" (sample: {sample})" if sample else "")
         )
         self.scheduler.schedule_later(60.0, self._log_cache_pressure_progress())
@@ -995,10 +1000,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         )
 
     def _take_burst_slot(self, lane: int, turn: TurnToSend) -> None:
+        key = (turn.x_correlation_id, turn.turn_index)
         self._burst_in_flight[lane] += 1
-        self._burst_in_flight_turns.setdefault(lane, set()).add(
-            (turn.x_correlation_id, turn.turn_index)
-        )
+        self._burst_in_flight_turns.setdefault(lane, set()).add(key)
+        self._burst_slot_lane[key] = lane
 
     def _burst_lane_for_credit(self, credit: Credit) -> int | None:
         lane = self._root_to_lane.get(credit.effective_root_correlation_id)
@@ -1072,14 +1077,15 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         ``_handle_accelerated_warmup_return``, so the pump is scheduled here
         whenever the lane still has pending first turns or follow-ups.
         """
-        lane = self._burst_lane_for_credit(credit)
+        key = (credit.x_correlation_id, credit.turn_index)
+        lane = self._burst_slot_lane.pop(key, None)
         if lane is None:
             return
+        if self._burst_lane_for_credit(credit) != lane:
+            self._burst_slot_lane_mismatches += 1
         if self._burst_in_flight[lane] > 0:
             self._burst_in_flight[lane] -= 1
-        self._burst_in_flight_turns.get(lane, set()).discard(
-            (credit.x_correlation_id, credit.turn_index)
-        )
+        self._burst_in_flight_turns.get(lane, set()).discard(key)
         if self._burst_pending_states.get(lane) or self._burst_pending_follow_ups.get(
             lane
         ):
