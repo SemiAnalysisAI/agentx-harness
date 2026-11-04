@@ -216,6 +216,12 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # depends on re-resolving the lane from the (mutable) lane maps.
         self._burst_slot_lane: dict[tuple[str, int], int] = {}
         self._burst_dispatchable_by_lane: dict[int, int] = {}
+        # First turns of children the orchestrator spawns from completed
+        # pressure turns wait in the lane FIFO behind the pending snapshot
+        # states instead of taking a slot ahead of them; turns the pump itself
+        # issues are pre-registered here so admission lets them through.
+        self._burst_pending_spawned: dict[int, deque[TurnToSend]] = {}
+        self._burst_released: set[tuple[str, int]] = set()
         self._burst_slot_lane_mismatches = 0
         self._burst_pending_states: dict[int, deque[ConversationState]] = {}
         self._burst_pending_follow_ups: dict[int, deque[Credit]] = {}
@@ -512,6 +518,20 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if is_baseline:
             self._baseline_warmup_admitted += 1
             return TurnAdmission.ADMIT
+        key = (turn.x_correlation_id, turn.turn_index)
+        if key in self._burst_released:
+            self._burst_released.discard(key)
+        elif (
+            self._accelerated_warmup_started
+            and turn.agent_depth > 0
+            and turn.turn_index == 0
+        ):
+            # Orchestrator-spawned child: queue it behind the lane's pending
+            # snapshot states; the pump issues it when a slot is free. The
+            # issuer reports DEFERRED so the orchestrator keeps the child.
+            self._burst_pending_spawned.setdefault(lane, deque()).append(turn)
+            self.scheduler.schedule_later(0.0, self._pump_burst_lane(lane))
+            return TurnAdmission.DEFER
         if self._cache_warmup_requests_per_lane is None:
             self._take_burst_slot(lane, turn)
             return TurnAdmission.ADMIT
@@ -956,6 +976,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             f"in_flight={self._burst_in_flight[lane]} "
             f"holding={sorted(self._burst_in_flight_turns.get(lane, ()))[:3]} "
             f"pending_states={len(self._burst_pending_states.get(lane) or ())} "
+            f"pending_spawned={len(self._burst_pending_spawned.get(lane) or ())} "
             f"pending_follow_ups="
             f"{[(c.x_correlation_id, c.turn_index) for c in list(self._burst_pending_follow_ups.get(lane) or ())[:3]]}"
             for lane in below[:5]
@@ -1052,25 +1073,40 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         the profiling handoff exactly as before.
         """
         states = self._burst_pending_states.get(lane)
+        spawned = self._burst_pending_spawned.get(lane)
         follow_ups = self._burst_pending_follow_ups.get(lane)
         cap = self._burst_cap_by_lane.get(lane, 1)
-        while states or follow_ups:
+        while states or spawned or follow_ups:
             if self._burst_in_flight[
                 lane
             ] >= cap and not self._burst_lane_quota_reached(lane):
                 return
             if states:
-                await self.credit_issuer.issue_credit(
-                    self._burst_state_turn(states.popleft())
-                )
+                turn = self._burst_state_turn(states.popleft())
+                self._burst_released.add((turn.x_correlation_id, turn.turn_index))
+                await self.credit_issuer.issue_credit(turn)
+            elif spawned:
+                turn = spawned.popleft()
+                self._burst_released.add((turn.x_correlation_id, turn.turn_index))
+                await self._issue_child_continuation_or_drain(turn)
             else:
-                await self._issue_accelerated_follow_up(follow_ups.popleft())
+                credit = follow_ups.popleft()
+                self._burst_released.add(
+                    (credit.x_correlation_id, credit.turn_index + 1)
+                )
+                await self._issue_accelerated_follow_up(credit)
 
     def _flush_burst_pending_to_handoff(self) -> None:
         """Persist never-issued pending pressure turns for the profiling handoff."""
         for states in self._burst_pending_states.values():
             while states:
                 turn = self._burst_state_turn(states.popleft())
+                self._quota_handoff_turns[
+                    (turn.conversation_id, turn.x_correlation_id, turn.turn_index)
+                ] = turn
+        for spawned in self._burst_pending_spawned.values():
+            while spawned:
+                turn = spawned.popleft()
                 self._quota_handoff_turns[
                     (turn.conversation_id, turn.x_correlation_id, turn.turn_index)
                 ] = turn
@@ -1116,8 +1152,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if self._burst_in_flight[lane] > 0:
             self._burst_in_flight[lane] -= 1
         self._burst_in_flight_turns.get(lane, set()).discard(key)
-        if self._burst_pending_states.get(lane) or self._burst_pending_follow_ups.get(
-            lane
+        if (
+            self._burst_pending_states.get(lane)
+            or self._burst_pending_spawned.get(lane)
+            or self._burst_pending_follow_ups.get(lane)
         ):
             self.scheduler.schedule_later(0.0, self._pump_burst_lane(lane))
 

@@ -3951,3 +3951,68 @@ async def test_cache_pressure_intercepted_return_still_frees_the_lane_slot():
     await strategy._test_scheduled_pumps.pop()
     assert issued[2:] == [("lane-0-child-new-a", 0)]
     assert strategy._burst_in_flight[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_pressure_spawned_child_waits_behind_pending_snapshot_states():
+    """A child the orchestrator spawns mid-stage is deferred into the lane FIFO
+    behind the pending snapshot states instead of taking a slot ahead of them;
+    the pump issues it afterwards and the quota flush hands it off like any
+    other deferred turn."""
+    strategy, _, issued = await _burst_strategy(requests_per_lane=10)
+    trajectory = strategy.conversation_source.trajectories[0]
+    await strategy._dispatch_accelerated_trajectory(trajectory, 0)
+    assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
+
+    spawned = TurnToSend(
+        conversation_id="trace_0",
+        x_correlation_id="lane-0-spawned",
+        root_correlation_id="lane-0-root",
+        turn_index=0,
+        num_turns=4,
+        agent_depth=1,
+    )
+    # The orchestrator's dispatch reaches admission while the lane is full.
+    assert strategy._admit_cache_warmup_turn(spawned) is TurnAdmission.DEFER
+    assert list(strategy._burst_pending_spawned[0]) == [spawned]
+    assert ("trace_0", "lane-0-spawned", 0) not in strategy._quota_handoff_turns
+    for coro in strategy._test_scheduled_pumps:
+        coro.close()
+    strategy._test_scheduled_pumps.clear()
+
+    # Returns free slots: the two pending snapshot states go first, then the
+    # spawned child, before any follow-up.
+    await _return_credit(strategy, _warmup_return("lane-0-root", 1))
+    await _return_credit(strategy, _warmup_return("lane-0-child-live", 1, depth=1))
+    assert issued[2:] == [("lane-0-child-new-a", 0), ("lane-0-child-new-b", 0)]
+    await _return_credit(strategy, _warmup_return("lane-0-child-new-a", 0, depth=1))
+    assert issued[4:] == [("lane-0-spawned", 0)]
+    assert not strategy._burst_pending_spawned[0]
+    await _return_credit(strategy, _warmup_return("lane-0-child-new-b", 0, depth=1))
+    assert issued[5:] == [("lane-0-root", 2)]
+
+
+@pytest.mark.asyncio
+async def test_cache_pressure_spawned_child_flushes_into_handoff_at_quota():
+    strategy, _, issued = await _burst_strategy(requests_per_lane=2)
+    trajectory = strategy.conversation_source.trajectories[0]
+    await strategy._dispatch_accelerated_trajectory(trajectory, 0)
+    assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
+    spawned = TurnToSend(
+        conversation_id="trace_0",
+        x_correlation_id="lane-0-spawned",
+        root_correlation_id="lane-0-root",
+        turn_index=0,
+        num_turns=4,
+        agent_depth=1,
+    )
+    assert strategy._admit_cache_warmup_turn(spawned) is TurnAdmission.DEFER
+    for coro in strategy._test_scheduled_pumps:
+        coro.close()
+    strategy._test_scheduled_pumps.clear()
+    # Quota (2) is already consumed: the pump pushes the queued child through
+    # admission, which defers it into the profiling handoff.
+    await strategy._pump_burst_lane(0)
+    assert issued == [("lane-0-root", 1), ("lane-0-child-live", 1)]
+    assert ("trace_0", "lane-0-spawned", 0) in strategy._quota_handoff_turns
+    assert not strategy._burst_pending_spawned[0]
