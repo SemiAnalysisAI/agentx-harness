@@ -58,6 +58,8 @@ next root drawn from the shared dataset sampler
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from collections import Counter, deque
@@ -916,6 +918,33 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             )
             await self.credit_issuer.issue_credit(turn)
 
+    def _dump_handoff_states(
+        self, states_by_lane: dict[int, list[ConversationState]]
+    ) -> None:
+        """Write the handoff (one line per live stream) when
+        AIPERF_AGENTX_HANDOFF_DUMP names a file; development aid for parity checks."""
+        path = os.environ.get("AIPERF_AGENTX_HANDOFF_DUMP")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            for lane, states in states_by_lane.items():
+                for state in states:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "lane": lane,
+                                "conversation_id": state.conversation_id,
+                                "x_correlation_id": state.x_correlation_id,
+                                "root_correlation_id": state.root_correlation_id,
+                                "next_turn_index": state.next_turn_index,
+                                "agent_depth": state.agent_depth,
+                                "waiting_on_children": state.waiting_on_children,
+                                "quota_used": self._cache_warmup_requests_by_lane[lane],
+                            }
+                        )
+                        + "\n"
+                    )
+
     def observe_credit_return(self, credit: Credit) -> None:
         """Track the next live turn for the warmup-to-profile handoff."""
         self.credit_issuer.replay_gate.complete(credit)
@@ -1000,6 +1029,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if not self._accelerated_warmup_started:
             return
         states_by_lane = self._build_handoff_states()
+        self._dump_handoff_states(states_by_lane)
         boundaries_by_lane = {
             lane: self._build_handoff_replay_boundaries(states)
             for lane, states in states_by_lane.items()
