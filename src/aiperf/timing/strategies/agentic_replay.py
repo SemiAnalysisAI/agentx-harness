@@ -850,6 +850,8 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 self._cache_warmup_duration,
                 self._finish_accelerated_warmup(),
             )
+        if self._cache_warmup_requests_per_lane is not None:
+            self.scheduler.schedule_later(60.0, self._log_cache_pressure_progress())
         results = await asyncio.gather(
             *(
                 self._dispatch_accelerated_trajectory(trajectory, lane)
@@ -929,6 +931,33 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         self._burst_cap_by_lane[lane] = max(1, live_streams)
         self._burst_pending_states[lane] = deque(dispatchable)
         await self._pump_burst_lane(lane)
+
+    async def _log_cache_pressure_progress(self) -> None:
+        """Once a minute during the count-mode pressure stage: lanes at quota
+        and a sample of the lanes still below it with their slot state."""
+        per_lane = self._cache_warmup_requests_per_lane
+        if per_lane is None or self._cache_warmup_request_budget_reached:
+            return
+        lanes = range(len(self.conversation_source.trajectories))
+        below = [
+            lane
+            for lane in lanes
+            if self._cache_warmup_requests_by_lane[lane] < per_lane
+        ]
+        sample = ", ".join(
+            f"lane {lane}: count={self._cache_warmup_requests_by_lane[lane]} "
+            f"cap={self._burst_cap_by_lane.get(lane)} "
+            f"in_flight={self._burst_in_flight[lane]} "
+            f"pending_states={len(self._burst_pending_states.get(lane) or ())} "
+            f"pending_follow_ups={len(self._burst_pending_follow_ups.get(lane) or ())}"
+            for lane in below[:5]
+        )
+        self.info(
+            f"WARMUP cache pressure progress: {len(lanes) - len(below)}/{len(lanes)} "
+            f"lanes at quota; below quota: {len(below)}"
+            + (f" (sample: {sample})" if sample else "")
+        )
+        self.scheduler.schedule_later(60.0, self._log_cache_pressure_progress())
 
     def _burst_state_turn(self, state: ConversationState) -> TurnToSend:
         session = self.conversation_source.session_for_state(state)

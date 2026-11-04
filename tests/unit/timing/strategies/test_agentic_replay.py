@@ -679,7 +679,10 @@ async def test_count_cache_warmup_starts_without_duration_timer():
     assert pressure.turn_index == 2
     assert pressure.max_tokens_override == 1
     issuer.set_max_tokens_override.assert_called_once_with(1)
-    scheduler.schedule_later.assert_not_called()
+    # No duration cutoff timer; only the once-a-minute progress log is scheduled.
+    for call in scheduler.schedule_later.call_args_list:
+        assert call.args[0] == 60.0
+        call.args[1].close()
 
 
 @pytest.mark.asyncio
