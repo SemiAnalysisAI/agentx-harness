@@ -101,6 +101,15 @@ class Credit(
     recorded output limit.
     """
 
+    close_connection: bool = False
+    """Ask the server to close the HTTP connection after this response.
+
+    Agentic replay sets this on the one-shot warmup primers: their sockets
+    would otherwise sit idle in the worker pools for the rest of the warmup
+    stage and be closed by the client (TIME_WAIT) exactly when the
+    cache-pressure burst needs the ports. Never propagated to later turns.
+    """
+
     @property
     def is_final_turn(self) -> bool:
         return self.turn_index == self.num_turns - 1
@@ -204,6 +213,9 @@ class TurnToSend(Struct, frozen=True):
 
     max_tokens_override: int | None = None
     """Per-request generation limit override; omitted for normal requests."""
+
+    close_connection: bool = False
+    """Send ``Connection: close`` so the server closes the socket after the response."""
 
     @property
     def is_final_turn(self) -> bool:

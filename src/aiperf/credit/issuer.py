@@ -542,6 +542,7 @@ class CreditIssuer:
             cache_bust_marker=cache_bust_marker,
             cache_bust_target=cache_bust_target_for_credit,
             max_tokens_override=turn.max_tokens_override,
+            close_connection=turn.close_connection,
         )
 
         await self._credit_router.send_credit(credit=credit)

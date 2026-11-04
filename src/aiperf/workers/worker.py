@@ -2161,6 +2161,19 @@ class Worker(BaseComponentService, ProcessHealthMixin):
                     last_turn.raw_payload, credit.max_tokens_override
                 )
             turns = [*turns[:-1], last_turn.model_copy(update=update)]
+        if credit.close_connection and turns:
+            last_turn = turns[-1]
+            turns = [
+                *turns[:-1],
+                last_turn.model_copy(
+                    update={
+                        "extra_headers": {
+                            **(last_turn.extra_headers or {}),
+                            "Connection": "close",
+                        }
+                    }
+                ),
+            ]
         source_turn = turns[-1] if turns else None
         return RequestInfo(
             model_endpoint=self.model_endpoint,

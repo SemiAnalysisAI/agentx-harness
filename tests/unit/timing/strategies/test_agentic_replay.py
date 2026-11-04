@@ -3918,3 +3918,30 @@ async def test_cache_pressure_duration_cutoff_persists_pending_first_turns():
     assert not strategy._burst_pending_states[0]
     assert not strategy._burst_pending_follow_ups[0]
     issuer.mark_sending_complete.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_warmup_primers_close_their_connection_but_pressure_turns_do_not():
+    strategy, _, issued = await _burst_strategy(requests_per_lane=10)
+    primers: list[TurnToSend] = []
+    pressure: list[TurnToSend] = []
+
+    async def issue(turn: TurnToSend) -> bool:
+        (primers if turn.close_connection else pressure).append(turn)
+        return True
+
+    strategy.credit_issuer.issue_credit = AsyncMock(side_effect=issue)
+    await strategy._execute_warmup()
+    assert {(t.x_correlation_id, t.turn_index) for t in primers} == {
+        ("lane-0-root", 0),
+        ("lane-0-child-live", 0),
+    }
+    assert pressure == []
+
+    await strategy._dispatch_accelerated_trajectory(
+        strategy.conversation_source.trajectories[0], 0
+    )
+    # (The mocked issuer runs no admission here, so the per-lane slot cap is
+    # not exercised; only the connection flag is under test.)
+    assert pressure and all(not t.close_connection for t in pressure)
+    assert ("lane-0-root", 1) in {(t.x_correlation_id, t.turn_index) for t in pressure}

@@ -137,3 +137,17 @@ class TestTurnToSendNoRequest:
         tts = TurnToSend(**self._kwargs())
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(tts), type=TurnToSend)
         assert decoded.no_request is False
+
+
+def test_credit_close_connection_roundtrip_and_default():
+    assert _make_credit().close_connection is False
+    assert b"close_connection" not in msgspec.msgpack.encode(_make_credit())
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(_make_credit(close_connection=True)), type=Credit
+    )
+    assert decoded.close_connection is True
+
+
+def test_turn_to_send_does_not_propagate_close_connection():
+    parent = _make_credit(close_connection=True)
+    assert TurnToSend.from_previous_credit(parent).close_connection is False

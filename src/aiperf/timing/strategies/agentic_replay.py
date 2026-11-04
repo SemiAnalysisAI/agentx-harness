@@ -706,6 +706,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 turn = self._build_turn_for_session(
                     session, trajectory.start_turn_index
                 )
+                turn = _struct_replace(turn, close_connection=True)
                 prepared.append((turn, None))
                 self._baseline_correlations.add(turn.x_correlation_id)
                 self._baseline_warmup_turns.add(
@@ -728,6 +729,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                     session.effective_root_correlation_id, state.conversation_id, lane
                 )
                 turn = self._build_turn_for_session(session, warm_index)
+                # One-shot primer: the server closes the socket after the
+                # response instead of leaving it pooled (and later closed by
+                # the client into TIME_WAIT) for the rest of the stage.
+                turn = _struct_replace(turn, close_connection=True)
                 lead_ms: float | None = None
                 if spread:
                     meta = self.conversation_source.get_metadata(state.conversation_id)

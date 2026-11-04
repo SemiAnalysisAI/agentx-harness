@@ -499,6 +499,32 @@ class TestCreateRequestInfo:
         assert request_info.turns[-1].max_tokens == 1
         assert original.max_tokens == 4096
 
+    async def test_create_request_info_close_connection_adds_header(self, mock_worker):
+        original = Turn(extra_headers={"X-Keep": "1"})
+        credit_context = CreditContext(
+            credit=Credit(
+                id=1,
+                phase=CreditPhase.WARMUP,
+                conversation_id="test-conv",
+                x_correlation_id="test-correlation",
+                turn_index=0,
+                num_turns=1,
+                issued_at_ns=0,
+                close_connection=True,
+            ),
+            drop_perf_ns=0,
+        )
+        request_info = mock_worker._create_request_info(
+            x_request_id="request-id",
+            credit_context=credit_context,
+            turns=[original],
+        )
+        assert request_info.turns[-1].extra_headers == {
+            "X-Keep": "1",
+            "Connection": "close",
+        }
+        assert original.extra_headers == {"X-Keep": "1"}
+
     @pytest.mark.parametrize(
         "recorded_payload, cap_key",
         [
