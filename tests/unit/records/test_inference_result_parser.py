@@ -18,15 +18,15 @@ from aiperf.common.models import (
     Usage,
 )
 from aiperf.endpoints.openai_chat import ChatEndpoint
-from aiperf.plugin.enums import PluginType
-from tests.harness import mock_plugin
 from aiperf.metrics.types.e2e_output_throughput_metric import (
     E2EOutputTokenThroughputMetric,
 )
 from aiperf.metrics.types.inter_token_latency_metric import InterTokenLatencyMetric
+from aiperf.plugin.enums import PluginType
 from aiperf.records.record_processor_service import RecordProcessor
 from aiperf.simulation.identity import VIRTUAL_TIMESTAMP_ORIGIN_NS
 from aiperf.simulation.record_timing import apply_simulator_timing
+from tests.harness import mock_plugin
 from tests.unit.metrics.conftest import run_simple_metrics_pipeline
 from tests.unit.records.conftest import (
     create_invalid_record,

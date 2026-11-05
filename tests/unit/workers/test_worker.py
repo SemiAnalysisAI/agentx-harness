@@ -24,9 +24,8 @@ from aiperf.config.phases import ConcurrencyPhase
 from aiperf.credit.structs import Credit, CreditContext
 from aiperf.dataset.memory_map_utils import PayloadTurnData
 from aiperf.endpoints.openai_responses import ResponsesEndpoint
-from aiperf.plugin.enums import EndpointType
+from aiperf.plugin.enums import EndpointType, TransportType
 from aiperf.workers.session_manager import UserSession
-from aiperf.plugin.enums import TransportType
 from aiperf.workers.worker import (
     Worker,
     _is_terminal_context_overflow,

@@ -35,9 +35,7 @@ async def test_cancel_preserves_virtual_records_without_wall_clock_fallback(
     started: bool,
     complete: bool,
 ) -> None:
-    benchmark_run.cfg.endpoint.transport = (
-        "sglang_simulator" if simulator else "http"
-    )
+    benchmark_run.cfg.endpoint.transport = "sglang_simulator" if simulator else "http"
     benchmark_run.cfg.gpu_telemetry.enabled = False
     benchmark_run.cfg.server_metrics.enabled = False
     benchmark_run.cfg.scenario = None
