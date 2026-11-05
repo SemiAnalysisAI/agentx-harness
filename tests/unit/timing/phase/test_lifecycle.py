@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+from unittest.mock import Mock
+
 import pytest
 
 from aiperf.common.enums import CreditPhase
+from aiperf.common.timing_runtime import TimingRuntime
 from aiperf.plugin.enums import TimingMode
 from aiperf.timing.config import CreditPhaseConfig
 from aiperf.timing.phase.lifecycle import PhaseLifecycle, PhaseState
@@ -19,6 +22,28 @@ def cfg(dur: float | None = None, grace: float | None = None) -> CreditPhaseConf
 
 
 class TestPhaseLifecycle:
+    def test_injected_clock_controls_duration_grace_and_timestamps(self) -> None:
+        runtime = Mock(spec=TimingRuntime)
+        runtime.now_ns.return_value = 0
+        runtime.timestamp_ns.return_value = 1_000_000_000_000
+        lifecycle = PhaseLifecycle(cfg(dur=10.0, grace=2.0), runtime=runtime)
+        lifecycle.start()
+        assert lifecycle.started_at_perf_ns == 0
+        assert lifecycle.started_at_ns == 1_000_000_000_000
+
+        runtime.now_ns.return_value = 10_000_000_000
+        runtime.timestamp_ns.return_value += 10_000_000_000
+        assert lifecycle.time_left_in_seconds() == 0.0
+        assert lifecycle.time_left_in_seconds(include_grace_period=True) == 2.0
+        lifecycle.mark_sending_complete(timeout_triggered=True)
+        assert lifecycle.sending_complete_at_ns == 1_010_000_000_000
+
+        runtime.now_ns.return_value = 12_000_000_000
+        runtime.timestamp_ns.return_value += 2_000_000_000
+        assert lifecycle.time_left_in_seconds(include_grace_period=True) == 0.0
+        lifecycle.mark_complete(grace_period_triggered=True)
+        assert lifecycle.complete_at_ns == 1_012_000_000_000
+
     def test_full_lifecycle(self) -> None:
         lc = PhaseLifecycle(cfg())
         lc.start()

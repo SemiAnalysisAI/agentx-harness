@@ -20,6 +20,7 @@ from aiperf.common.environment import Environment
 from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.common.mixins import TaskManagerMixin
 from aiperf.common.phase import phase_runtime_key
+from aiperf.common.timing_runtime import RealTimingRuntime, TimingRuntime
 from aiperf.credit.issuer import CreditIssuer
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import PluginType, TimingMode
@@ -100,6 +101,7 @@ class PhaseRunner(TaskManagerMixin):
         branch_orchestrator: BranchOrchestrator | None = None,
         run: BenchmarkRun | None = None,
         session_tree_registry: SessionTreeRegistry | None = None,
+        runtime: TimingRuntime | None = None,
         **kwargs,
     ) -> None:
         """Initialize phase runner.
@@ -124,6 +126,8 @@ class PhaseRunner(TaskManagerMixin):
             session_tree_registry: Optional per-tree session-slot ledger
                 (AGENTIC_REPLAY only). Passed into the orchestrator + issuer +
                 released at phase teardown via ``release_all``.
+            runtime: Clock and timer source shared by the scheduler and lifecycle.
+                Other phase waits and strategies still use their existing clocks.
         """
         super().__init__(**kwargs)
         self._config = config
@@ -188,8 +192,13 @@ class PhaseRunner(TaskManagerMixin):
         self._on_phase_complete: Callable[[], None] | None = None
 
         # Per-phase components - order matters
-        self._scheduler = LoopScheduler()
-        self._lifecycle = PhaseLifecycle(self._config)
+        self._runtime = (
+            runtime
+            if runtime is not None
+            else RealTimingRuntime(asyncio.get_running_loop())
+        )
+        self._scheduler = LoopScheduler(runtime=self._runtime)
+        self._lifecycle = PhaseLifecycle(self._config, runtime=self._runtime)
         self._progress = PhaseProgressTracker(self._config)
         self._stop_checker = StopConditionChecker(
             config=self._config,
