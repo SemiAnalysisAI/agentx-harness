@@ -15,6 +15,7 @@ Progress reporting is delegated to PhaseRunner.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from aiperf.common.enums import CacheBustTarget, CreditPhase
@@ -33,6 +34,7 @@ from aiperf.timing.url_samplers import URLSelectionStrategyProtocol
 
 if TYPE_CHECKING:
     from aiperf.common.models import DatasetMetadata
+    from aiperf.common.timing_runtime import TimingRuntime
     from aiperf.config.resolution.plan import BenchmarkRun
     from aiperf.credit.sticky_router import CreditRouterProtocol
     from aiperf.timing.config import TimingConfig
@@ -91,6 +93,7 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
         credit_router: CreditRouterProtocol,
         dataset_metadata: DatasetMetadata,
         run: BenchmarkRun | None = None,
+        runtime: TimingRuntime | None = None,
         **kwargs,
     ) -> None:
         """Initialize timing strategy and orchestration components.
@@ -111,6 +114,7 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
         self._credit_router = credit_router
         self._dataset_metadata = dataset_metadata
         self._run = run
+        self._runtime = runtime
 
         # Create dataset sampler
         SamplerClass = plugins.get_class(
@@ -189,7 +193,7 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
                 benchmark_id=benchmark_id,
                 cache_bust_target=cache_bust_target,
             )
-        self._concurrency_manager = ConcurrencyManager()
+        self._concurrency_manager = ConcurrencyManager(runtime=runtime)
         self._session_tree_registry = (
             SessionTreeRegistry(self._concurrency_manager)
             if is_agentic_replay
@@ -254,6 +258,14 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
             await self._phase_publisher.publish_credits_complete()
 
     async def _execute_phases(self) -> None:
+        """Track phase work continuously across the warmup/profiling handoff."""
+        scope = (
+            self._runtime.run_scope() if self._runtime is not None else nullcontext()
+        )
+        with scope:
+            await self._run_phases()
+
+    async def _run_phases(self) -> None:
         """Execute phases in order (typically: warmup → profiling).
 
         For each phase:
@@ -284,6 +296,7 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
                 url_selection_strategy=self._url_sampler,
                 run=self._run,
                 session_tree_registry=self._session_tree_registry,
+                runtime=self._runtime,
             )
 
             # For seamless non-final phases, set callback to remove from active runners

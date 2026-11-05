@@ -75,6 +75,9 @@ class MockCreditRouter:
     async def cancel_all_credits(self) -> None:
         pass
 
+    async def wait_for_cancellation_drain(self, timeout: float) -> None:
+        pass
+
     def mark_credits_complete(self) -> None:
         pass
 
@@ -542,6 +545,9 @@ class MockCreditSender:
 
     async def cancel_all_credits(self) -> None:
         self.cancelled = True
+
+    async def wait_for_cancellation_drain(self, timeout: float) -> None:
+        pass
 
     def reset(self) -> None:
         self.sent_credits.clear()

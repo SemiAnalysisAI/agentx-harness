@@ -19,11 +19,12 @@ from aiperf.common.models import (
     TextResponseData,
     Turn,
 )
+from aiperf.common.models.server_timing import ServerTiming
 from aiperf.config.phases import ConcurrencyPhase
 from aiperf.credit.structs import Credit, CreditContext
 from aiperf.dataset.memory_map_utils import PayloadTurnData
 from aiperf.endpoints.openai_responses import ResponsesEndpoint
-from aiperf.plugin.enums import EndpointType
+from aiperf.plugin.enums import EndpointType, TransportType
 from aiperf.workers.session_manager import UserSession
 from aiperf.workers.worker import (
     Worker,
@@ -94,6 +95,55 @@ def test_phase_needs_first_token_callback(phase_data, expected):
     phase = ConcurrencyPhase.model_validate(phase_data)
 
     assert _phase_needs_first_token_callback(phase) is expected
+
+
+@pytest.mark.asyncio
+async def test_simulator_worker_failure_exit_removes_physical_timing(
+    mock_worker: Worker,
+) -> None:
+    mock_worker.model_endpoint.transport = TransportType.SGLANG_SIMULATOR
+    mock_worker.inference_results_push_client = AsyncMock()
+    mock_worker.execute_async = Mock(side_effect=lambda coroutine: coroutine.close())
+    record = RequestRecord(error=ErrorDetails(message="session construction failed"))
+    await mock_worker._send_inference_result_message(record)
+    assert record.server_timing is not None
+    assert record.end_perf_ns is None and record.start_perf_ns == 0
+    assert record.error.message == "session construction failed"
+    assert (
+        mock_worker.inference_results_push_client.push.call_args.args[0].record
+        is record
+    )
+
+
+def test_credit_return_metrics_use_same_generation_bounds_as_records() -> None:
+    worker = object.__new__(Worker)
+    record = RequestRecord(
+        start_perf_ns=0,
+        end_perf_ns=30,
+        server_timing=ServerTiming(first_token_perf_ns=10, last_token_perf_ns=30),
+    )
+    assert worker._request_latency_ns_for_record(record, [30]) == 30
+    assert worker._inter_token_latency_ns_for_record(record, [30], [], 3) == 10
+    record.server_timing = ServerTiming()
+    assert worker._request_latency_ns_for_record(record, [999999]) is None
+    assert worker._inter_token_latency_ns_for_record(record, [999999], [], 3) is None
+
+
+@pytest.mark.asyncio
+async def test_simulator_grace_cancellation_returns_cancelled_credit_without_record(
+    mock_worker: Worker,
+    sample_credit_context: CreditContext,
+) -> None:
+    mock_worker.model_endpoint.transport = TransportType.SGLANG_SIMULATOR
+    mock_worker._process_credit = AsyncMock(side_effect=asyncio.CancelledError)
+    mock_worker._emit_credit_failure_record = AsyncMock()
+    mock_worker.credit_return_push_client = AsyncMock()
+    await mock_worker._on_credit_drop_message_task(sample_credit_context)
+    returned = mock_worker.credit_return_push_client.send.call_args.args[0]
+    assert returned.cancelled
+    assert returned.request_latency_ns is None
+    assert returned.inter_token_latency_ns is None
+    mock_worker._emit_credit_failure_record.assert_not_awaited()
 
 
 @pytest.fixture

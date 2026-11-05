@@ -129,6 +129,78 @@ AIPerf supports 34 plugin categories organized by function, including `api_route
 | `endpoint` | `EndpointType` | API endpoint implementations (chat, completions, embeddings, etc.) |
 | `transport` | `TransportType` | Network transport (HTTP via aiohttp) |
 
+This fork maintains `sglang_simulator` as a local AgentX adapter for the SGLang
+simulator's Ready/Grant v1 protocol. The simulator does not depend on AgentX or
+this adapter; other workload drivers can use the same protocol. Ordinary HTTP
+against simulator `BLOCKING` mode uses real clocks and requires no adapter.
+
+For accelerated `OFFLINE` runs, select the transport explicitly with
+`--transport sglang_simulator` and set
+`AIPERF_TIMING_SIMULATOR_COORDINATOR`. HTTP URL detection continues to select
+the ordinary `http` transport.
+
+Use this AgentX fork and a SGLang checkout with the optional coordinator.
+In the SGLang terminal, set:
+
+```bash
+export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
+export SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001
+```
+
+Then use the serving launch command and model/predictor configuration in the
+[SGLang simulator README](https://github.com/sgl-project/sglang/blob/main/tools/sglang-simulator/README.md#serving-mode).
+Keep the server and AgentX on the same host or network namespace; the coordinator
+accepts loopback TCP only. Restart the server for each run to reset its clock and
+cache.
+
+The following short local-trace command exercises the real AgentX loader,
+workers and phases. Replace the model, tokenizer and Weka trace paths with your
+inputs. It is a functional check, **not an AgentX benchmark submission**:
+`--unsafe-override` permits the local fixture and short duration.
+
+```bash
+AIPERF_TIMING_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001 \
+uv run aiperf profile \
+  --scenario inferencex-agentx-mvp \
+  --transport sglang_simulator \
+  --url http://127.0.0.1:30000 \
+  --model /path/to/model --tokenizer /path/to/model \
+  --endpoint-type chat --streaming --use-server-token-count \
+  --input-file /path/to/short-weka-trace.json --custom-dataset-type weka_trace \
+  --trajectory-start-min-ratio 0.5 --trajectory-start-max-ratio 0.5 \
+  --concurrency 1 --workers-max 1 \
+  --benchmark-duration 30 --benchmark-grace-period inf --unsafe-override \
+  --no-server-metrics --no-gpu-telemetry \
+  --artifact-dir /path/to/new-run
+```
+
+For the pinned public corpus and scenario validity rules, see the
+[AgentX tutorial](../tutorials/agentx-mvp.md). Workload warmup retains the server
+cache but is excluded from profiling metrics. Report simulated results together
+with the predictor and cache configuration; they do not measure physical hardware.
+The initial scope is one server and completion-driven agentic replay. Prefill
+concurrency, seamless phases and rate ramps are unsupported.
+
+This transport preserves the endpoint's JSON payload and the existing SSE parser.
+It adds a coordinator-owned `rid` derived from the benchmark, phase, and credit.
+User-supplied `rid` values are rejected. Its pooled connections have no concurrency
+limit, so every payload in a coordinator round can arrive before responses complete.
+Other connection strategies, multipart requests, and random cancellation are not
+supported.
+
+It requires streaming chat, one choice per request, `--use-server-token-count`,
+and native simulator timing metadata. Use `--no-server-metrics` and
+`--no-gpu-telemetry`; keep network latency calibration disabled because it observes
+physical time. Ordinary SSE content and usage remain intact. The transport
+validates native token/cache counts
+and maps request records to the shared virtual clock; missing or inconsistent
+metadata fails the run without admitting physical timing samples.
+
+TTFT and request latency measure the simulator's first and last generated tokens.
+ITL and throughput use the existing metric pipeline. TTST, inter-chunk latency,
+TTFO, HTTP setup, and network tracing are unavailable because generation bounds
+do not describe physical chunk delivery or reasoning-token boundaries.
+
 ### Processing Categories
 
 | Category | Enum | Description |

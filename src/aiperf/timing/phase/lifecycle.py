@@ -10,11 +10,11 @@ Cancellation is a flag (can happen at any state), not a state itself.
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 from aiperf.common.constants import NANOS_PER_SECOND
 from aiperf.common.enums import CaseInsensitiveStrEnum
+from aiperf.common.timing_runtime import RealTimingRuntime, TimingRuntime
 
 if TYPE_CHECKING:
     from aiperf.timing.config import CreditPhaseConfig
@@ -43,12 +43,15 @@ class PhaseLifecycle:
     Cancellation is orthogonal to state - a cancelled phase still completes
     its lifecycle for cleanup.
 
-    Uses wall-clock time (time.time_ns()) for timestamps since they're published
-    across services and need to be comparable. perf_counter is process-local.
+    By default, published timestamps use wall time and durations use performance
+    time. An injected runtime supplies both clocks without changing transitions.
     """
 
-    def __init__(self, config: CreditPhaseConfig) -> None:
+    def __init__(
+        self, config: CreditPhaseConfig, *, runtime: TimingRuntime | None = None
+    ) -> None:
         self._config = config
+        self._runtime = runtime if runtime is not None else RealTimingRuntime()
         self.state: PhaseState = PhaseState.CREATED
 
         # Timestamps (wall clock - time.time_ns())
@@ -84,7 +87,7 @@ class PhaseLifecycle:
         if self.state != PhaseState.CREATED:
             raise ValueError("Credit phase already started")
         self.state = PhaseState.STARTED
-        perf_ns, time_ns = time.perf_counter_ns(), time.time_ns()
+        perf_ns, time_ns = self._runtime.now_ns(), self._runtime.timestamp_ns()
         self.started_at_ns = time_ns
         self.started_at_perf_ns = perf_ns
 
@@ -99,7 +102,7 @@ class PhaseLifecycle:
         if self.state in _SENDING_COMPLETE_STATES:
             raise ValueError("Credit phase already completed sending")
         self.state = PhaseState.SENDING_COMPLETE
-        self.sending_complete_at_ns = time.time_ns()
+        self.sending_complete_at_ns = self._runtime.timestamp_ns()
         if timeout_triggered:
             self.timeout_triggered = True
 
@@ -116,7 +119,7 @@ class PhaseLifecycle:
                 "Credit phase has not completed sending. Call mark_sending_complete() first."
             )
         self.state = PhaseState.COMPLETE
-        self.complete_at_ns = time.time_ns()
+        self.complete_at_ns = self._runtime.timestamp_ns()
         if grace_period_triggered:
             self.grace_period_triggered = True
 
@@ -148,7 +151,7 @@ class PhaseLifecycle:
         if self.started_at_perf_ns is None:
             return None  # Not started yet
 
-        elapsed_ns = time.perf_counter_ns() - self.started_at_perf_ns
+        elapsed_ns = self._runtime.now_ns() - self.started_at_perf_ns
         elapsed_sec = elapsed_ns / NANOS_PER_SECOND
         grace = (self._config.grace_period_sec or 0) if include_grace_period else 0
         time_left = self._config.expected_duration_sec + grace - elapsed_sec

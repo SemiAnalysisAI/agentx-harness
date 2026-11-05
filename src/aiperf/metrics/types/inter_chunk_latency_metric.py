@@ -53,6 +53,10 @@ class InterChunkLatencyMetric(BaseRecordMetric[list[int]]):
             NoMetricValue: If the record does not have at least two content responses
             ValueError: If any of the inter chunk latencies are not positive.
         """
+        if record.request.server_timing is not None:
+            raise NoMetricValue(
+                "Server generation bounds do not identify content chunks."
+            )
         content_responses = record.content_responses
 
         if len(content_responses) < 2:

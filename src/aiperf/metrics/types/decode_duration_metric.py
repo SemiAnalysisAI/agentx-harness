@@ -70,7 +70,14 @@ class FullDecodeDurationMetric(BaseRecordMetric[int]):
                 "Full decode duration requires an explicit request end timestamp."
             )
 
-        first_content_ts = record.content_responses[0].perf_ns
+        timing = record.request.server_timing
+        first_content_ts = (
+            timing.first_token_perf_ns
+            if timing is not None
+            else record.content_responses[0].perf_ns
+        )
+        if first_content_ts is None:
+            raise NoMetricValue("Server generation timing is unavailable.")
         duration = record.request.end_perf_ns - first_content_ts
         if duration < 0:
             raise ValueError("Request end timestamp is before first content response.")

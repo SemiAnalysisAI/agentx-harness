@@ -108,6 +108,7 @@ from aiperf.credit.dispatch import ChildDispatchResult
 
 if TYPE_CHECKING:
     from aiperf.common.loop_scheduler import LoopScheduler
+    from aiperf.timing.conversation_source import SampledSession
 
 __all__ = [
     "BranchOrchestrator",
@@ -576,18 +577,25 @@ class BranchOrchestrator:
                         )
                         self.stats.children_errored += 1
                         continue
-                    result = ChildDispatchResult.normalize(
-                        await self._issuer.dispatch_first_turn(child_session)
-                    )
-                    if result.preserves_tracking:
-                        self.stats.children_spawned += 1
+                    if self._uses_virtual_time:
+                        self._scheduler.execute_async(
+                            self._dispatch_pre_session_child(child_session)
+                        )
                     else:
-                        # Terminal refusal before the child reaches the wire.
-                        # Exceptions are caught above; tally this as truncated.
-                        self.stats.children_truncated += 1
+                        await self._dispatch_pre_session_child(child_session)
                 self._pre_dispatched_branches.add(
                     (conv.conversation_id, branch.branch_id)
                 )
+
+    async def _dispatch_pre_session_child(self, child_session: SampledSession) -> None:
+        """Issue a pre-session child without delaying the phase deadline setup."""
+        result = ChildDispatchResult.normalize(
+            await self._issuer.dispatch_first_turn(child_session)
+        )
+        if result.preserves_tracking:
+            self.stats.children_spawned += 1
+        else:
+            self.stats.children_truncated += 1
 
     def _register_tree_descendants(self, root_corr: str | None, n: int) -> None:
         """Add ``n`` descendants to their session tree's outstanding count.
@@ -1050,6 +1058,10 @@ class BranchOrchestrator:
                 offset_ms = 0.0
             if offset_ms > 0.0:
                 self._start_delayed_first_turn(child, offset_ms, parent_corr)
+            elif self._uses_virtual_time:
+                self._scheduler.execute_async(
+                    self._dispatch_registered_child(child, parent_corr)
+                )
             else:
                 immediate_children.append(child)
 
@@ -1310,6 +1322,29 @@ class BranchOrchestrator:
         """Sleep out a dispatch offset. Separate method so tests can gate it."""
         await asyncio.sleep(offset_ms / 1000.0)
 
+    @property
+    def _uses_virtual_time(self) -> bool:
+        return (
+            self._scheduler is not None and self._scheduler.runtime.is_virtual is True
+        )
+
+    async def _dispatch_registered_child(
+        self, child: SampledSession, parent_corr: str
+    ) -> None:
+        """Wait for capacity without holding the parent's bookkeeping lock."""
+        if self._cleaning_up:
+            return
+        try:
+            result = await self._dispatch_first_turn(child)
+        except Exception as exc:
+            result = exc
+        if isinstance(result, BaseException) or (
+            ChildDispatchResult.normalize(result) is ChildDispatchResult.REJECTED
+        ):
+            async with self._parent_locks[parent_corr]:
+                self._rollback_failed_first_turn(child, result, parent_corr)
+                await self._finalize_failed_dispatches(parent_corr)
+
     async def _dispatch_first_turn_after_offset(
         self, child, offset_ms: float, parent_corr: str
     ) -> None:
@@ -1319,6 +1354,11 @@ class BranchOrchestrator:
         refusal. Dispatch and settlement run under the parent lock, matching
         the intercept path's locking.
         """
+        if self._uses_virtual_time:
+            if offset_ms:
+                await self._scheduler.runtime.sleep(offset_ms / 1000.0)
+            await self._dispatch_registered_child(child, parent_corr)
+            return
         await self._sleep_offset_ms(offset_ms)
         if self._cleaning_up:
             return
@@ -1655,6 +1695,13 @@ class BranchOrchestrator:
 
     async def _release_blocked_join(self, pending: PendingBranchJoin) -> None:
         """Dispatch the parent's gated turn and update stats."""
+        if self._uses_virtual_time:
+            self._scheduler.execute_async(self._dispatch_released_join(pending))
+        else:
+            await self._dispatch_released_join(pending)
+
+    async def _dispatch_released_join(self, pending: PendingBranchJoin) -> None:
+        """Issue an already released join after capacity becomes available."""
         assert pending.gated_turn_index is not None, (
             "_release_blocked_join called without a gated_turn_index"
         )

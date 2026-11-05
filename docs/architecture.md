@@ -66,6 +66,60 @@ The Timing Manager controls and coordinates the timing of requests during benchm
 - Supporting advanced timing scenarios, such as replaying traces with specific inter-arrival times or simulating bursty traffic
 - Ensuring that requests are dispatched to workers at the correct intervals for reliable measurement
 
+`PhaseRunner` shares a `TimingRuntime` with credit issuance, concurrency waits,
+`LoopScheduler`, and `PhaseLifecycle`. The default `RealTimingRuntime` uses Python
+clocks and asyncio timers. Timer deadlines use `timer_time()`; performance
+timestamps use `now_ns()`. Absolute scheduling bridges those two clock origins.
+The orchestrator enters an explicit `run_scope()` across warmup and profiling;
+ordinary activity scopes only track runnable and blocked work. Phase cancellation
+uses the credit-router protocol's drain barrier, without depending on a concrete
+router implementation.
+
+This fork maintains a local AgentX adapter for the SGLang simulator's
+Ready/Grant v1 protocol. SGLang does not depend on this fork: other workload
+drivers can implement the same protocol. Ordinary HTTP against `BLOCKING` mode
+uses real clocks and requires no simulator adapter.
+
+The optional `sglang_simulator` transport, together with
+`AIPERF_TIMING_SIMULATOR_COORDINATOR=tcp://127.0.0.1:<port>`, selects an externally
+advanced runtime for agentic replay. AgentX still runs its original dataset
+loader, workers, branches, joins, and phase logic. SGLang must run in `OFFLINE`
+mode with its optional coordinator enabled.
+Published timestamps use a fixed synthetic epoch; they are not wall-clock dates.
+
+At each virtual timestamp, the timing manager:
+
+1. Processes request completions only after both the worker return and the
+   simulator's matching terminal event arrive.
+2. Drains callbacks and due workload timers, including tool waits and child
+   dispatches. Explicit activity tracking accounts for tasks waiting on capacity
+   or phase events; it does not inspect asyncio internals.
+3. Sends newly issued request IDs, cancellations, and the next timer deadline to
+   the simulator. Time may advance only after the corresponding HTTP payloads
+   have arrived at the server.
+
+Completions precede deadlines at the same timestamp; phase deadlines precede
+new workload timers. Warmup and profiling share the server cache and clock but
+retain separate phase identities and statistics. Final result publication waits
+for the simulator's `FINISHED` acknowledgment, including native request cleanup.
+At grace expiry, phase completion waits for each cancellation terminal, worker
+return, and native accounting callback. Pending DAG joins are then cleaned up
+without waiting for workload timers beyond the cutoff.
+Wall-clock timeouts detect broken connections or stalled participants; they do
+not determine workload timing. Unsupported options fail during configuration.
+If coordinated execution fails, the timing manager requests cancellation with
+the original service error. The controller collects available records within
+a bounded timeout and exits nonzero without publishing phase success.
+Cancelled output retains available request records; uncommitted phase boundaries
+are reported as unknown rather than replaced with wall-clock timestamps.
+
+Workload input still passes through the native loader and prompt composer. Weka
+traces supply their own response history, so simulated output text does not
+replace that history. The server schedules the actual tokenized prompts and
+uses those token IDs for cache reuse. Chat-template and cache-bust overhead can
+make wire token counts differ from trace proxy lengths; response metadata and
+usage must agree on the actual prompt, completion, and cached token counts.
+
 ### Worker Manager
 
 The Worker Manager orchestrates and manages the pool of worker processes that execute benchmarking tasks.

@@ -33,6 +33,7 @@ def mock_credit_router() -> MagicMock:
     m = MagicMock()
     m.send_credit = AsyncMock()
     m.cancel_all_credits = AsyncMock()
+    m.wait_for_cancellation_drain = AsyncMock()
     m.mark_credits_complete = MagicMock()
     m.reset = MagicMock()
     return m

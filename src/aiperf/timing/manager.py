@@ -32,6 +32,8 @@ from aiperf.timing.phase_orchestrator import PhaseOrchestrator
 
 if TYPE_CHECKING:
     from aiperf.config.resolution.plan import BenchmarkRun
+    from aiperf.simulation.completion import SimulationPhasePublisher
+    from aiperf.simulation.router import SimulatorCreditRouter
 
 
 class TimingManager(BaseComponentService):
@@ -81,6 +83,8 @@ class TimingManager(BaseComponentService):
         self.event_loop_monitor = EventLoopMonitor(self.service_id)
 
         self._phase_orchestrator: PhaseOrchestrator | None = None
+        self._simulator: SimulatorCreditRouter | None = None
+        self._simulation_publisher: SimulationPhasePublisher | None = None
 
     @on_message(MessageType.DATASET_CONFIGURED_NOTIFICATION)
     async def _on_dataset_configured_notification(
@@ -134,13 +138,45 @@ class TimingManager(BaseComponentService):
 
         self.debug(f"Configuring phase orchestrator for {self.service_id}")
 
+        credit_router = self.sticky_router
+        runtime = None
+        endpoint = Environment.TIMING.SIMULATOR_COORDINATOR
+        if endpoint or self.run.cfg.endpoint.transport == "sglang_simulator":
+            from aiperf.common.virtual_timing_runtime import VirtualTimingRuntime
+            from aiperf.simulation.completion import SimulationPhasePublisher
+            from aiperf.simulation.config import validate_simulation
+            from aiperf.simulation.identity import VIRTUAL_TIMESTAMP_ORIGIN_NS
+            from aiperf.simulation.router import SimulatorCreditRouter
+
+            validate_simulation(self.run, self.config, endpoint)
+            self._simulation_publisher = SimulationPhasePublisher(
+                pub_client=self.pub_client,
+                service_id=self.service_id,
+                final_phase_config=self.config.phase_configs[-1],
+                artifact_dir=self.run.artifact_dir,
+                benchmark_id=self.run.benchmark_id,
+            )
+            self.phase_publisher = self._simulation_publisher
+            runtime = VirtualTimingRuntime(
+                timestamp_origin_ns=VIRTUAL_TIMESTAMP_ORIGIN_NS
+            )
+            self._simulator = SimulatorCreditRouter(
+                self.sticky_router,
+                benchmark_id=self.run.benchmark_id,
+                endpoint=endpoint,
+                runtime=runtime,
+                artifact_dir=self.run.artifact_dir,
+            )
+            credit_router = self._simulator
+
         # Create orchestrator that executes phases
         self._phase_orchestrator = PhaseOrchestrator(
             config=self.config,
             phase_publisher=self.phase_publisher,
-            credit_router=self.sticky_router,
+            credit_router=credit_router,
             dataset_metadata=self._dataset_metadata,
             run=self.run,
+            runtime=runtime,
         )
         await self._phase_orchestrator.initialize()
 
@@ -186,8 +222,25 @@ class TimingManager(BaseComponentService):
         self.event_loop_monitor.start()
 
         self.debug("Starting profiling")
-        task = self.execute_async(self._phase_orchestrator.start())
+        task = self.execute_async(self._run_profiling())
         task.add_done_callback(self._on_phase_orchestrator_done)
+
+    async def _run_profiling(self) -> None:
+        if self._simulator is None:
+            await self._phase_orchestrator.start()
+            return
+        tasks = [
+            asyncio.create_task(self._phase_orchestrator.start()),
+            asyncio.create_task(self._simulator.drive()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+            await self._simulation_publisher.flush()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _on_phase_orchestrator_done(self, task: asyncio.Task) -> None:
         """Surface phase-orchestrator failures to the SystemController.
@@ -233,6 +286,7 @@ class TimingManager(BaseComponentService):
             BaseServiceErrorMessage(
                 service_id=self.service_id,
                 error=ErrorDetails.from_exception(exc),
+                abort_run=self._simulator is not None,
             )
         )
 
@@ -246,6 +300,7 @@ class TimingManager(BaseComponentService):
                 service_id=self.service_id,
                 error=details
                 or ErrorDetails(message="Phase orchestrator entered FAILED state"),
+                abort_run=self._simulator is not None,
             )
         )
 
@@ -280,6 +335,9 @@ class TimingManager(BaseComponentService):
 
         if self._phase_orchestrator:
             await self._phase_orchestrator.stop()
+
+        if self._simulator is not None:
+            self._simulator.close()
 
         self.event_loop_monitor.stop()
 

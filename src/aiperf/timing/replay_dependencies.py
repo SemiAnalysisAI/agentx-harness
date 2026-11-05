@@ -285,7 +285,12 @@ class ReplayBarrierCoordinator:
         ready = [key for key in state.pending if self._ready(state, key)]
         for key in sorted(ready):
             pending = state.pending.pop(key)
-            task = asyncio.create_task(self._dispatch_pending(pending))
+            task = (
+                self._scheduler.execute_async(self._dispatch_pending(pending))
+                if self._scheduler is not None
+                and self._scheduler.runtime.is_virtual is True
+                else asyncio.create_task(self._dispatch_pending(pending))
+            )
             self._dispatch_tasks.add(task)
             task.add_done_callback(self._dispatch_tasks.discard)
         if state.in_flight == 0:
@@ -304,7 +309,9 @@ class ReplayBarrierCoordinator:
             return
         loop = asyncio.get_running_loop()
         delay = 0.0 if state.idle_cap_expired else cap
-        state.idle_watchdog = loop.call_later(
+        runtime = self._scheduler.runtime
+        timer = runtime if runtime.is_virtual is True else loop
+        state.idle_watchdog = timer.call_later(
             delay, self._enforce_root_idle_cap, root_id
         )
 

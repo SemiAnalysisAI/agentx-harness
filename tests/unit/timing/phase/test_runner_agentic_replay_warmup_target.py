@@ -44,6 +44,7 @@ def _make_runner(
     pub.publish_progress = AsyncMock()
     router = MagicMock()
     router.send_credit = router.cancel_all_credits = AsyncMock()
+    router.wait_for_cancellation_drain = AsyncMock()
     router.mark_credits_complete = MagicMock()
     router.set_return_callback = router.set_first_token_callback = MagicMock()
     conc = MagicMock()

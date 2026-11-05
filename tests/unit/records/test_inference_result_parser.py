@@ -18,13 +18,22 @@ from aiperf.common.models import (
     Usage,
 )
 from aiperf.endpoints.openai_chat import ChatEndpoint
+from aiperf.metrics.types.e2e_output_throughput_metric import (
+    E2EOutputTokenThroughputMetric,
+)
+from aiperf.metrics.types.inter_token_latency_metric import InterTokenLatencyMetric
 from aiperf.plugin.enums import PluginType
+from aiperf.records.record_processor_service import RecordProcessor
+from aiperf.simulation.identity import VIRTUAL_TIMESTAMP_ORIGIN_NS
+from aiperf.simulation.record_timing import apply_simulator_timing
 from tests.harness import mock_plugin
+from tests.unit.metrics.conftest import run_simple_metrics_pipeline
 from tests.unit.records.conftest import (
     create_invalid_record,
     create_test_request_info,
     rebuild_payload_bytes,
 )
+from tests.unit.transports.test_simulator_record_timing import record_with, snapshot
 
 
 @pytest.fixture
@@ -34,6 +43,58 @@ def request_record(sample_turn):
         request_info=create_test_request_info(turns=[sample_turn]),
         model_name="test-model",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arrival_ns", [0, 2**53 + 1])
+async def test_simulator_metadata_passes_native_endpoint_and_records_pipeline(
+    server_token_parser,
+    sample_turn,
+    arrival_ns: int,
+) -> None:
+    parser = server_token_parser
+    record = apply_simulator_timing(
+        record_with(
+            snapshot(
+                arrival_ns=arrival_ns,
+                first_token_ns=arrival_ns + 10,
+                last_token_ns=arrival_ns + 30,
+                commit_ns=arrival_ns + 40,
+                terminal_ns=arrival_ns + 40,
+            )
+        ),
+        "request",
+    )
+    record.request_info = create_test_request_info(turns=[sample_turn])
+    record.model_name = "test-model"
+    parser.endpoint = ChatEndpoint(model_endpoint=record.request_info.model_endpoint)
+    for response in record.responses:
+        body = response.get_json()
+        if isinstance(body, dict) and body.get("choices"):
+            body["object"] = "chat.completion.chunk"
+            response.packets[-1].value = orjson.dumps(body).decode()
+    parsed = await parser.parse_request_record(record)
+    assert parsed.valid
+    assert len(parsed.content_responses) == 1
+    assert parsed.content_responses[0].data.get_text() == "abc"
+    assert parsed.token_counts.input == 7 and parsed.token_counts.output == 3
+    assert parsed.final_usage.prompt_cache_read_tokens == 2
+    result = run_simple_metrics_pipeline(
+        [parsed], InterTokenLatencyMetric.tag, E2EOutputTokenThroughputMetric.tag
+    )
+    assert result[InterTokenLatencyMetric.tag] == [10]
+    assert result[E2EOutputTokenThroughputMetric.tag] == pytest.approx([100_000_000])
+    parsed.create_error_from_invalid()
+    assert parsed.request.error is None
+    metadata = RecordProcessor._create_metric_record_metadata(
+        MagicMock(service_id="processor"),
+        record,
+        worker_id="worker",
+        last_response_perf_ns=parsed.responses[-1].perf_ns,
+    )
+    assert metadata.request_start_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + arrival_ns
+    assert metadata.request_end_ns == VIRTUAL_TIMESTAMP_ORIGIN_NS + arrival_ns + 40
+    assert metadata.request_ack_ns is None and metadata.cancellation_time_ns is None
 
 
 @pytest.fixture

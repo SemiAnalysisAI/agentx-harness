@@ -12,10 +12,12 @@ sessions and prefill requests are active during benchmarking.
 """
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from aiperf.common.enums import CreditPhase
+from aiperf.common.timing_runtime import TimingRuntime
 
 PhaseRuntimeKey = int | CreditPhase
 
@@ -70,13 +72,18 @@ class DynamicConcurrencyLimit:
         ```
     """
 
-    def __init__(self, initial_limit: int = 0) -> None:
+    def __init__(
+        self, initial_limit: int = 0, *, runtime: TimingRuntime | None = None
+    ) -> None:
         """Initialize with initial concurrency limit.
 
         Args:
             initial_limit: Starting number of available slots (default 0).
         """
         self._semaphore = asyncio.Semaphore(initial_limit)
+        self._runtime = runtime
+        self._capacity_changed = asyncio.Event()
+        self._virtual_waiters: deque[object] = deque()
         self._current_limit = initial_limit
         self._debt = 0
         self.stats = ConcurrencyStats()
@@ -140,6 +147,12 @@ class DynamicConcurrencyLimit:
             self._debt += diff
 
         self._current_limit = new_limit
+        self._notify_capacity_changed()
+
+    def _notify_capacity_changed(self) -> None:
+        if self._runtime is not None and self._runtime.is_virtual:
+            changed, self._capacity_changed = self._capacity_changed, asyncio.Event()
+            changed.set()
 
     async def acquire(self) -> None:
         """Acquire a concurrency slot.
@@ -150,7 +163,20 @@ class DynamicConcurrencyLimit:
         # Track if we'll need to wait (semaphore has no available slots)
         if self._semaphore.locked():
             self.stats.wait_count += 1
-        await self._semaphore.acquire()
+        if self._runtime is not None and self._runtime.is_virtual:
+            ticket = object()
+            self._virtual_waiters.append(ticket)
+            try:
+                while (
+                    self._virtual_waiters[0] is not ticket or self._semaphore.locked()
+                ):
+                    await self._runtime.wait_event(self._capacity_changed)
+                await self._semaphore.acquire()
+            finally:
+                self._virtual_waiters.remove(ticket)
+                self._notify_capacity_changed()
+        else:
+            await self._semaphore.acquire()
         self.stats.acquire_count += 1
 
     def release(self) -> None:
@@ -164,6 +190,7 @@ class DynamicConcurrencyLimit:
             self._debt -= 1
         else:
             self._semaphore.release()
+        self._notify_capacity_changed()
 
     def try_acquire(self) -> bool:
         """Try to acquire a concurrency slot without blocking.
@@ -177,7 +204,7 @@ class DynamicConcurrencyLimit:
         Note:
             Must still call release() if True is returned.
         """
-        if self._semaphore.locked():
+        if self.locked():
             return False
         # Semaphore not locked means _value > 0, so acquire won't block
         self._semaphore._value -= 1
@@ -186,7 +213,7 @@ class DynamicConcurrencyLimit:
 
     def locked(self) -> bool:
         """Check if the semaphore is locked."""
-        return self._semaphore.locked()
+        return self._semaphore.locked() or bool(self._virtual_waiters)
 
 
 class GlobalPhaseConcurrencyLimiter:
@@ -207,10 +234,11 @@ class GlobalPhaseConcurrencyLimiter:
         to complete gracefully.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, runtime: TimingRuntime | None = None) -> None:
         """Initialize as disabled with empty phase limits and a global limit of 0."""
         self._enabled = False
-        self._global_limit = DynamicConcurrencyLimit()
+        self._runtime = runtime
+        self._global_limit = DynamicConcurrencyLimit(runtime=runtime)
         self._phase_limits: dict[PhaseRuntimeKey, DynamicConcurrencyLimit] = {}
 
     @property
@@ -232,7 +260,9 @@ class GlobalPhaseConcurrencyLimiter:
             return
 
         self._enabled = True
-        self._phase_limits[phase] = DynamicConcurrencyLimit(limit)
+        self._phase_limits[phase] = DynamicConcurrencyLimit(
+            limit, runtime=self._runtime
+        )
         self._global_limit.set_limit(limit)
 
     async def acquire(
@@ -277,7 +307,7 @@ class GlobalPhaseConcurrencyLimiter:
                 return False
 
             return True
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             if acquired_phase:
                 phase_limit.release()
             if acquired_global:
@@ -402,14 +432,14 @@ class ConcurrencyManager:
     and global limits.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, runtime: TimingRuntime | None = None) -> None:
         """Initialize the concurrency manager.
 
         Note: By default, both session and prefill concurrency limiting is disabled.
         They will be enabled or disabled based on the phase config.
         """
-        self._session_limiter = GlobalPhaseConcurrencyLimiter()
-        self._prefill_limiter = GlobalPhaseConcurrencyLimiter()
+        self._session_limiter = GlobalPhaseConcurrencyLimiter(runtime=runtime)
+        self._prefill_limiter = GlobalPhaseConcurrencyLimiter(runtime=runtime)
 
     def configure_for_phase(
         self,

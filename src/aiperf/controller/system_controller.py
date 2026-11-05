@@ -505,6 +505,17 @@ class SystemController(SignalHandlerMixin, BaseService):
         # A dead producer can no longer join its result domain; drop it from the
         # barrier so shutdown isn't blocked forever, then re-check readiness.
         self._result_join_coordinator.unregister_service(message.service_id)
+        if message.abort_run:
+            # The producer cannot publish normal completion. Collect partial
+            # results through the bounded cancel path instead of waiting for it.
+            # Keep the original error above, without adding a duplicate abort.
+            self._abort_recorded = True
+            if not self._shutdown_triggered:
+                await self._cancel_profiling(
+                    reason=ProfileCancelReason.SERVICE_ERROR,
+                    reason_detail=message.error.message,
+                )
+            return
         await self._check_and_trigger_shutdown()
 
     @on_message(MessageType.STATUS)
@@ -947,7 +958,12 @@ class SystemController(SignalHandlerMixin, BaseService):
         console.print()
         console.file.flush()
 
-    async def _cancel_profiling(self) -> None:
+    async def _cancel_profiling(
+        self,
+        *,
+        reason: ProfileCancelReason = ProfileCancelReason.USER,
+        reason_detail: str | None = None,
+    ) -> None:
         self.debug("Cancelling profiling of all services")
         self._was_cancelled = True
 
@@ -979,7 +995,8 @@ class SystemController(SignalHandlerMixin, BaseService):
             responses = await self.send_command_and_wait_for_all_responses(
                 ProfileCancelCommand(
                     service_id=self.service_id,
-                    reason=ProfileCancelReason.USER,
+                    reason=reason,
+                    reason_detail=reason_detail,
                 ),
                 records_manager_ids,
                 timeout=Environment.SERVICE.PROFILE_CANCEL_TIMEOUT,
