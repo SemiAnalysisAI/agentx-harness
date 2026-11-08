@@ -220,6 +220,11 @@ def validate_dataset_wrap_policy(
         )
 
 
+#: Distinguishes "this instance has no memo attribute at all" (assembled with
+#: ``__new__``) from "the memo is present but empty".
+_UNMEMOIZED = object()
+
+
 class TrajectorySource(ConversationSource):
     """ConversationSource that samples a fixed set of trajectories with a randomized
     per-trajectory start position drawn from [start_min_ratio, start_max_ratio] of
@@ -438,8 +443,9 @@ class TrajectorySource(ConversationSource):
         send the join turn n, so n-1 is still its warmup turn). Streams whose
         first request is at/after t* contribute nothing to warm.
         """
-        if self._warmup_credit_counts_by_lane is not None:
-            return self._warmup_credit_counts_by_lane
+        cached = getattr(self, "_warmup_credit_counts_by_lane", _UNMEMOIZED)
+        if cached is not None and cached is not _UNMEMOIZED:
+            return cached
         counts: list[int] = []
         for trajectory in self.trajectories:
             if trajectory.snapshot is None:
@@ -453,15 +459,23 @@ class TrajectorySource(ConversationSource):
                     )
                 )
         result = tuple(counts)
-        self._warmup_credit_counts_by_lane = result
+        # Only instances built through __init__ own the cache attribute; one
+        # assembled with __new__ (tests, tooling) must keep recomputing so a
+        # later reassignment of ``trajectories`` cannot serve a stale value.
+        if cached is not _UNMEMOIZED:
+            self._warmup_credit_counts_by_lane = result
         return result
 
     @property
     def warmup_credit_count(self) -> int:
         """Total mandatory snapshot primers across all trajectory lanes."""
-        if self._warmup_credit_count is None:
-            self._warmup_credit_count = sum(self.warmup_credit_counts_by_lane)
-        return self._warmup_credit_count
+        cached = getattr(self, "_warmup_credit_count", _UNMEMOIZED)
+        if cached is not None and cached is not _UNMEMOIZED:
+            return cached
+        total = sum(self.warmup_credit_counts_by_lane)
+        if cached is not _UNMEMOIZED:
+            self._warmup_credit_count = total
+        return total
 
     def _build_trajectories(self) -> list[Trajectory]:
         """Sample one trajectory per concurrency lane straight from the sampler.
