@@ -69,6 +69,13 @@ class LoopScheduler:
         # parallel map so the long-standing ``_handles`` tuple contract remains
         # stable for tests and diagnostics.
         self._handle_groups: dict[HandleId, str] = {}
+        # Inverted index over ``_handle_groups``: group → live handle ids in
+        # insertion order. ``_handle_groups`` stays the single source of truth
+        # for membership; this only removes the O(all handles) scan from the
+        # per-group queries. Ordering is preserved (rather than a set) because
+        # ``cap_pending_delay_for_group`` re-schedules in iteration order and
+        # must produce the same order the ``_handles`` scan it replaces did.
+        self._pending_ids_by_group: dict[str, dict[HandleId, None]] = {}
         self._exception_handler: Callable[[asyncio.Task], None] | None = (
             exception_handler
         )
@@ -121,10 +128,34 @@ class LoopScheduler:
         if handle_container[0] is not None:
             handle_id = id(handle_container[0])
             self._handles.pop(handle_id, None)
-            self._handle_groups.pop(handle_id, None)
+            self._untrack_group_membership(handle_id)
         task = self._loop.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._done_callback)
+
+    def _index_pending_handle(self, handle_id: HandleId, group_id: str) -> None:
+        """Record ``handle_id`` as pending under ``group_id``."""
+        self._pending_ids_by_group.setdefault(group_id, {})[handle_id] = None
+
+    def _unindex_pending_handle(self, handle_id: HandleId, group_id: str) -> None:
+        """Drop ``handle_id`` from ``group_id``, pruning the group when empty."""
+        ids = self._pending_ids_by_group.get(group_id)
+        if ids is None:
+            return
+        ids.pop(handle_id, None)
+        if not ids:
+            del self._pending_ids_by_group[group_id]
+
+    def _untrack_group_membership(self, handle_id: HandleId) -> str | None:
+        """Remove ``handle_id`` from both group maps; return its former group.
+
+        Every site that stops tracking a pending timer goes through here so the
+        inverted index cannot drift from ``_handle_groups``.
+        """
+        group_id = self._handle_groups.pop(handle_id, None)
+        if group_id is not None:
+            self._unindex_pending_handle(handle_id, group_id)
+        return group_id
 
     def _track_handle_and_return_id(
         self,
@@ -144,6 +175,7 @@ class LoopScheduler:
         self._handles[handle_id] = (handle, coro)
         if group_id is not None:
             self._handle_groups[handle_id] = group_id
+            self._index_pending_handle(handle_id, group_id)
         return handle_id
 
     def execute_async(self, coro: Coroutine) -> asyncio.Task:
@@ -291,7 +323,7 @@ class LoopScheduler:
         handle_data = self._handles.pop(handle_id, None)
         if handle_data is None:
             return False
-        self._handle_groups.pop(handle_id, None)
+        self._untrack_group_membership(handle_id)
         handle, coro = handle_data
         handle.cancel()
         coro.close()
@@ -307,6 +339,7 @@ class LoopScheduler:
         items = list(self._handles.values())
         self._handles.clear()
         self._handle_groups.clear()
+        self._pending_ids_by_group.clear()
 
         # Cancel handles first, then close coroutines
         for handle, coro in items:
@@ -375,6 +408,7 @@ class LoopScheduler:
         ]
         self._handles.clear()
         self._handle_groups.clear()
+        self._pending_ids_by_group.clear()
         for handle, coro, group_id in items:
             target = max(now, handle.when() - shift_sec)
             handle.cancel()
@@ -404,9 +438,9 @@ class LoopScheduler:
         if max_delay_sec < 0:
             raise ValueError("max_delay_sec must be non-negative")
         selected = [
-            (handle_id, handle, coro)
-            for handle_id, (handle, coro) in self._handles.items()
-            if self._handle_groups.get(handle_id) == group_id
+            (handle_id, *self._handles[handle_id])
+            for handle_id in self._pending_ids_by_group.get(group_id, ())
+            if handle_id in self._handles
         ]
         if not selected:
             return 0.0
@@ -423,7 +457,7 @@ class LoopScheduler:
 
         for handle_id, handle, coro in selected:
             self._handles.pop(handle_id, None)
-            self._handle_groups.pop(handle_id, None)
+            self._untrack_group_membership(handle_id)
             target = max(now, handle.when() - shift_sec)
             handle.cancel()
             handle_container = [None]
