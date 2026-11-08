@@ -57,6 +57,7 @@ from aiperf.common.models import (
     MemoryMapClientMetadata,
     Turn,
 )
+from aiperf.dataset.string_dedup import dedupe_conversation_strings
 
 _logger = AIPerfLogger(__name__)
 
@@ -795,11 +796,13 @@ class MemoryMapDatasetClient:
             MemoryMapSerializationError: If deserialization fails
         """
         try:
-            return Conversation.model_validate_json(data)
+            conversation = Conversation.model_validate_json(data)
         except Exception as e:
             raise MemoryMapSerializationError(
                 f"Failed to decode conversation data: {e}"
             ) from e
+        dedupe_conversation_strings(conversation)
+        return conversation
 
     def get_conversation(self, conversation_id: str) -> Conversation:
         """Get a conversation by ID. O(1) lookup using byte offset index.
