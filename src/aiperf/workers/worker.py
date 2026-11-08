@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
-
 
 from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.base_component_service import BaseComponentService
@@ -99,7 +99,18 @@ if TYPE_CHECKING:
 # hold the whole corpus costs workers x corpus, i.e. roughly 0.5 TB at the
 # 393-trace corpus with 100 workers. A miss costs one re-decode at session
 # creation, which is cheap next to that, so a small working set is enough.
-_CONVERSATION_CACHE_MAX_ENTRIES = 16
+_CONVERSATION_CACHE_MAX_ENTRIES = int(
+    os.environ.get("AIPERF_CONVERSATION_CACHE_MAX_ENTRIES", "16")
+)
+"""Decoded conversations retained per worker (LRU), env-tunable.
+
+A miss costs one decode plus, once the string dedup below is active, one
+dedup pass over that conversation -- so the bound trades memory against
+repeated decode work. 16 was chosen when a decoded conversation cost ~14 MB
+and a large cache held the whole 393-trace corpus per worker (~0.5 TB at 100
+workers). With repeated large strings collapsed at decode the per-conversation
+footprint is far smaller, so a larger bound may now be affordable; measure
+before raising the default."""
 
 
 def _phase_needs_first_token_callback(phase) -> bool:
