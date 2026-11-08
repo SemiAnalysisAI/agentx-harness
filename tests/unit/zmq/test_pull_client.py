@@ -280,7 +280,7 @@ class TestZMQPullClientWireCodec:
         await client.initialize()
         await client.start()
 
-        await asyncio.wait_for(done_event.wait(), timeout=EVENT_WAIT_HANG_GUARD_S)
+        await asyncio.wait_for(done_event.wait(), timeout=1.0)
         await asyncio.sleep(0)
 
         assert decoded_frames == [frame]
