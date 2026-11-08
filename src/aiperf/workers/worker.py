@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import os
 import time
 import uuid
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
-import zmq
 
 from aiperf.common.aiperf_logger import AIPerfLogger
 from aiperf.common.base_component_service import BaseComponentService
