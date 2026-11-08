@@ -292,6 +292,15 @@ class TrajectorySource(ConversationSource):
         # ``validate_dataset_wrap_policy``.
         self._target_size = concurrency
         self.trajectories: list[Trajectory] = self._build_trajectories()
+        # Per-lane warmup primer counts and their total are fully determined by
+        # ``self.trajectories`` (each lane's snapshot is created during the
+        # build and never reassigned), and the warmup return path asks for them
+        # on every credit return. Recomputing them there is O(lanes) per
+        # return, i.e. quadratic over the phase: at 50k lanes that pinned the
+        # single timing-manager thread at a full core and held throughput to
+        # ~40 req/s. Memoize on first use.
+        self._warmup_credit_counts_by_lane: tuple[int, ...] | None = None
+        self._warmup_credit_count: int | None = None
 
         if not self.trajectories:
             raise EmptyTracePoolError(
@@ -429,6 +438,8 @@ class TrajectorySource(ConversationSource):
         send the join turn n, so n-1 is still its warmup turn). Streams whose
         first request is at/after t* contribute nothing to warm.
         """
+        if self._warmup_credit_counts_by_lane is not None:
+            return self._warmup_credit_counts_by_lane
         counts: list[int] = []
         for trajectory in self.trajectories:
             if trajectory.snapshot is None:
@@ -441,12 +452,16 @@ class TrajectorySource(ConversationSource):
                         if state.warmup_turn_index is not None
                     )
                 )
-        return tuple(counts)
+        result = tuple(counts)
+        self._warmup_credit_counts_by_lane = result
+        return result
 
     @property
     def warmup_credit_count(self) -> int:
         """Total mandatory snapshot primers across all trajectory lanes."""
-        return sum(self.warmup_credit_counts_by_lane)
+        if self._warmup_credit_count is None:
+            self._warmup_credit_count = sum(self.warmup_credit_counts_by_lane)
+        return self._warmup_credit_count
 
     def _build_trajectories(self) -> list[Trajectory]:
         """Sample one trajectory per concurrency lane straight from the sampler.
