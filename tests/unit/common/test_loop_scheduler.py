@@ -18,7 +18,7 @@ import time
 import pytest
 
 from aiperf.common.constants import NANOS_PER_SECOND
-from aiperf.common.loop_scheduler import LoopScheduler
+from aiperf.common.loop_scheduler import HandleId, LoopScheduler
 from aiperf.common.utils import yield_to_event_loop
 
 # =============================================================================
@@ -227,6 +227,71 @@ class TestScheduleLater:
         )
         assert root_a_after == root_a_before
         scheduler.cancel_all_pending()
+
+    async def test_group_index_matches_group_maps_under_churn(
+        self, scheduler: LoopScheduler
+    ):
+        """The per-group index cannot drift from the maps it mirrors.
+
+        The index exists only to replace full scans, so it is correct only if
+        it agrees with a brute-force walk of ``_handle_groups`` after every
+        operation that can change membership.
+        """
+
+        async def noop():
+            pass
+
+        def brute_force() -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for group in scheduler._handle_groups.values():
+                counts[group] = counts.get(group, 0) + 1
+            return counts
+
+        def indexed() -> dict[str, int]:
+            return {
+                group: len(ids)
+                for group, ids in scheduler._pending_ids_by_group.items()
+                if ids
+            }
+
+        groups = ["root-a", "root-b", "root-c"]
+        live: list[HandleId] = []
+        for step in range(60):
+            choice = step % 3
+            if choice == 0 or not live:
+                live.append(
+                    scheduler.schedule_later(
+                        1.0 + step, noop(), group_id=groups[step % len(groups)]
+                    )
+                )
+            elif choice == 1:
+                scheduler.cancel_handle_id(live.pop(step % len(live)))
+            else:
+                live.append(
+                    scheduler.schedule_at(
+                        scheduler._loop.time() + 1.0 + step,
+                        noop(),
+                        group_id=groups[step % len(groups)],
+                    )
+                )
+            assert indexed() == brute_force(), f"diverged after step {step}"
+
+        # Both cap passes re-track every timer they move; the index must
+        # follow, and the per-group pass must keep the group's timer order.
+        order_before = list(scheduler._pending_ids_by_group["root-a"])
+        whens_before = [scheduler._handles[h][0].when() for h in order_before]
+        assert scheduler.cap_pending_delay_for_group("root-a", 0.5) > 0
+        assert indexed() == brute_force()
+        order_after = list(scheduler._pending_ids_by_group["root-a"])
+        whens_after = [scheduler._handles[h][0].when() for h in order_after]
+        shift = whens_before[0] - whens_after[0]
+        assert [w + shift for w in whens_after] == pytest.approx(whens_before)
+        assert scheduler.cap_pending_delay(0.25) > 0
+        assert indexed() == brute_force()
+
+        scheduler.cancel_all_pending()
+        assert scheduler._pending_ids_by_group == {}
+        assert scheduler._handle_groups == {}
 
     async def test_cap_pending_delay_zero_queues_timer_as_ready_work(
         self, scheduler: LoopScheduler
