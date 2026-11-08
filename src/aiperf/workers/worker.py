@@ -795,7 +795,9 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         # (_clone_conversation_for_session). Decoding a multi-MB conversation on
         # the worker's event loop for every session is both the biggest stall
         # source and, at 50k lanes, the dominant memory consumer.
-        self._conversation_cache: OrderedDict[str, Conversation] = OrderedDict()
+        self._conversation_cache: OrderedDict[
+            tuple[str, int], Conversation
+        ] = OrderedDict()
         if isinstance(msg.client_metadata, MemoryMapClientMetadata):
             self._is_payload_bytes = (
                 msg.client_metadata.format == MemoryMapFormat.PAYLOAD_BYTES
@@ -1696,18 +1698,24 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         containers over the shared payload (see
         :func:`_clone_conversation_for_session`), so a trace replayed by many
         lanes is decoded once per worker rather than once per lane.
+
+        The key includes ``num_turns`` because the PAYLOAD_BYTES reconstruction
+        loops ``range(num_turns)`` and the cheap-path scan uses the credit's
+        count; keying on the conversation id alone would hand a later credit a
+        reconstruction built for a different turn count.
         """
-        conversation_id = credit_context.credit.conversation_id
-        cached = self._conversation_cache.get(conversation_id)
+        credit = credit_context.credit
+        key = (credit.conversation_id, credit.num_turns)
+        cached = self._conversation_cache.get(key)
         if cached is None:
             cached = await self._retrieve_conversation_for_session(
                 credit_context=credit_context,
             )
-            self._conversation_cache[conversation_id] = cached
+            self._conversation_cache[key] = cached
             if len(self._conversation_cache) > _CONVERSATION_CACHE_MAX_ENTRIES:
                 self._conversation_cache.popitem(last=False)
         else:
-            self._conversation_cache.move_to_end(conversation_id)
+            self._conversation_cache.move_to_end(key)
         return _clone_conversation_for_session(cached)
 
     async def _retrieve_conversation_for_session(
