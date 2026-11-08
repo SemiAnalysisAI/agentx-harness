@@ -1663,6 +1663,17 @@ class _WorkerSettings(BaseSettings):
         default=1.0,
         description="Interval in seconds between worker status checks by WorkerManager",
     )
+    CONVERSATION_CACHE_MAX_ENTRIES: int = Field(
+        ge=1,
+        default=16,
+        description="Decoded conversations retained per worker (LRU). A miss costs "
+        "one decode plus one string-dedup pass over that conversation, so this "
+        "trades memory against repeated decode work. 16 was chosen when a decoded "
+        "conversation cost ~14 MB and a full-corpus cache cost ~0.5 TB per 100 "
+        "workers; with repeated large strings collapsed at decode the "
+        "per-conversation footprint is much smaller, so a larger bound may now be "
+        "affordable.",
+    )
     CPU_UTILIZATION_FACTOR: float = Field(
         ge=0.1,
         le=1.0,

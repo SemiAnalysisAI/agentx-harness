@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import uuid
 from collections import OrderedDict
@@ -99,9 +98,7 @@ if TYPE_CHECKING:
 # hold the whole corpus costs workers x corpus, i.e. roughly 0.5 TB at the
 # 393-trace corpus with 100 workers. A miss costs one re-decode at session
 # creation, which is cheap next to that, so a small working set is enough.
-_CONVERSATION_CACHE_MAX_ENTRIES = int(
-    os.environ.get("AIPERF_CONVERSATION_CACHE_MAX_ENTRIES", "16")
-)
+_CONVERSATION_CACHE_MAX_ENTRIES = Environment.WORKER.CONVERSATION_CACHE_MAX_ENTRIES
 """Decoded conversations retained per worker (LRU), env-tunable.
 
 A miss costs one decode plus, once the string dedup below is active, one
