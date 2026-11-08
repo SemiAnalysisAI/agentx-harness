@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from collections.abc import Callable
 
 import zmq.asyncio
 
@@ -48,6 +49,8 @@ class ZMQPushClient(BaseZMQClient):
         address: str,
         bind: bool,
         socket_ops: dict | None = None,
+        *,
+        encode: Callable[[Message], bytes] | None = None,
         **kwargs,
     ) -> None:
         """
@@ -57,8 +60,13 @@ class ZMQPushClient(BaseZMQClient):
             address (str): The address to bind or connect to.
             bind (bool): Whether to bind or connect the socket.
             socket_ops (dict, optional): Additional socket options to set.
+            encode (callable, optional): Channel wire codec replacing
+                ``Message.to_json_bytes``. Injected per channel by
+                ``BaseZMQCommunication.create_client`` (see ``WIRE_CODECS``);
+                None keeps the JSON bus encoding.
         """
         super().__init__(zmq.SocketType.PUSH, address, bind, socket_ops, **kwargs)
+        self._encode = encode
 
     async def _push_message(
         self,
@@ -77,7 +85,11 @@ class ZMQPushClient(BaseZMQClient):
             max_retries = Environment.ZMQ.PUSH_MAX_RETRIES
 
         try:
-            data_json_bytes = message.to_json_bytes()
+            data = (
+                message.to_json_bytes()
+                if self._encode is None
+                else self._encode(message)
+            )
             # copy=False sends without memcpy'ing the payload into a libzmq frame on
             # the event loop thread. The PUSH path carries record/result payloads
             # (e.g. multi-thousand-token inference results) where that copy shows up
@@ -88,9 +100,9 @@ class ZMQPushClient(BaseZMQClient):
             # PUSH is send-only (no recv driver on this socket), so there is no
             # FD edge-trigger to contend with. With the default SNDHWM=0 it never
             # blocks; a finite HWM raises zmq.Again and falls to the retry path.
-            zmq.Socket.send(self.socket, data_json_bytes, flags=zmq.NOBLOCK, copy=False)
+            zmq.Socket.send(self.socket, data, flags=zmq.NOBLOCK, copy=False)
             if self.is_trace_enabled:
-                self.trace(f"Pushed json data: {data_json_bytes}")
+                self.trace(f"Pushed data: {data}")
         except (asyncio.CancelledError, zmq.ContextTerminated):
             self.debug("Push client cancelled or context terminated")
             return

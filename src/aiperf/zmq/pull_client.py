@@ -54,6 +54,7 @@ class ZMQPullClient(BaseZMQClient):
         socket_ops: dict | None = None,
         max_pull_concurrency: int | None = None,
         additional_bind_address: str | None = None,
+        decode: Callable[[bytes], Message] | None = None,
         **kwargs,
     ) -> None:
         """
@@ -66,6 +67,10 @@ class ZMQPullClient(BaseZMQClient):
             max_pull_concurrency (int, optional): The maximum number of concurrent requests to allow.
             additional_bind_address (str, optional): Optional second address to bind to for dual-bind
                 mode (e.g., IPC + TCP in Kubernetes). Only used when bind=True.
+            decode (callable, optional): Channel wire codec replacing
+                ``Message.from_json``. Injected per channel by
+                ``BaseZMQCommunication.create_client`` (see ``WIRE_CODECS``);
+                None keeps the JSON bus decoding.
         """
         super().__init__(
             zmq.SocketType.PULL,
@@ -78,6 +83,7 @@ class ZMQPullClient(BaseZMQClient):
         self._pull_callbacks: dict[
             MessageTypeT, Callable[[Message], Coroutine[Any, Any, None]]
         ] = {}
+        self._decode: Callable[[bytes], Message] = decode or Message.from_json
 
         # `or` (not `is not None`): 0 is not a valid bound here — it would halt
         # the FD drain entirely (`while self._inflight < self._max_inflight`), so
@@ -165,11 +171,11 @@ class ZMQPullClient(BaseZMQClient):
         self._rearm_pending = False
         self._on_pull_readable()
 
-    async def _process_message_fd(self, message_json_bytes: bytes) -> None:
+    async def _process_message_fd(self, message_bytes: bytes) -> None:
         """FD-reader variant of ``_process_message`` using the _inflight counter."""
         try:
-            message = Message.from_json(message_json_bytes)
-            del message_json_bytes
+            message = self._decode(message_bytes)
+            del message_bytes
             if message.message_type in self._pull_callbacks:
                 await self._pull_callbacks[message.message_type](message)
             else:

@@ -17,6 +17,7 @@ from aiperf.common.singleton import Singleton
 from aiperf.config.comm import ZMQDualBindConfig, ZMQIPCConfig, ZMQTCPConfig
 from aiperf.plugin import plugins
 from aiperf.plugin.enums import PluginType
+from aiperf.zmq.inference_results_wire import WIRE_CODECS
 
 if TYPE_CHECKING:
     from aiperf.common.protocols import CommunicationClientProtocol
@@ -79,6 +80,12 @@ class BaseZMQCommunication(BaseCommunication, AIPerfLoggerMixin, ABC, Singleton)
             max_pull_concurrency: The maximum number of concurrent pull requests to allow. (Only used for pull clients)
             additional_bind_address: Optional second address to bind to for dual-bind mode (e.g., IPC + TCP).
         """
+        # A channel's wire codec is a property of the channel, not of the caller:
+        # every PUSH and PULL client on it gets the same codec, so one socket can
+        # never carry two encodings.
+        wire_codec = WIRE_CODECS.get((client_type, address))
+        if wire_codec is not None:
+            kwargs = {**kwargs, **wire_codec}
         if (client_type, address, bind) in self._clients_cache:
             return self._clients_cache[(client_type, address, bind)]
 

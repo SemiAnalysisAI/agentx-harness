@@ -1707,7 +1707,8 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         Flow:
         1. Update task statistics (total and success/failure counts)
         2. Wrap record in InferenceResultsMessage
-        3. Push to RecordProcessor via PUSH socket (fire-and-forget)
+        3. Push to RecordProcessor via PUSH socket (fire-and-forget). This channel
+           is encoded as msgpack, not JSON: see ``aiperf.zmq.inference_results_wire``.
 
         Note: Uses execute_async() to avoid blocking on network I/O.
         """
