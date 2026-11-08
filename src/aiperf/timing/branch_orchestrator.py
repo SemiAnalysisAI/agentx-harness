@@ -240,6 +240,97 @@ class ChildJoinEntry:
     prereq_key: str | None
 
 
+_MISSING: Any = object()
+
+
+class _ChildJoinMap(dict[str, list[ChildJoinEntry]]):
+    """``child_corr -> join entries``, keeping a per-parent entry count in step.
+
+    The orchestrator asks "does this parent still have tracked children?" on
+    every credit that spawns children (``_finalize_failed_dispatches``), so
+    walking every entry of every child is O(total tracked entries) per credit
+    -- the timing_manager hotspot at 50k lanes. Maintaining the index inside
+    the mapping means no mutation path -- including tests that assign into
+    the map directly -- can desynchronize it.
+
+    Invariant: an entry list is treated as immutable once stored. Replace it
+    by assigning a new list (``m[k] = new``); mutating a stored list in place
+    would bypass the index. Every mutating ``dict`` method is overridden;
+    ``copy()`` returns a plain ``dict`` (no index) by design.
+    """
+
+    __slots__ = ("_entry_counts_by_parent",)
+
+    def __init__(self, entry_counts_by_parent: dict[str, int]) -> None:
+        super().__init__()
+        self._entry_counts_by_parent = entry_counts_by_parent
+
+    def _count(self, entries: list[ChildJoinEntry]) -> None:
+        counts = self._entry_counts_by_parent
+        for entry in entries:
+            parent = entry.parent_correlation_id
+            counts[parent] = counts.get(parent, 0) + 1
+
+    def _uncount(self, entries: list[ChildJoinEntry]) -> None:
+        counts = self._entry_counts_by_parent
+        for entry in entries:
+            parent = entry.parent_correlation_id
+            remaining = counts.get(parent, 0) - 1
+            if remaining > 0:
+                counts[parent] = remaining
+            else:
+                # Drop at zero so the index stays sized by live parents.
+                counts.pop(parent, None)
+
+    def __setitem__(self, child_corr: str, entries: list[ChildJoinEntry]) -> None:
+        previous = dict.get(self, child_corr, _MISSING)
+        if previous is not _MISSING:
+            self._uncount(previous)
+        dict.__setitem__(self, child_corr, entries)
+        self._count(entries)
+
+    def __delitem__(self, child_corr: str) -> None:
+        entries = dict.__getitem__(self, child_corr)
+        dict.__delitem__(self, child_corr)
+        self._uncount(entries)
+
+    def pop(self, child_corr: str, default: Any = _MISSING) -> Any:
+        if default is _MISSING:
+            entries = dict.pop(self, child_corr)
+        else:
+            entries = dict.pop(self, child_corr, _MISSING)
+            if entries is _MISSING:
+                return default
+        self._uncount(entries)
+        return entries
+
+    def popitem(self) -> tuple[str, list[ChildJoinEntry]]:
+        child_corr, entries = dict.popitem(self)
+        self._uncount(entries)
+        return child_corr, entries
+
+    def setdefault(
+        self, child_corr: str, default: list[ChildJoinEntry] | None = None
+    ) -> list[ChildJoinEntry]:
+        if child_corr in self:
+            return dict.__getitem__(self, child_corr)
+        entries = [] if default is None else default
+        self[child_corr] = entries
+        return entries
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        for child_corr, entries in dict(*args, **kwargs).items():
+            self[child_corr] = entries
+
+    def __ior__(self, other: Any) -> _ChildJoinMap:
+        self.update(other)
+        return self
+
+    def clear(self) -> None:
+        dict.clear(self)
+        self._entry_counts_by_parent.clear()
+
+
 class BranchOrchestrator:
     """Handles DAG branch dispatch (FORK and SPAWN modes).
 
@@ -292,7 +383,13 @@ class BranchOrchestrator:
         # an active join dispatches the gated turn.
         self._future_joins: dict[str, dict[int, PendingBranchJoin]] = {}
         self._active_joins: dict[str, PendingBranchJoin] = {}
-        self._child_to_join: dict[str, list[ChildJoinEntry]] = {}
+        # parent_corr -> number of ChildJoinEntry objects naming it across
+        # every tracked child; maintained by _ChildJoinMap so the "any child
+        # still tracked for this parent?" check is O(1) instead of a full walk.
+        self._tracked_children_by_parent: dict[str, int] = {}
+        self._child_to_join: _ChildJoinMap = _ChildJoinMap(
+            self._tracked_children_by_parent
+        )
         self._parent_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._descendant_counts: dict[str, int] = {}
         # Phase 2b: records (conv_id, branch_id) for branches that were
@@ -1217,7 +1314,7 @@ class BranchOrchestrator:
         # (does not race / double-decrement registered children).
         if self._sticky_router is not None:
             self._sticky_router.evict_unclaimed_sticky(parent_corr)
-        if not any_child_tracked_for_parent(self._child_to_join, parent_corr):
+        if not self._tracked_children_by_parent.get(parent_corr, 0):
             self._release_parent_slot_if_drained(parent_corr)
         # Dispatch each drained gate's gated turn immediately. The gate was
         # satisfied with zero outstanding children (every child rolled back),
@@ -1924,11 +2021,13 @@ class BranchOrchestrator:
 def any_child_tracked_for_parent(
     child_to_join: dict[str, list[ChildJoinEntry]], parent_corr: str
 ) -> bool:
-    """Return True if any child in ``child_to_join`` belongs to ``parent_corr``.
+    """Brute-force reference: True if any entry in ``child_to_join`` names ``parent_corr``.
 
-    Module-level helper (rather than method) because it is called from inside
-    _spawn_children_and_register_gates to decide whether all children rolled
-    back and no per-parent state should remain reserved.
+    TEST-ONLY. Production code reads ``BranchOrchestrator._tracked_children_by_parent``
+    (maintained by ``_ChildJoinMap``) instead, because this walk is
+    O(total tracked entries) and ran on every child-spawning credit. Kept as
+    the oracle the index is checked against in
+    ``tests/unit/timing/test_branch_orchestrator_child_index.py``.
     """
     return any(
         any(e.parent_correlation_id == parent_corr for e in ents)
