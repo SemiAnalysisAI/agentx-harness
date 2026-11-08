@@ -153,8 +153,8 @@ HTTP client socket and connection configuration. Controls low-level socket optio
 |----------------------|---------|-------------|-------------|
 | `AIPERF_HTTP_CONNECTION_LIMIT` | `2500` | ≥ 1, ≤ 65000 | Maximum number of concurrent HTTP connections |
 | `AIPERF_HTTP_KEEPALIVE_TIMEOUT` | `300` | ≥ 0, ≤ 10000 | HTTP connection keepalive timeout in seconds for connection pooling |
-| `AIPERF_HTTP_SO_RCVBUF` | `10485760` | ≥ 1024 | Socket receive buffer size in bytes (default: 10MB for high-throughput streaming) |
-| `AIPERF_HTTP_SO_SNDBUF` | `10485760` | ≥ 1024 | Socket send buffer size in bytes (default: 10MB for high-throughput streaming) |
+| `AIPERF_HTTP_SO_RCVBUF` | `10485760` | ≥ 0 | Socket receive buffer size in bytes (default: 10MB for high-throughput streaming) |
+| `AIPERF_HTTP_SO_SNDBUF` | `10485760` | ≥ 0 | Socket send buffer size in bytes (default: 10MB for high-throughput streaming) |
 | `AIPERF_HTTP_TCP_KEEPCNT` | `1` | ≥ 1, ≤ 100 | Maximum number of keepalive probes to send before considering the connection dead |
 | `AIPERF_HTTP_TCP_KEEPIDLE` | `60` | ≥ 1, ≤ 100000 | Time in seconds before starting TCP keepalive probes on idle connections |
 | `AIPERF_HTTP_TCP_KEEPINTVL` | `30` | ≥ 1, ≤ 100000 | Interval in seconds between TCP keepalive probes |
