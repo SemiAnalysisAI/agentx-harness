@@ -469,9 +469,7 @@ class BranchOrchestrator:
     def close_replay_root(self, root_correlation_id: str) -> None:
         """Discard per-instance overlap markers after a tree drains."""
         for branch_id in self._overlap_by_root.pop(root_correlation_id, ()):
-            self._overlap_dispatched_branches.discard(
-                (root_correlation_id, branch_id)
-            )
+            self._overlap_dispatched_branches.discard((root_correlation_id, branch_id))
 
     def snapshot_annotations(
         self,

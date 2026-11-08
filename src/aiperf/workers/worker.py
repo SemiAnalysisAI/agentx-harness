@@ -795,9 +795,9 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         # (_clone_conversation_for_session). Decoding a multi-MB conversation on
         # the worker's event loop for every session is both the biggest stall
         # source and, at 50k lanes, the dominant memory consumer.
-        self._conversation_cache: OrderedDict[
-            tuple[str, int], Conversation
-        ] = OrderedDict()
+        self._conversation_cache: OrderedDict[tuple[str, int], Conversation] = (
+            OrderedDict()
+        )
         if isinstance(msg.client_metadata, MemoryMapClientMetadata):
             self._is_payload_bytes = (
                 msg.client_metadata.format == MemoryMapFormat.PAYLOAD_BYTES
