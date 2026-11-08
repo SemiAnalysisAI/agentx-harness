@@ -21,6 +21,7 @@ from __future__ import annotations
 import socket
 from unittest.mock import MagicMock, patch
 
+from aiperf.common.environment import Environment
 from aiperf.transports.http_defaults import SocketDefaults
 
 
@@ -61,6 +62,31 @@ class TestSocketDefaultsBufferSizes:
         )
         assert (socket.SOL_SOCKET, socket.SO_RCVBUF) in opts, (
             "SO_RCVBUF must still be set on non-Windows for streaming throughput"
+        )
+
+    def test_zero_buffer_size_leaves_the_socket_to_the_kernel(self) -> None:
+        """A configured size of 0 must not call setsockopt at all.
+
+        Calling ``setsockopt(SO_RCVBUF)`` disables Linux TCP autotuning for
+        that socket, pinning it to a fixed size so a multi-megabyte streaming
+        response can no longer grow its receive window. Operators opt out of
+        the fixed size by setting the value to 0, which must therefore skip
+        both buffer calls entirely.
+        """
+        mock_sock = MagicMock(spec=socket.socket)
+        with (
+            patch("aiperf.transports.http_defaults.IS_WINDOWS", False),
+            patch.object(Environment.HTTP, "SO_RCVBUF", 0),
+            patch.object(Environment.HTTP, "SO_SNDBUF", 0),
+        ):
+            SocketDefaults.apply_to_socket(mock_sock)
+
+        opts = _socket_options_set(mock_sock)
+        assert (socket.SOL_SOCKET, socket.SO_RCVBUF) not in opts, (
+            "SO_RCVBUF must not be set when configured as 0 (kernel autotunes)"
+        )
+        assert (socket.SOL_SOCKET, socket.SO_SNDBUF) not in opts, (
+            "SO_SNDBUF must not be set when configured as 0 (kernel autotunes)"
         )
 
     def test_platform_independent_options_set_on_both(self) -> None:

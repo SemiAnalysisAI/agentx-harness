@@ -774,12 +774,12 @@ class _HTTPSettings(BaseSettings):
         description="HTTP connection keepalive timeout in seconds for connection pooling",
     )
     SO_RCVBUF: int = Field(
-        ge=1024,
+        ge=0,
         default=10485760,  # 10MB
         description="Socket receive buffer size in bytes (default: 10MB for high-throughput streaming)",
     )
     SO_SNDBUF: int = Field(
-        ge=1024,
+        ge=0,
         default=10485760,  # 10MB
         description="Socket send buffer size in bytes (default: 10MB for high-throughput streaming)",
     )
