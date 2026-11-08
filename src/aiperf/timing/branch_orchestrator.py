@@ -399,6 +399,10 @@ class BranchOrchestrator:
         # turn 0 credit returns.
         self._pre_dispatched_branches: set[tuple[str, str]] = set()
         self._overlap_dispatched_branches: set[tuple[str, str]] = set()
+        # Same membership indexed by root. close_replay_root runs every time a
+        # session tree drains; rebuilding a set sized by every live tree is
+        # O(live lanes) per drain, which is O(50k) at the 50k target.
+        self._overlap_by_root: dict[str, set[str]] = {}
         self._fail_fast = Environment.DAG.FAIL_FAST
         self._cleaning_up: bool = False
         # SPAWN children whose recorded first request starts after the branch
@@ -464,11 +468,10 @@ class BranchOrchestrator:
 
     def close_replay_root(self, root_correlation_id: str) -> None:
         """Discard per-instance overlap markers after a tree drains."""
-        self._overlap_dispatched_branches = {
-            item
-            for item in self._overlap_dispatched_branches
-            if item[0] != root_correlation_id
-        }
+        for branch_id in self._overlap_by_root.pop(root_correlation_id, ()):
+            self._overlap_dispatched_branches.discard(
+                (root_correlation_id, branch_id)
+            )
 
     def snapshot_annotations(
         self,
@@ -582,6 +585,7 @@ class BranchOrchestrator:
             self._overlap_dispatched_branches.update(
                 (parent_corr, branch_id) for branch_id in overlapping
             )
+            self._overlap_by_root.setdefault(parent_corr, set()).update(overlapping)
 
     def _marker_for_root(self, root_correlation_id: str | None) -> str | None:
         """Resolve the tree-root cache-bust marker for a spawned descendant.
@@ -2016,6 +2020,7 @@ class BranchOrchestrator:
         self._parent_locks.clear()
         self._pre_dispatched_branches.clear()
         self._overlap_dispatched_branches.clear()
+        self._overlap_by_root.clear()
 
 
 def any_child_tracked_for_parent(

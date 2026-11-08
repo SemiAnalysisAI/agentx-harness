@@ -192,6 +192,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             else None
         )
         self._cache_warmup_requests_by_lane: Counter[int] = Counter()
+        self._cache_warmup_saturated_lanes = 0
         self._cache_warmup_request_budget_reached = False
         self._baseline_warmup_admitted = 0
         self._quota_handoff_turns: dict[tuple[str, str, int], TurnToSend] = {}
@@ -485,10 +486,20 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             self._quota_handoff_turns[state_key] = turn
             return TurnAdmission.DEFER
         self._cache_warmup_requests_by_lane[lane] += 1
-        if not self._cache_warmup_request_budget_reached and all(
-            self._cache_warmup_requests_by_lane[lane_index]
-            >= self._cache_warmup_requests_per_lane
-            for lane_index in range(len(self.conversation_source.trajectories))
+        # The early return above guarantees a lane is incremented only while it
+        # is under quota, so `==` fires exactly once per lane. Counting
+        # saturated lanes makes this test O(1) instead of scanning every lane on
+        # every admitted warmup turn -- O(lanes) per admit is 500k admits at
+        # 50,000 lanes for the official 10-requests-per-lane budget.
+        if (
+            self._cache_warmup_requests_by_lane[lane]
+            == self._cache_warmup_requests_per_lane
+        ):
+            self._cache_warmup_saturated_lanes += 1
+        if (
+            not self._cache_warmup_request_budget_reached
+            and self._cache_warmup_saturated_lanes
+            >= len(self.conversation_source.trajectories)
         ):
             self._cache_warmup_request_budget_reached = True
             self.credit_issuer.replay_gate.pause_releases()
