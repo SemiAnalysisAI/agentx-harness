@@ -16,7 +16,9 @@ from aiperf.common.messages import (
     ConversationRequestMessage,
     ConversationTurnRequestMessage,
     DatasetConfigStatusRequest,
+    DatasetConfigStatusResponse,
     DatasetConfiguredNotification,
+    Message,
 )
 from aiperf.common.messages.command_messages import ProfileConfigureCommand
 from aiperf.common.models import Conversation, Image, Text, Turn
@@ -1163,3 +1165,47 @@ class TestDatasetConfigStatusRequest:
         assert response.notification is not None
         assert response.notification.metadata == published[0].metadata
         assert response.notification.client_metadata == published[0].client_metadata
+
+    @pytest.mark.asyncio
+    async def test_status_reply_encodes_notification_once_and_byte_identically(
+        self, configured_dataset_manager
+    ) -> None:
+        """Each not-yet-configured worker polls this, and every reply carries
+        the full DatasetMetadata. The notification must be pydantic-dumped once
+        per published notification, and the spliced reply must be byte-identical
+        to a plain ``to_json_bytes()`` of the same response."""
+        dm = configured_dataset_manager
+        notification = dm._last_dataset_configured_notification
+        assert notification is not None
+
+        with patch.object(
+            DatasetConfiguredNotification,
+            "to_json_bytes",
+            autospec=True,
+            side_effect=lambda self: Message.to_json_bytes(self),
+        ) as encode:
+            replies = []
+            for i in range(3):
+                response = await dm._handle_dataset_config_status_request(
+                    DatasetConfigStatusRequest(
+                        service_id="late_worker", request_id=f"req-{i}"
+                    )
+                )
+                replies.append((response, response.to_json_bytes()))
+            assert encode.call_count == 1
+
+        for response, wire in replies:
+            assert wire == Message.to_json_bytes(response)
+            decoded = Message.from_json(wire)
+            assert isinstance(decoded, DatasetConfigStatusResponse)
+            assert decoded.request_id == response.request_id
+            assert decoded.notification.metadata == notification.metadata
+
+        # A re-published notification (new object) is re-encoded, not served stale.
+        republished = notification.model_copy()
+        dm._last_dataset_configured_notification = republished
+        response = await dm._handle_dataset_config_status_request(
+            DatasetConfigStatusRequest(service_id="late_worker")
+        )
+        assert dm._dataset_configured_notification_json[0] is republished
+        assert response.to_json_bytes() == Message.to_json_bytes(response)

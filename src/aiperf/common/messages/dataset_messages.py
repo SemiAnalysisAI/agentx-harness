@@ -3,7 +3,8 @@
 
 from typing import Any
 
-from pydantic import Field, SerializeAsAny, field_validator
+import orjson
+from pydantic import Field, PrivateAttr, SerializeAsAny, field_validator
 
 from aiperf.common.enums import CreditPhase, MessageType
 from aiperf.common.messages.service_messages import BaseServiceMessage
@@ -120,6 +121,36 @@ class DatasetConfigStatusResponse(BaseServiceMessage):
         description="The already-published DatasetConfiguredNotification, if "
         "dataset configuration has completed. None if not yet configured.",
     )
+
+    _notification_json: bytes | None = PrivateAttr(default=None)
+
+    def use_serialized_notification(self, notification_json: bytes) -> None:
+        """Reuse ``notification``'s already-encoded ``to_json_bytes()`` output.
+
+        The notification carries the full ``DatasetMetadata`` and never changes
+        once published, but every status poll would otherwise re-dump it through
+        pydantic. The caller owns the guarantee that ``notification_json`` is
+        exactly ``self.notification.to_json_bytes()``.
+        """
+        self._notification_json = notification_json
+
+    def to_json_bytes(self) -> bytes:
+        notification_json = self._notification_json
+        if notification_json is None or self.notification is None:
+            return super().to_json_bytes()
+        # ``notification`` is the last field, so splicing its pre-encoded bytes
+        # onto the envelope reproduces ``super().to_json_bytes()`` byte for byte.
+        envelope = orjson.dumps(
+            self.model_dump(
+                exclude={"notification"},
+                exclude_none=True,
+                mode="json",
+                context={"include_internal": True},
+            )
+        )
+        return b"".join(
+            (envelope[:-1], b',"notification":', notification_json, b"}")
+        )
 
 
 class DatasetConfigurationFailedNotification(BaseServiceMessage):

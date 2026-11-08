@@ -145,6 +145,11 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         self._last_dataset_configured_notification: (
             DatasetConfiguredNotification | None
         ) = None
+        # (notification, its to_json_bytes()) so status replies encode the full
+        # DatasetMetadata once per published notification, not once per poll.
+        self._dataset_configured_notification_json: (
+            tuple[DatasetConfiguredNotification, bytes] | None
+        ) = None
 
     def _is_kubernetes_run(self) -> bool:
         """Return whether the optional KUBERNETES service-run plugin is active."""
@@ -1094,11 +1099,23 @@ class DatasetManager(ReplyClientMixin, BaseComponentService):
         self.debug(
             lambda: f"Handling dataset config status request from {message.service_id}"
         )
-        return DatasetConfigStatusResponse(
+        notification = self._last_dataset_configured_notification
+        response = DatasetConfigStatusResponse(
             service_id=self.service_id,
             request_id=message.request_id,
-            notification=self._last_dataset_configured_notification,
+            notification=notification,
         )
+        if notification is not None:
+            # Every not-yet-configured worker polls this until it is configured,
+            # and each reply carries the full DatasetMetadata. Encode it once per
+            # published notification (identity-keyed, so a re-publish re-encodes)
+            # instead of re-dumping it through pydantic on every poll.
+            cached = self._dataset_configured_notification_json
+            if cached is None or cached[0] is not notification:
+                cached = (notification, notification.to_json_bytes())
+                self._dataset_configured_notification_json = cached
+            response.use_serialized_notification(cached[1])
+        return response
 
     @on_request(MessageType.CONVERSATION_REQUEST)
     async def _handle_conversation_request(
