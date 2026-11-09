@@ -33,9 +33,8 @@ def pin_malloc_thresholds(threshold: int = PINNED_THRESHOLD_BYTES) -> bool:
     libc = _libc()
     if libc is None:
         return False
-    return bool(libc.mallopt(M_MMAP_THRESHOLD, threshold)) and bool(
-        libc.mallopt(M_TRIM_THRESHOLD, threshold)
-    )
+    # Variant v1: trim threshold only, the mmap threshold stays dynamic.
+    return bool(libc.mallopt(M_TRIM_THRESHOLD, threshold))
 
 
 def trim_heap() -> bool:
