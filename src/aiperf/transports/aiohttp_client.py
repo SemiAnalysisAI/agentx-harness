@@ -354,6 +354,15 @@ class AioHttpClient(AIPerfLoggerMixin):
                     f"Reused connection was reset before any response; retrying {method} {url} once on a new connection: {e!r}"
                 )
                 _reset_trace_data(record.trace_data)
+                # A connector the caller keeps (a sticky-session lease) has already
+                # dropped the reset connection, so retry on it to keep the session on
+                # one connection. Otherwise use a one-off connector, since other idle
+                # connections in the shared pool may have been closed at the same time.
+                if connector is not None and not connector_owner:
+                    retry_connector, retry_connector_owner = connector, False
+                else:
+                    retry_connector = create_tcp_connector(**self._tcp_kwargs)
+                    retry_connector_owner = True
                 return await self._request(
                     method,
                     url,
@@ -362,8 +371,8 @@ class AioHttpClient(AIPerfLoggerMixin):
                     on_request_sent=on_request_sent,
                     first_token_callback=first_token_callback,
                     trace_data=record.trace_data,
-                    connector=create_tcp_connector(**self._tcp_kwargs),
-                    connector_owner=True,
+                    connector=retry_connector,
+                    connector_owner=retry_connector_owner,
                     retry_reset_connection=False,
                     **kwargs,
                 )

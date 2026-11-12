@@ -17,6 +17,7 @@ from aiperf.common.models import AioHttpTraceData, RequestRecord
 from aiperf.transports.aiohttp_client import (
     AioHttpClient,
     _is_reset_reused_connection,
+    create_tcp_connector,
 )
 
 HEADERS = {"Content-Type": "application/json"}
@@ -153,9 +154,10 @@ async def http_server(
             if stats.connections == 1:
                 await handler(reader, writer, stats)
             else:
-                await _read_request(reader)
-                stats.served += 1
-                await _respond(writer)
+                while True:
+                    await _read_request(reader)
+                    stats.served += 1
+                    await _respond(writer)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
@@ -205,6 +207,40 @@ class TestResetRetryOverSockets:
         assert second.trace_data.tcp_connect_start_perf_ns is not None
         assert stats.connections == 2
         assert stats.served == 2
+
+    @pytest.mark.parametrize("http_server", [_serve_then_reset_next], indirect=True)
+    async def test_post_reset_on_caller_connector_retries_on_that_connector(
+        self, http_server: tuple[str, _ServerStats], client: AioHttpClient
+    ) -> None:
+        """A connector the caller keeps (a sticky-session lease) carries the retry,
+        so the following request reuses the retry's connection."""
+        url, stats = http_server
+        lease = create_tcp_connector(limit=1)
+
+        async def post(body: bytes) -> RequestRecord:
+            return await asyncio.wait_for(
+                client.post_request(
+                    url, body, HEADERS, connector=lease, connector_owner=False
+                ),
+                timeout=5,
+            )
+
+        try:
+            first = await post(b"{}")
+            retried = await post(b"x" * 2_000)
+            third = await post(b"{}")
+            assert not lease.closed
+        finally:
+            await lease.close()
+
+        assert first.status == 200
+        assert retried.error is None
+        assert retried.status == 200
+        assert retried.trace_data.connection_reused_perf_ns is None
+        assert third.status == 200
+        assert third.trace_data.connection_reused_perf_ns is not None
+        assert stats.connections == 2
+        assert stats.served == 3
 
     @pytest.mark.parametrize("http_server", [_reset_before_reading], indirect=True)
     async def test_post_reset_on_new_connection_is_not_retried(
