@@ -206,6 +206,10 @@ class UserSessionManager:
         self._cache: dict[str, UserSession] = {}
         self._default_context_mode: ConversationContextMode | None = None
 
+    def __len__(self) -> int:
+        """Number of live sessions on this worker."""
+        return len(self._cache)
+
     @property
     def default_context_mode(self) -> ConversationContextMode | None:
         """The dataset-level default context mode, if one was set by the loader."""

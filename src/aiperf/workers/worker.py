@@ -92,22 +92,17 @@ if TYPE_CHECKING:
     from aiperf.transports.base_transports import FirstTokenCallback
 
 
-# Bound on decoded conversations held per worker. This must stay well below the
-# corpus size: a conversation is ~14 MB decoded, and round-robin credit routing
-# means every worker eventually sees every trace, so a cache large enough to
-# hold the whole corpus costs workers x corpus, i.e. roughly 0.5 TB at the
-# 393-trace corpus with 100 workers. A miss costs one re-decode at session
-# creation, which is cheap next to that, so a small working set is enough.
-_CONVERSATION_CACHE_MAX_ENTRIES = Environment.WORKER.CONVERSATION_CACHE_MAX_ENTRIES
-"""Decoded conversations retained per worker (LRU), env-tunable.
+_CONVERSATION_CACHE_MIN_ENTRIES = Environment.WORKER.CONVERSATION_CACHE_MIN_ENTRIES
+"""Floor on decoded conversations retained per worker (LRU), env-tunable.
 
-A miss costs one decode plus, once the string dedup below is active, one
-dedup pass over that conversation -- so the bound trades memory against
-repeated decode work. 16 was chosen when a decoded conversation cost ~14 MB
-and a large cache held the whole 393-trace corpus per worker (~0.5 TB at 100
-workers). With repeated large strings collapsed at decode the per-conversation
-footprint is far smaller, so a larger bound may now be affordable; measure
-before raising the default."""
+The live bound is ``max(floor, live sessions on this worker)``. A cached entry
+whose trace some live session is replaying costs almost nothing, because that
+session's clone already shares its payload; only idle entries cost memory. So
+tying the bound to the live-session count keeps idle memory at most one
+conversation per live session, while a worker running more lanes than the
+corpus has traces caches the whole corpus and decodes each trace once. A fixed
+small bound instead misses on almost every session at 50k lanes (~500 lanes per
+worker over 393 traces), and each miss pays decode plus dedup."""
 
 
 def _phase_needs_first_token_callback(phase) -> bool:
@@ -1709,7 +1704,8 @@ class Worker(BaseComponentService, ProcessHealthMixin):
                 credit_context=credit_context,
             )
             self._conversation_cache[key] = cached
-            if len(self._conversation_cache) > _CONVERSATION_CACHE_MAX_ENTRIES:
+            bound = max(_CONVERSATION_CACHE_MIN_ENTRIES, len(self.session_manager))
+            while len(self._conversation_cache) > bound:
                 self._conversation_cache.popitem(last=False)
         else:
             self._conversation_cache.move_to_end(key)
