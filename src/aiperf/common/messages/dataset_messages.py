@@ -148,7 +148,9 @@ class DatasetConfigStatusResponse(BaseServiceMessage):
                 context={"include_internal": True},
             )
         )
-        return b"".join((envelope[:-1], b',"notification":', notification_json, b"}"))
+        return b"".join(
+            (envelope[:-1], b',"notification":', notification_json, b"}")
+        )
 
 
 class DatasetConfigurationFailedNotification(BaseServiceMessage):
