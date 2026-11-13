@@ -839,12 +839,29 @@ the failed and total request counts, observed failure percentage, configured lim
 operator to the inference-server logs.
 
 For profiling phases that meet the AgentX scenario's minimum valid duration, the scenario also
-requires TTFT or inter-token-latency observations to extend through at least 95% of the phase. This
-catches a server that stops returning responses while allowing a sparse low-concurrency run to end
-with a long request in flight. A stalled run
+requires TTFT, inter-token-latency, or parsed streaming content observations to extend through at
+least 95% of the phase. The worker retains the last content timestamp even when a long request is
+cancelled after the grace period and produces no metric record. That timestamp contributes the
+separate `streaming_content_ratio` in `metric_duration_coverage`; cancelled requests still do not
+contribute successful request counts, throughput, or latency samples. Text, reasoning content, and
+tool-call deltas count as content activity. Role-only chunks, usage-only
+chunks, keepalives, and cancellation itself do not prove content activity. The ratio uses the
+configured duration and is clamped to [0, 1], including activity during the grace period.
+
+This catches a server that stops producing content while allowing a sparse low-concurrency run to
+end with a long request in flight. Cancellation without recent content still fails the check.
+The gate establishes recent content activity, not continued admission of new requests: a single
+ongoing stream can satisfy it even if the server has stopped admitting new requests. Admission
+stalls are outside this check's scope; inspect TTFT and server diagnostics separately.
+Activity is scoped to the concrete profiling phase. A run that fails the coverage check
 exits non-zero, the JSON artifact is retained with `submission_valid: false` and reason
 `insufficient_profile_metric_coverage`, and the error directs the operator to the server logs.
 Warmup observations and intentionally short `--unsafe-override` smoke runs do not count.
+Workers also report content during streaming, at most once per second per request, so evidence
+already delivered survives forced phase completion when a cancelled credit never returns. The
+credit return carries the exact last content timestamp. Without that return, the last report is
+conservative: it can precede the last observed content by less than one second. A worker that
+never reports content cannot contribute evidence of liveness.
 
 ### Q: My server has a ~256k context window and the run keeps overflowing — what's the right fix?
 Switch to a `_256k` corpus (see [§3](#3-how-realistic-are-the-prompts-and-token-counts)) — sizing the

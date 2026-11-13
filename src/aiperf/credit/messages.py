@@ -121,6 +121,8 @@ class CreditReturn(
             channel (CommAddress.CREDIT_RETURN), where there is no ZMQ envelope
             identity; None on the ROUTER/DEALER path (identity comes from the
             envelope). Lets the router attribute the return to the right worker.
+        last_streaming_content_ns: Wall-clock timestamp of the latest parsed
+            content chunk, including requests cancelled before emitting a record.
     """
 
     credit: Credit
@@ -131,6 +133,7 @@ class CreditReturn(
     inter_token_latency_ns: float | None = None
     output_sequence_length: int | None = None
     worker_id: str | None = None
+    last_streaming_content_ns: int | None = None
 
 
 class FirstToken(Struct, frozen=True, kw_only=True, tag_field="t", tag="ft"):
@@ -153,9 +156,23 @@ class FirstToken(Struct, frozen=True, kw_only=True, tag_field="t", tag="ft"):
     phase_index: int | None = None
 
 
+class StreamingContent(Struct, frozen=True, kw_only=True, tag_field="t", tag="sc"):
+    """Rate-limited evidence of content from an in-flight profiling request.
+
+    Attributes:
+        phase: Credit phase owning the request.
+        phase_index: Concrete phase index; prevents cross-phase liveness leakage.
+        timestamp_ns: Last parsed content timestamp in wall-clock nanoseconds.
+    """
+
+    phase: CreditPhase
+    phase_index: int | None
+    timestamp_ns: int
+
+
 # Union type for decoding worker -> router messages
 WorkerToRouterMessage: TypeAlias = (
-    WorkerReady | WorkerShutdown | CreditReturn | FirstToken
+    WorkerReady | WorkerShutdown | CreditReturn | FirstToken | StreamingContent
 )
 
 # =============================================================================
