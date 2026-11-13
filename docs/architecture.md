@@ -66,6 +66,18 @@ The Timing Manager controls and coordinates the timing of requests during benchm
 - Supporting advanced timing scenarios, such as replaying traces with specific inter-arrival times or simulating bursty traffic
 - Ensuring that requests are dispatched to workers at the correct intervals for reliable measurement
 
+`PhaseRunner` shares an optional `TimingRuntime` between `LoopScheduler` and
+`PhaseLifecycle`. The default `RealTimingRuntime` uses Python performance and
+wall clocks plus asyncio callback timers. Task execution and cancellation remain
+in `LoopScheduler`; the runtime only supplies clocks and timer handles. Timer
+deadlines use the runtime's timer clock, while performance timestamps use
+`now_ns()`. Absolute scheduling bridges those two clock origins.
+
+This is an internal injection point, not a virtual-time execution mode. Phase
+deadline waits, strategy-specific timers, worker timestamps, and credit transport
+still use their existing behavior. They must be coordinated before a simulator
+can drive an entire benchmark. No CLI option selects an alternative runtime.
+
 ### Worker Manager
 
 The Worker Manager orchestrates and manages the pool of worker processes that execute benchmarking tasks.
