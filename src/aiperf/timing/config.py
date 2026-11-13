@@ -645,6 +645,7 @@ def _build_agentic_warmup_config(phase: PhaseConfig) -> CreditPhaseConfig | None
         phase=CreditPhase.WARMUP,
         phase_kind="warmup",
         timing_mode=TimingMode.AGENTIC_REPLAY,
+        phase_kind="warmup",
         # Duration mode is strategy-terminated by its timer. Count mode uses
         # the generic request-count stop condition as a global backstop while
         # the agentic strategy independently enforces each lane's quota.
