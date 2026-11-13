@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import contextlib
+import errno
 import socket
 import time
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,51 @@ def _expected_request_body_size(data: Any) -> int | None:
     return None
 
 
+_CONNECTION_RESET_ERRNOS = frozenset({errno.ECONNRESET, errno.EPIPE})
+
+
+def _is_reset_reused_connection(
+    exc: BaseException, method: str, data: Any, record: RequestRecord
+) -> bool:
+    """Return True if a POST failed because its reused keep-alive connection was reset.
+
+    aiohttp retries idempotent methods once after a connection error (RFC 9112
+    section 9.3.1), but never POST. A reset (ECONNRESET/EPIPE) on a reused
+    connection before any response arrived means the server dropped the
+    connection without reading the whole request, typically because it closed
+    the idle connection just as the request was written, so one retry on a new
+    connection is safe. A clean close (ServerDisconnectedError) or a timeout
+    may follow a request the server did process, so those are not retried.
+    """
+    trace = record.trace_data
+    if (
+        method != "POST"
+        or not isinstance(data, bytes)
+        or isinstance(exc, aiohttp.ServerDisconnectedError | TimeoutError)
+        or record.status is not None
+        or trace is None
+        or trace.connection_reused_perf_ns is None
+        or trace.response_headers_received_perf_ns is not None
+    ):
+        return False
+    current: BaseException | None = exc
+    for _ in range(4):
+        if current is None:
+            return False
+        if isinstance(current, ConnectionResetError | BrokenPipeError) or (
+            isinstance(current, OSError) and current.errno in _CONNECTION_RESET_ERRNOS
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _reset_trace_data(trace_data: AioHttpTraceData) -> None:
+    """Reset trace data in place so a retried request records only its own attempt."""
+    for name, field in type(trace_data).model_fields.items():
+        setattr(trace_data, name, field.get_default(call_default_factory=True))
+
+
 class AioHttpClient(AIPerfLoggerMixin):
     """A high-performance HTTP client for communicating with HTTP based REST APIs using aiohttp.
 
@@ -63,7 +109,8 @@ class AioHttpClient(AIPerfLoggerMixin):
     ) -> None:
         """Initialize the AioHttpClient."""
         super().__init__(**kwargs)
-        self.tcp_connector = create_tcp_connector(**tcp_kwargs or {})
+        self._tcp_kwargs = dict(tcp_kwargs or {})
+        self.tcp_connector = create_tcp_connector(**self._tcp_kwargs)
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.collect_trace_chunks = collect_trace_chunks
 
@@ -85,6 +132,7 @@ class AioHttpClient(AIPerfLoggerMixin):
         trace_data: AioHttpTraceData | None = None,
         connector: aiohttp.TCPConnector | None = None,
         connector_owner: bool = False,
+        retry_reset_connection: bool = True,
         **kwargs: Any,
     ) -> RequestRecord:
         """Generic request method that handles common logic for all HTTP methods.
@@ -101,6 +149,8 @@ class AioHttpClient(AIPerfLoggerMixin):
                 If None, uses self.tcp_connector (shared pool).
             connector_owner: If True, the session will close the connector when done.
                 Use True for per-request connections that should be closed after use.
+            retry_reset_connection: If True, retry a POST once on a new connection
+                when its reused keep-alive connection is reset before any response.
             **kwargs: Additional arguments to pass to the request
 
         Returns:
@@ -297,6 +347,35 @@ class AioHttpClient(AIPerfLoggerMixin):
             raise
         except Exception as e:
             record.end_perf_ns = time.perf_counter_ns()
+            if retry_reset_connection and _is_reset_reused_connection(
+                e, method, data, record
+            ):
+                self.warning(
+                    f"Reused connection was reset before any response; retrying {method} {url} once on a new connection: {e!r}"
+                )
+                _reset_trace_data(record.trace_data)
+                # A connector the caller keeps (a sticky-session lease) has already
+                # dropped the reset connection, so retry on it to keep the session on
+                # one connection. Otherwise use a one-off connector, since other idle
+                # connections in the shared pool may have been closed at the same time.
+                if connector is not None and not connector_owner:
+                    retry_connector, retry_connector_owner = connector, False
+                else:
+                    retry_connector = create_tcp_connector(**self._tcp_kwargs)
+                    retry_connector_owner = True
+                return await self._request(
+                    method,
+                    url,
+                    headers,
+                    data=data,
+                    on_request_sent=on_request_sent,
+                    first_token_callback=first_token_callback,
+                    trace_data=record.trace_data,
+                    connector=retry_connector,
+                    connector_owner=retry_connector_owner,
+                    retry_reset_connection=False,
+                    **kwargs,
+                )
             self.error(f"Error in aiohttp request: {e!r}")
             record.error = ErrorDetails.from_exception(e)
 
