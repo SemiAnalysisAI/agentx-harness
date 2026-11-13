@@ -191,6 +191,7 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
             CreditPhase.PROFILING,
             self._slice_duration,
             include_final_collection=not ctx.is_phase_scoped,
+            start_ns=start_ns,
         )
         if not endpoint_summaries:
             endpoint_summaries = self._compute_endpoint_summaries(
@@ -378,8 +379,11 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         self,
         data: ScalarTimeSeries,
         phase: CreditPhase,
+        start_ns: int = 0,
     ) -> tuple[ScalarTimeSeries, int, int] | None:
-        phase_indices = np.flatnonzero(data.get_phase_mask(phase))
+        phase_indices = np.flatnonzero(
+            data.get_phase_mask(phase) & (data.timestamps >= start_ns)
+        )
         if len(phase_indices) == 0:
             return None
 
@@ -405,8 +409,11 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         self,
         data: HistogramTimeSeries,
         phase: CreditPhase,
+        start_ns: int = 0,
     ) -> tuple[HistogramTimeSeries, int, int] | None:
-        phase_indices = np.flatnonzero(data.get_phase_mask(phase))
+        phase_indices = np.flatnonzero(
+            data.get_phase_mask(phase) & (data.timestamps >= start_ns)
+        )
         if len(phase_indices) == 0:
             return None
 
@@ -439,6 +446,7 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
         slice_duration: float | None = None,
         *,
         include_final_collection: bool,
+        start_ns: int = 0,
     ) -> dict[str, ServerMetricsEndpointSummary]:
         """Compute per-endpoint summaries from samples whose record phase matches ``phase``."""
         summaries: dict[str, ServerMetricsEndpointSummary] = {}
@@ -468,11 +476,13 @@ class ServerMetricsAccumulator(BaseMetricsProcessor):
                     filtered_series = self._build_phase_filtered_scalar_series(
                         metric_entry.data,
                         phase,
+                        start_ns,
                     )
                 else:
                     filtered_series = self._build_phase_filtered_histogram_series(
                         metric_entry.data,
                         phase,
+                        start_ns,
                     )
                 if filtered_series is None:
                     continue
