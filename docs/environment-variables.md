@@ -153,8 +153,8 @@ HTTP client socket and connection configuration. Controls low-level socket optio
 |----------------------|---------|-------------|-------------|
 | `AIPERF_HTTP_CONNECTION_LIMIT` | `2500` | ≥ 1, ≤ 65000 | Maximum number of concurrent HTTP connections |
 | `AIPERF_HTTP_KEEPALIVE_TIMEOUT` | `300` | ≥ 0, ≤ 10000 | HTTP connection keepalive timeout in seconds for connection pooling |
-| `AIPERF_HTTP_SO_RCVBUF` | `10485760` | ≥ 1024 | Socket receive buffer size in bytes (default: 10MB for high-throughput streaming) |
-| `AIPERF_HTTP_SO_SNDBUF` | `10485760` | ≥ 1024 | Socket send buffer size in bytes (default: 10MB for high-throughput streaming) |
+| `AIPERF_HTTP_SO_RCVBUF` | `10485760` | ≥ 0 | Socket receive buffer size in bytes (default: 10MB for high-throughput streaming) |
+| `AIPERF_HTTP_SO_SNDBUF` | `10485760` | ≥ 0 | Socket send buffer size in bytes (default: 10MB for high-throughput streaming) |
 | `AIPERF_HTTP_TCP_KEEPCNT` | `1` | ≥ 1, ≤ 100 | Maximum number of keepalive probes to send before considering the connection dead |
 | `AIPERF_HTTP_TCP_KEEPIDLE` | `60` | ≥ 1, ≤ 100000 | Time in seconds before starting TCP keepalive probes on idle connections |
 | `AIPERF_HTTP_TCP_KEEPINTVL` | `30` | ≥ 1, ≤ 100000 | Interval in seconds between TCP keepalive probes |
@@ -345,6 +345,7 @@ Worker management and auto-scaling configuration. Controls worker pool sizing, h
 | Environment Variable | Default | Constraints | Description |
 |----------------------|---------|-------------|-------------|
 | `AIPERF_WORKER_CHECK_INTERVAL` | `1.0` | ≥ 0.1, ≤ 100000.0 | Interval in seconds between worker status checks by WorkerManager |
+| `AIPERF_WORKER_CONVERSATION_CACHE_MIN_ENTRIES` | `16` | ≥ 1 | Floor on decoded conversations retained per worker (LRU). The bound is max(this, live sessions on the worker): entries a live session replays are shared with it and cost little, so the cache grows with concurrency and a worker with more lanes than traces decodes each trace once. A miss costs one decode plus one string-dedup pass. |
 | `AIPERF_WORKER_CPU_UTILIZATION_FACTOR` | `0.75` | ≥ 0.1, ≤ 1.0 | Factor multiplied by CPU count to determine default max workers (0.0-1.0). Formula: max(1, min(int(cpu_count * factor) - 1, MAX_WORKERS_CAP)) |
 | `AIPERF_WORKER_ERROR_RECOVERY_TIME` | `3.0` | ≥ 0.1, ≤ 1000.0 | Time in seconds from last error before worker is considered healthy again |
 | `AIPERF_WORKER_HEALTH_CHECK_INTERVAL` | `2.0` | ≥ 0.1, ≤ 1000.0 | Interval in seconds between worker health check messages |

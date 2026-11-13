@@ -774,12 +774,12 @@ class _HTTPSettings(BaseSettings):
         description="HTTP connection keepalive timeout in seconds for connection pooling",
     )
     SO_RCVBUF: int = Field(
-        ge=1024,
+        ge=0,
         default=10485760,  # 10MB
         description="Socket receive buffer size in bytes (default: 10MB for high-throughput streaming)",
     )
     SO_SNDBUF: int = Field(
-        ge=1024,
+        ge=0,
         default=10485760,  # 10MB
         description="Socket send buffer size in bytes (default: 10MB for high-throughput streaming)",
     )
@@ -1662,6 +1662,15 @@ class _WorkerSettings(BaseSettings):
         le=100000.0,
         default=1.0,
         description="Interval in seconds between worker status checks by WorkerManager",
+    )
+    CONVERSATION_CACHE_MIN_ENTRIES: int = Field(
+        ge=1,
+        default=16,
+        description="Floor on decoded conversations retained per worker (LRU). The "
+        "bound is max(this, live sessions on the worker): entries a live session "
+        "replays are shared with it and cost little, so the cache grows with "
+        "concurrency and a worker with more lanes than traces decodes each trace "
+        "once. A miss costs one decode plus one string-dedup pass.",
     )
     CPU_UTILIZATION_FACTOR: float = Field(
         ge=0.1,

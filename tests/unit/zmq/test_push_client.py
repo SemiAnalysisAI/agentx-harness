@@ -178,3 +178,38 @@ class TestZMQPushClientEdgeCases:
             await client.push(msg)
 
         assert mock_zmq_socket._sync_send.call_count == 5
+
+
+class TestZMQPushClientWireCodec:
+    """A channel codec replaces the JSON encoding without changing send semantics."""
+
+    @pytest.mark.asyncio
+    async def test_custom_encode_replaces_json(self, mock_zmq_socket, mock_zmq_context):
+        encoded: list[Message] = []
+
+        def encode(message: Message) -> bytes:
+            encoded.append(message)
+            return b"\x81\xa1k\x01"
+
+        client = ZMQPushClient(address="tcp://127.0.0.1:5555", bind=True, encode=encode)
+        await client.initialize()
+
+        message = Message(message_type=MessageType.HEARTBEAT, request_id="test-123")
+        await client.push(message)
+
+        assert encoded == [message]
+        assert mock_zmq_socket._sync_send.call_args[0][0] == b"\x81\xa1k\x01"
+
+    @pytest.mark.asyncio
+    async def test_encode_failure_raises_communication_error(
+        self, mock_zmq_socket, mock_zmq_context
+    ):
+        def encode(message: Message) -> bytes:
+            raise TypeError("not on this channel")
+
+        client = ZMQPushClient(address="tcp://127.0.0.1:5555", bind=True, encode=encode)
+        await client.initialize()
+
+        with pytest.raises(CommunicationError, match="not on this channel"):
+            await client.push(Message(message_type=MessageType.HEARTBEAT))
+        mock_zmq_socket._sync_send.assert_not_called()

@@ -8,8 +8,13 @@ import pytest
 
 from aiperf.common.enums import CommAddress, LifecycleState
 from aiperf.common.exceptions import InvalidStateError
+from aiperf.common.messages import Message
 from aiperf.config.comm import ZMQTCPConfig
 from aiperf.plugin.enums import CommClientType
+from aiperf.zmq.inference_results_wire import (
+    decode_inference_results,
+    encode_inference_results,
+)
 from aiperf.zmq.zmq_comms import (
     ZMQTCPCommunication,
 )
@@ -103,3 +108,25 @@ class TestZMQTCPCommunication:
             comm.create_client(CommClientType.PUB, "tcp://127.0.0.1:5555", bind=True)
 
         await comm.stop()
+
+
+class TestRawInferenceWireCodec:
+    """Raw-inference is msgpack on both ends; every other channel stays JSON."""
+
+    def test_raw_inference_push_and_pull_get_the_msgpack_codec(self):
+        comm = ZMQTCPCommunication()
+
+        push = comm.create_push_client(CommAddress.RAW_INFERENCE_PROXY_FRONTEND)
+        pull = comm.create_pull_client(CommAddress.RAW_INFERENCE_PROXY_BACKEND)
+
+        assert push._encode is encode_inference_results
+        assert pull._decode is decode_inference_results
+
+    def test_other_channels_keep_the_json_codec(self):
+        comm = ZMQTCPCommunication()
+
+        push = comm.create_push_client(CommAddress.RECORDS)
+        pull = comm.create_pull_client(CommAddress.RECORDS, bind=True)
+
+        assert push._encode is None
+        assert pull._decode == Message.from_json

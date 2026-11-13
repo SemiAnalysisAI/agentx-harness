@@ -51,7 +51,18 @@ class SocketDefaults:
     def _set_socket_buffer(
         cls, sock: socket.socket, option_name: int, value: int
     ) -> None:
-        """Set a socket buffer, reducing it if the OS rejects the requested size."""
+        """Set a socket buffer, reducing it if the OS rejects the requested size.
+
+        A ``value`` of 0 or less means "leave this to the kernel" and is not
+        applied at all. That matters: calling ``setsockopt(SO_RCVBUF)``
+        disables Linux TCP autotuning (``tcp_moderate_rcvbuf``) for the socket
+        and pins it to a fixed size, so a multi-megabyte streaming response can
+        no longer grow its receive window towards ``net.ipv4.tcp_rmem``'s
+        maximum. Left alone, the kernel sizes the buffer to the observed
+        bandwidth-delay product.
+        """
+        if value <= 0:
+            return
         candidate = value
         while True:
             try:

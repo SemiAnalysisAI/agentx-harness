@@ -60,6 +60,14 @@ the profiling process and its child services:
 | `AIPERF_UI_REALTIME_METRICS_ENABLED` | `true` |
 | `AIPERF_HTTP_TCP_USER_TIMEOUT` | `900000` milliseconds |
 
+At very high concurrency on Linux, also consider `AIPERF_HTTP_SO_RCVBUF=0` and
+`AIPERF_HTTP_SO_SNDBUF=0`; the preset does not set them. The 10 MB defaults are
+applied with `setsockopt`, which turns off kernel TCP buffer autotuning for each
+socket and is silently capped by `net.core.rmem_max` (often ~416 KB effective).
+`0` skips the call and lets the kernel size buffers up to `net.ipv4.tcp_rmem`.
+The 50,000-lane warmup and memory measurements behind the AgentX scaling work
+used both set to `0`.
+
 Explicit CLI flags and runtime environment settings override the preset defaults. For example, `--warmup-grace-period 3600` extends warmup, and
 `--agentic-cache-warmup-duration 60` selects duration-based cache warmup instead
 of the default request budget. The argument preset applies to flag-based

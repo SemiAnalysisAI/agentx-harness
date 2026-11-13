@@ -5,7 +5,7 @@ Tests for pull_client.py - ZMQPullClient class.
 """
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import zmq
@@ -246,5 +246,75 @@ class TestZMQPullClientConcurrency:
         # Let the _process_message_fd finally-block run (_inflight -= 1).
         await asyncio.sleep(0)
 
+        assert client._inflight == 0
+        await client.stop()
+
+
+class TestZMQPullClientWireCodec:
+    """A channel codec replaces the JSON decoding without changing flow control."""
+
+    @pytest.mark.asyncio
+    async def test_custom_decode_replaces_json(
+        self, mock_zmq_socket, mock_zmq_context, sample_message, fd_enqueue
+    ):
+        frame = b"\x81\xa1k\x01"
+        fd_enqueue(mock_zmq_socket, messages=[frame])
+        decoded_frames: list[bytes] = []
+
+        def decode(data: bytes) -> Message:
+            decoded_frames.append(data)
+            return sample_message
+
+        client = ZMQPullClient(
+            address="tcp://127.0.0.1:5555", bind=False, decode=decode
+        )
+        received: list[Message] = []
+        done_event = asyncio.Event()
+
+        async def callback(msg: Message) -> None:
+            received.append(msg)
+            done_event.set()
+
+        client.register_pull_callback(sample_message.message_type, callback)
+
+        await client.initialize()
+        await client.start()
+
+        await asyncio.wait_for(done_event.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert decoded_frames == [frame]
+        assert received == [sample_message]
+        assert client._inflight == 0
+        await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_undecodable_frame_is_logged_and_released(
+        self, mock_zmq_socket, mock_zmq_context, sample_message, fd_enqueue
+    ):
+        """A frame from a peer on the other codec is logged, not silently lost."""
+        fd_enqueue(mock_zmq_socket, messages=[sample_message.to_json_bytes()])
+
+        def decode(data: bytes) -> Message:
+            raise ValueError("not a msgpack frame")
+
+        client = ZMQPullClient(
+            address="tcp://127.0.0.1:5555", bind=False, decode=decode
+        )
+        callback = AsyncMock()
+        client.register_pull_callback(sample_message.message_type, callback)
+
+        with patch.object(client, "exception") as log_exception:
+            await client.initialize()
+            await client.start()
+            for _ in range(10):
+                if log_exception.called:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+
+        log_exception.assert_called_once()
+        assert "not a msgpack frame" in log_exception.call_args.args[0]
+        callback.assert_not_awaited()
         assert client._inflight == 0
         await client.stop()

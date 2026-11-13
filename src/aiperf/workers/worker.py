@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from aiperf.common.aiperf_logger import AIPerfLogger
@@ -89,6 +90,19 @@ from aiperf.workers.session_manager import UserSession, UserSessionManager
 if TYPE_CHECKING:
     from aiperf.config.resolution.plan import BenchmarkRun
     from aiperf.transports.base_transports import FirstTokenCallback
+
+
+_CONVERSATION_CACHE_MIN_ENTRIES = Environment.WORKER.CONVERSATION_CACHE_MIN_ENTRIES
+"""Floor on decoded conversations retained per worker (LRU), env-tunable.
+
+The live bound is ``max(floor, live sessions on this worker)``. A cached entry
+whose trace some live session is replaying costs almost nothing, because that
+session's clone already shares its payload; only idle entries cost memory. So
+tying the bound to the live-session count keeps idle memory at most one
+conversation per live session, while a worker running more lanes than the
+corpus has traces caches the whole corpus and decodes each trace once. A fixed
+small bound instead misses on almost every session at 50k lanes (~500 lanes per
+worker over 393 traces), and each miss pays decode plus dedup."""
 
 
 def _phase_needs_first_token_callback(phase) -> bool:
@@ -364,6 +378,50 @@ def _inject_marker_into_first_user_text(
     if _content_has_marker_at_edge(existing, marker, is_prefix=is_prefix):
         return
     first.contents[0] = (marker + existing) if is_prefix else (existing + marker)
+
+
+def _clone_conversation_for_session(conversation: Conversation) -> Conversation:
+    """Give one session private containers over shared, immutable content.
+
+    A session decodes its whole conversation and holds it until the session
+    ends. At 50,000 lanes over 393 traces every trace is decoded and held about
+    127 times, which costs hundreds of GiB; decoding once per worker and
+    cloning per session keeps the message payloads shared.
+
+    Cache-bust and media-uuid suffixing mutate only *containers*: they assign to
+    list slots (``raw_messages[:] = ...``, ``images[:] = ...``,
+    ``contents[0] = ...``, ``turn.texts = ...``) and replace dicts rather than
+    editing them. The message dicts, parts and strings are therefore safe to
+    share, while every list container and ``Turn`` object the mutators can
+    write to must be private to the session.
+    """
+
+    def clone_turn(turn: Turn) -> Turn:
+        return turn.model_copy(
+            update={
+                "raw_messages": None
+                if turn.raw_messages is None
+                else list(turn.raw_messages),
+                "raw_tools": None if turn.raw_tools is None else list(turn.raw_tools),
+                "raw_system": None
+                if turn.raw_system is None
+                else list(turn.raw_system),
+                "texts": [
+                    text.model_copy(update={"contents": list(text.contents)})
+                    for text in turn.texts
+                ],
+                "images": list(turn.images),
+                "audios": list(turn.audios),
+                "videos": list(turn.videos),
+                "raw_payload": None
+                if turn.raw_payload is None
+                else dict(turn.raw_payload),
+            }
+        )
+
+    return conversation.model_copy(
+        update={"turns": [clone_turn(turn) for turn in conversation.turns]}
+    )
 
 
 def _inject_marker_at_first_user(
@@ -725,6 +783,13 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         self._dataset_client = ClientStoreClass(client_metadata=msg.client_metadata)
         await self._dataset_client.initialize()
         self.session_manager.set_default_context_mode(msg.metadata.default_context_mode)
+        # Decoded conversations are cached per worker and cloned per session
+        # (_clone_conversation_for_session). Decoding a multi-MB conversation on
+        # the worker's event loop for every session is both the biggest stall
+        # source and, at 50k lanes, the dominant memory consumer.
+        self._conversation_cache: OrderedDict[tuple[str, int], Conversation] = (
+            OrderedDict()
+        )
         if isinstance(msg.client_metadata, MemoryMapClientMetadata):
             self._is_payload_bytes = (
                 msg.client_metadata.format == MemoryMapFormat.PAYLOAD_BYTES
@@ -1089,7 +1154,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         credit = credit_context.credit
         session = self.session_manager.get(x_correlation_id)
         if session is None:
-            _conversation = await self._retrieve_conversation_for_session(
+            _conversation = await self._borrow_conversation_for_session(
                 credit_context=credit_context,
             )
             session = self.session_manager.create_and_store(
@@ -1614,6 +1679,38 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             conversation_id, credit_context
         )
 
+    async def _borrow_conversation_for_session(
+        self,
+        *,
+        credit_context: CreditContext,
+    ) -> Conversation:
+        """Return a session-private clone of this conversation.
+
+        The decoded conversation is cached and shared; each session gets its own
+        containers over the shared payload (see
+        :func:`_clone_conversation_for_session`), so a trace replayed by many
+        lanes is decoded once per worker rather than once per lane.
+
+        The key includes ``num_turns`` because the PAYLOAD_BYTES reconstruction
+        loops ``range(num_turns)`` and the cheap-path scan uses the credit's
+        count; keying on the conversation id alone would hand a later credit a
+        reconstruction built for a different turn count.
+        """
+        credit = credit_context.credit
+        key = (credit.conversation_id, credit.num_turns)
+        cached = self._conversation_cache.get(key)
+        if cached is None:
+            cached = await self._retrieve_conversation_for_session(
+                credit_context=credit_context,
+            )
+            self._conversation_cache[key] = cached
+            bound = max(_CONVERSATION_CACHE_MIN_ENTRIES, len(self.session_manager))
+            while len(self._conversation_cache) > bound:
+                self._conversation_cache.popitem(last=False)
+        else:
+            self._conversation_cache.move_to_end(key)
+        return _clone_conversation_for_session(cached)
+
     async def _retrieve_conversation_for_session(
         self,
         *,
@@ -1707,7 +1804,8 @@ class Worker(BaseComponentService, ProcessHealthMixin):
         Flow:
         1. Update task statistics (total and success/failure counts)
         2. Wrap record in InferenceResultsMessage
-        3. Push to RecordProcessor via PUSH socket (fire-and-forget)
+        3. Push to RecordProcessor via PUSH socket (fire-and-forget). This channel
+           is encoded as msgpack, not JSON: see ``aiperf.zmq.inference_results_wire``.
 
         Note: Uses execute_async() to avoid blocking on network I/O.
         """
@@ -1718,7 +1816,14 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             service_id=self.service_id,
             record=record,
         )
-        self.execute_async(self.inference_results_push_client.push(msg))
+        self.execute_async(self._push_inference_result(msg))
+
+    async def _push_inference_result(self, msg: InferenceResultsMessage) -> None:
+        # Fire-and-forget: log a failed push here, since nothing awaits the task.
+        try:
+            await self.inference_results_push_client.push(msg)
+        except Exception as e:
+            self.exception(f"Dropped an inference result: {e!r}")
 
     @on_command(CommandType.PROFILE_CONFIGURE)
     async def _on_profile_configure_command(self, message: CommandMessage) -> None:
