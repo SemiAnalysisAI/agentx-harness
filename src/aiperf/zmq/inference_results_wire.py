@@ -28,7 +28,8 @@ The codec is bound to the channel, not chosen by callers: ``WIRE_CODECS`` maps
 injects them. Every PUSH client on ``RAW_INFERENCE_PROXY_FRONTEND`` encodes
 msgpack and every PULL client on ``RAW_INFERENCE_PROXY_BACKEND`` decodes it, so
 JSON and msgpack can never share that socket. A frame from a mismatched peer
-fails decoding loudly in either direction (see ``WIRE_TAG``).
+fails decoding in either direction (see ``WIRE_TAG``); the PULL client logs the
+failure and drops that frame.
 """
 
 from typing import Any, Final

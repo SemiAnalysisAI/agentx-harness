@@ -1816,7 +1816,14 @@ class Worker(BaseComponentService, ProcessHealthMixin):
             service_id=self.service_id,
             record=record,
         )
-        self.execute_async(self.inference_results_push_client.push(msg))
+        self.execute_async(self._push_inference_result(msg))
+
+    async def _push_inference_result(self, msg: InferenceResultsMessage) -> None:
+        # Fire-and-forget: log a failed push here, since nothing awaits the task.
+        try:
+            await self.inference_results_push_client.push(msg)
+        except Exception as e:
+            self.exception(f"Dropped an inference result: {e!r}")
 
     @on_command(CommandType.PROFILE_CONFIGURE)
     async def _on_profile_configure_command(self, message: CommandMessage) -> None:

@@ -173,6 +173,7 @@ class ZMQPullClient(BaseZMQClient):
 
     async def _process_message_fd(self, message_bytes: bytes) -> None:
         """FD-reader variant of ``_process_message`` using the _inflight counter."""
+        size = len(message_bytes)
         try:
             message = self._decode(message_bytes)
             del message_bytes
@@ -182,6 +183,12 @@ class ZMQPullClient(BaseZMQClient):
                 self.warning(
                     f"Pull message received for message type {message.message_type} without callback"
                 )
+        except Exception as e:
+            # This runs as a fire-and-forget task, so an exception left to
+            # propagate surfaces only as asyncio's "Task exception was never
+            # retrieved", if at all. A wire-codec mismatch between peers (e.g.
+            # image skew) would otherwise drop every record silently.
+            self.exception(f"Dropped a {size}-byte pull message: {e!r}")
         finally:
             self._inflight -= 1
             # A slot freed; resume draining if the reader paused at the cap.
