@@ -2406,7 +2406,7 @@ class CLIConfig(BaseConfig):
             gt=0,
             description="Additional agentic replay warmup duration in seconds. "
             "After the normal snapshot warmup drains, AIPerf continues the live "
-            "trajectories without recorded idle delays and with one-token outputs, "
+            "trajectories without recorded idle delays and with outputs capped at 10 tokens, "
             "then drains and resumes profiling from the resulting trajectory state "
             "using each live stream's residual next-turn delay. Mutually exclusive "
             "with --warmup-requests-per-lane.",

@@ -355,7 +355,7 @@ class BasePhaseConfig(AdaptiveScalePhaseMixin, BaseConfig):
             description="AGENTIC_REPLAY only: additional cache-pressure warmup "
             "duration in seconds. After the normal snapshot warmup drains, AIPerf "
             "continues the live trajectories without recorded idle delays and with "
-            "one-token outputs for this long, then drains and resumes profiling "
+            "outputs capped at 10 tokens for this long, then drains and resumes profiling "
             "from the resulting trajectory state. Read off the profiling phase by "
             "``timing.config._build_agentic_warmup_config``. Mutually exclusive "
             "with warmup_requests_per_lane. None disables it.",

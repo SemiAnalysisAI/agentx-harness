@@ -84,7 +84,7 @@ from aiperf.timing.trajectory_source import (
     _as_timestamp_ms,
 )
 
-_WARMUP_MAX_TOKENS = 1
+_WARMUP_MAX_TOKENS = 10
 _IDLE_WATCHDOG_EPSILON_SECONDS = 1e-6
 
 if TYPE_CHECKING:

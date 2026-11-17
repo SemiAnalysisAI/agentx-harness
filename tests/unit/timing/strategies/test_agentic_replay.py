@@ -31,7 +31,10 @@ from aiperf.timing.replay_dependencies import (
     ReplayBarrierCoordinator,
     ReplayResumeBoundary,
 )
-from aiperf.timing.strategies.agentic_replay import AgenticReplayStrategy
+from aiperf.timing.strategies.agentic_replay import (
+    _WARMUP_MAX_TOKENS,
+    AgenticReplayStrategy,
+)
 from aiperf.timing.trajectory_source import (
     ConversationState,
     Trajectory,
@@ -246,7 +249,10 @@ def test_warmup_only_overrides_max_tokens():
     warmup_session = warmup_source.session_for(trajectory)
     profiling_session = profiling_source.session_for(trajectory)
 
-    assert warmup._build_turn_for_session(warmup_session, 0).max_tokens_override == 1
+    assert (
+        warmup._build_turn_for_session(warmup_session, 0).max_tokens_override
+        == _WARMUP_MAX_TOKENS
+    )
     assert (
         profiling._build_turn_for_session(profiling_session, 1).max_tokens_override
         is None
@@ -294,9 +300,9 @@ async def test_cache_warmup_starts_after_baseline_and_removes_idle_delay():
 
     pressure = issuer.issue_credit.await_args_list[1].args[0]
     assert pressure.turn_index == 2
-    assert pressure.max_tokens_override == 1
+    assert pressure.max_tokens_override == _WARMUP_MAX_TOKENS
     assert pressure.is_session_start is False
-    issuer.set_max_tokens_override.assert_called_once_with(1)
+    issuer.set_max_tokens_override.assert_called_once_with(_WARMUP_MAX_TOKENS)
     scheduler.schedule_later.assert_called_once()
     assert scheduler.schedule_later.call_args.args[0] == 600.0
 
@@ -636,8 +642,8 @@ async def test_count_cache_warmup_starts_without_duration_timer():
 
     pressure = issuer.issue_credit.await_args_list[1].args[0]
     assert pressure.turn_index == 2
-    assert pressure.max_tokens_override == 1
-    issuer.set_max_tokens_override.assert_called_once_with(1)
+    assert pressure.max_tokens_override == _WARMUP_MAX_TOKENS
+    issuer.set_max_tokens_override.assert_called_once_with(_WARMUP_MAX_TOKENS)
     scheduler.schedule_later.assert_not_called()
 
 
