@@ -29,7 +29,7 @@ def validate_simulator_endpoint(endpoint: EndpointInfo | EndpointConfig) -> None
 def validate_simulation(
     run: BenchmarkRun, timing: TimingConfig, endpoint: str | None
 ) -> None:
-    """Keep the initial integration limited to completion-driven agentic replay."""
+    """Use native workload strategies with the coordinated simulation clock."""
     if not endpoint or run.cfg.endpoint.transport != "sglang_simulator":
         raise ValueError(
             "simulation requires both --transport sglang_simulator and "
@@ -46,17 +46,20 @@ def validate_simulation(
         raise NotImplementedError(
             "simulation: inference readiness probes are unsupported"
         )
-    dataset = run.cfg.get_default_dataset()
-    if getattr(dataset, "trace_idle_gap_cap_seconds", None) is not None:
-        raise NotImplementedError("simulation: per-trace idle cap is not supported")
     for phase in timing.phase_configs:
         _validate_phase(phase)
 
 
 def _validate_phase(phase: CreditPhaseConfig) -> None:
     location = f"simulation phase {phase.phase_index!r} ({phase.phase})"
-    if phase.timing_mode != TimingMode.AGENTIC_REPLAY:
-        raise NotImplementedError(f"{location}: only agentic replay is supported")
+    if phase.timing_mode not in (
+        TimingMode.AGENTIC_REPLAY,
+        TimingMode.REQUEST_RATE,
+        TimingMode.FIXED_SCHEDULE,
+    ):
+        raise NotImplementedError(
+            f"{location}: unsupported timing mode {phase.timing_mode}"
+        )
     for name in (
         "seamless",
         "prefill_concurrency",
@@ -64,8 +67,6 @@ def _validate_phase(phase: CreditPhaseConfig) -> None:
         "prefill_concurrency_ramp_duration_sec",
         "request_rate_ramp_duration_sec",
         "request_rate_series",
-        "agentic_cache_warmup_duration_sec",
-        "warmup_requests_per_lane",
     ):
         if getattr(phase, name):
             raise NotImplementedError(f"{location}: {name} is not supported")

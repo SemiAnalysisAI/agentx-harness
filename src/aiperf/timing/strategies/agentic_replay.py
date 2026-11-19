@@ -1855,10 +1855,16 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                     self.credit_issuer.issue_credit(turn),
                     group_id=turn.effective_root_correlation_id,
                 )
-            elif state.agent_depth > 0:
-                await self._issue_child_continuation_or_drain(turn)
             else:
-                await self.credit_issuer.issue_credit(turn)
+                coro = (
+                    self._issue_child_continuation_or_drain(turn)
+                    if state.agent_depth > 0
+                    else self.credit_issuer.issue_credit(turn)
+                )
+                if self._runtime.is_virtual:
+                    self.scheduler.execute_async(coro)
+                else:
+                    await coro
 
         root_correlation_id = self._lane_root_corr(snapshot)
         if root_correlation_id is not None:

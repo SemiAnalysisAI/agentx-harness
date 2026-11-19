@@ -11,11 +11,12 @@ from typing import TYPE_CHECKING
 from aiperf.common.constants import IS_LINUX, MILLIS_PER_SECOND, NANOS_PER_SECOND
 from aiperf.common.environment import Environment
 from aiperf.common.mixins import AIPerfLoggerMixin
+from aiperf.common.timing_runtime import RealTimingRuntime, TimingRuntime
 from aiperf.common.utils import yield_to_event_loop
 from aiperf.credit.dispatch import ChildDispatchResult
 from aiperf.credit.structs import Credit, TurnToSend
 from aiperf.plugin import plugins
-from aiperf.plugin.enums import PluginType
+from aiperf.plugin.enums import ArrivalPattern, PluginType
 from aiperf.timing.intervals import IntervalGeneratorConfig
 
 if TYPE_CHECKING:
@@ -96,6 +97,7 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         credit_issuer: CreditIssuer,
         lifecycle: PhaseLifecycle,
         branch_orchestrator: BranchOrchestrator | None = None,
+        runtime: TimingRuntime | None = None,
         **kwargs,
     ):
         """Initialize rate timing strategy with all dependencies."""
@@ -107,6 +109,8 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         self._credit_issuer = credit_issuer
         self._lifecycle = lifecycle
         self._branch_orchestrator = branch_orchestrator
+        self._runtime = runtime if runtime is not None else RealTimingRuntime()
+        self._work_available = asyncio.Event()
 
         # Queue for subsequent turns (turn_index > 0) waiting to be issued.
         # Populated by handle_credit_return when workers complete turns.
@@ -131,13 +135,18 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         """Setup the phase."""
         pass  # Already setup in __init__
 
+    def _now_perf(self) -> float:
+        if self._runtime.is_virtual:
+            return self._runtime.now_ns() / NANOS_PER_SECOND
+        return time.perf_counter()
+
     def _create_high_res_pacer(self) -> TimerFdPacer | ThreadPacer | None:
         """Create the best available high-resolution pacer, else None.
 
         Selection order: Linux timerfd (kernel hrtimer, in-loop fd) ->
         dedicated sleep thread (all platforms) -> event-loop timers (None).
         """
-        if not Environment.TIMING.HIGH_RES_TIMER:
+        if self._runtime.is_virtual or not Environment.TIMING.HIGH_RES_TIMER:
             return None
         if IS_LINUX:
             try:
@@ -165,7 +174,7 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         self._rate_update_event.clear()
         return min(
             next_target_perf,
-            time.perf_counter() + self._rate_generator.next_interval(),
+            self._now_perf() + self._rate_generator.next_interval(),
         )
 
     async def _wait_for_pacer_or_rate_update(self, deadline_perf_s: float) -> bool:
@@ -220,12 +229,12 @@ class RequestRateStrategy(AIPerfLoggerMixin):
                 self._pacer.close()
                 self._pacer = None
                 return await self._wait_until_next_target(
-                    next_target_perf, time.perf_counter()
+                    next_target_perf, self._now_perf()
                 )
 
         try:
-            await asyncio.wait_for(
-                self._rate_update_event.wait(), timeout=sleep_duration
+            await self._runtime.wait_event(
+                self._rate_update_event, timeout=sleep_duration
             )
         except asyncio.TimeoutError:  # noqa: UP041 - distinct on Python 3.10
             return False
@@ -261,7 +270,8 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         self._pacer = self._create_high_res_pacer()
         try:
             while True:
-                now = time.perf_counter()
+                self._work_available.clear()
+                now = self._now_perf()
 
                 # Behind schedule: re-anchor to now only past the bounded catch-up
                 # window, so sub-ms oversleeps stay on the original schedule.
@@ -314,7 +324,7 @@ class RequestRateStrategy(AIPerfLoggerMixin):
                         case None:  # No slot available, retry later
                             # Always yield to event loop to allow callbacks to run.
                             # This is especially critical to prevent deadlock in CONCURRENCY_BURST mode (0 interval).
-                            await yield_to_event_loop()
+                            await self._wait_for_work()
 
                 # Priority 3: No more sessions to start and queue is empty.
                 # Check if we're done sending entirely.
@@ -326,11 +336,20 @@ class RequestRateStrategy(AIPerfLoggerMixin):
                     # continuation turns to arrive from callbacks.
                     # Always yield to event loop to allow callbacks to run.
                     # This is especially critical to prevent deadlock in CONCURRENCY_BURST mode (0 interval).
-                    await yield_to_event_loop()
+                    await self._wait_for_work()
         finally:
             if self._pacer is not None:
                 self._pacer.close()
                 self._pacer = None
+
+    async def _wait_for_work(self) -> None:
+        if (
+            self._runtime.is_virtual
+            and self._config.arrival_pattern == ArrivalPattern.CONCURRENCY_BURST
+        ):
+            await self._runtime.wait_event(self._work_available)
+        else:
+            await yield_to_event_loop()
 
     async def handle_credit_return(
         self, credit: Credit, *, error: str | None = None
@@ -354,6 +373,7 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         sampling, so the main rate loop may have already exited. Direct
         dispatch avoids that race and keeps the DAG tree flowing.
         """
+        self._work_available.set()
         if credit.is_final_turn:
             return
 
@@ -376,10 +396,14 @@ class RequestRateStrategy(AIPerfLoggerMixin):
         if meta.delay_ms is not None:
             self._scheduler.schedule_later(
                 meta.delay_ms / MILLIS_PER_SECOND,
-                self._continuation_turns.put(turn),
+                self._queue_continuation(turn),
             )
         else:
-            self._continuation_turns.put_nowait(turn)
+            await self._queue_continuation(turn)
+
+    async def _queue_continuation(self, turn: TurnToSend) -> None:
+        self._continuation_turns.put_nowait(turn)
+        self._work_available.set()
 
     async def _issue_parked_child_continuation(
         self, turn: TurnToSend, child_returning_credit: Credit

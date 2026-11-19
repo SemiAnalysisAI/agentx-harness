@@ -82,7 +82,8 @@ uses real clocks and requires no simulator adapter.
 
 The optional `sglang_simulator` transport, together with
 `AIPERF_TIMING_SIMULATOR_COORDINATOR=tcp://127.0.0.1:<port>`, selects an externally
-advanced runtime for agentic replay. AgentX still runs its original dataset
+advanced runtime for concurrency/rate-driven requests, timestamp replay and
+agentic replay. AgentX still runs its original dataset
 loader, workers, branches, joins, and phase logic. SGLang must run in `OFFLINE`
 mode with its optional coordinator enabled.
 Published timestamps use a fixed synthetic epoch; they are not wall-clock dates.

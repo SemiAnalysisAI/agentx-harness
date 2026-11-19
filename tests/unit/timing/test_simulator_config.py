@@ -71,7 +71,6 @@ def test_both_clock_and_transport_are_required(
     "field,value",
     [
         param("prefill_concurrency", 1, id="first-token-admission"),
-        param("agentic_cache_warmup_duration_sec", 1.0, id="accelerated-warmup"),
         param("seamless", True, id="overlapping-phases"),
     ],
 )  # fmt: skip
@@ -86,6 +85,29 @@ def test_readiness_inference_cannot_enter_the_input_barrier() -> None:
     run.cfg.endpoint.wait_for_model_timeout = 5
     with pytest.raises(NotImplementedError, match="readiness probes"):
         validate_simulation(run, timing, "tcp://127.0.0.1:30001")
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        param(TimingMode.REQUEST_RATE, id="native-concurrency-or-rate"),
+        param(TimingMode.FIXED_SCHEDULE, id="timestamp-replay"),
+        param(TimingMode.AGENTIC_REPLAY, id="agentic-replay"),
+    ],
+)  # fmt: skip
+def test_native_workloads_share_the_simulator_transport(mode: TimingMode) -> None:
+    run, timing = configuration()
+    phase = timing.phase_configs[0].model_copy(update={"timing_mode": mode})
+    timing = timing.model_copy(update={"phase_configs": [phase]})
+    validate_simulation(run, timing, "tcp://127.0.0.1:30001")
+
+
+def test_agentic_warmup_and_trace_idle_inputs_remain_supported() -> None:
+    run, timing = configuration(warmup_requests_per_lane=10)
+    run.cfg.get_default_dataset = lambda: SimpleNamespace(
+        trace_idle_gap_cap_seconds=300
+    )
+    validate_simulation(run, timing, "tcp://127.0.0.1:30001")
 
 
 @pytest.mark.parametrize("name", ["server_metrics", "gpu_telemetry", "network_latency"])
