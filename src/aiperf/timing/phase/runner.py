@@ -127,7 +127,7 @@ class PhaseRunner(TaskManagerMixin):
                 (AGENTIC_REPLAY only). Passed into the orchestrator + issuer +
                 released at phase teardown via ``release_all``.
             runtime: Clock and timer source shared by the scheduler and lifecycle.
-                Other phase waits and strategies still use their existing clocks.
+                Strategies and phase waits use the same runtime.
         """
         super().__init__(**kwargs)
         self._config = config
@@ -1301,12 +1301,18 @@ class PhaseRunner(TaskManagerMixin):
         done-callback only discards it from the task set, so an exception it
         raises is otherwise never retrieved and the wait hangs forever (#1041).
         """
-        event_task = asyncio.ensure_future(self._runtime.wait_event(event))
+        event_task = self._runtime.create_task(self._runtime.wait_event(event))
+        changed = asyncio.Event()
+
+        def notify(done: asyncio.Future) -> None:
+            changed.set()
+
+        event_task.add_done_callback(notify)
+        task.add_done_callback(notify)
         try:
-            await asyncio.wait({event_task, task}, return_when=asyncio.FIRST_COMPLETED)
-            # A failure wins over a same-tick event completion; FIRST_COMPLETED
-            # only guarantees one of the two is done, so task.done() is checked
-            # explicitly rather than assumed from event_task's state.
+            await self._runtime.wait_event(changed)
+            # Both callbacks may become runnable at the same timestamp.
+            # Preserve a strategy failure even when the phase event is also set.
             if (
                 task.done()
                 and not task.cancelled()
@@ -1314,11 +1320,15 @@ class PhaseRunner(TaskManagerMixin):
             ):
                 raise exc
             if event_task.done():
+                event_task.result()
                 return
-            await event_task
+            await self._runtime.wait_event(event)
         finally:
+            task.remove_done_callback(notify)
+            event_task.remove_done_callback(notify)
             if not event_task.done():
                 event_task.cancel()
+            await asyncio.gather(event_task, return_exceptions=True)
 
     async def _progress_report_loop(self) -> None:
         """Publish phase progress stats at regular intervals.
